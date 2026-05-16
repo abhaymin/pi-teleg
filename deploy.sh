@@ -1,12 +1,13 @@
 #!/bin/bash
-# Deploy teleg monorepo: extension + MCP server
+# Deploy teleg monorepo: extension + MCP server (stdio)
 # Both are part of the same source tree at /home/abhaym/Development/PTGD/teleg/
 #
 # Architecture:
-#   - Extension (src/extension/)      → registers tools, polls Telegram, handles message routing
-#   - MCP server (mcp-server/)        → exposes send_* tools via HTTP, NO polling
+#   - Extension (dist/)          → polls Telegram, handles message routing, @sessionName routing
+#   - MCP server (mcp-server/)   → stdio JSON-RPC tools (send_message, send_photo, send_video, get_me, teleg_attach)
 #
-# The extension owns the polling lock. The MCP server provides tools only.
+# The extension owns the polling lock. The MCP server provides tools only (no polling).
+# MCP server can be used standalone (without the extension) OR with the extension.
 #
 # Usage:
 #   ./deploy.sh          → one-time deploy
@@ -28,20 +29,13 @@ echo ""
 echo "[1] Building extension (TypeScript → dist/)"
 npx tsc
 
-# ── Install MCP server deps ──────────────────────────────────────────────────
-echo ""
-echo "[2] Installing MCP server dependencies"
-cd mcp-server
-npm install --silent 2>/dev/null || npm install
-cd ..
-
-# ── Update agent settings.json ──────────────────────────────────────────────
+# ── Update agent settings.json (extension only) ──────────────────────────────
 AGENT_DIR="${HOME}/.pi/agent"
 SETTINGS_FILE="$AGENT_DIR/settings.json"
 mkdir -p "$AGENT_DIR"
 
 echo ""
-echo "[3] Updating $SETTINGS_FILE..."
+echo "[2] Updating $SETTINGS_FILE (extension only)..."
 
 python3 << 'PYEOF'
 import json, os, sys
@@ -66,7 +60,7 @@ settings["packages"] = [
   if "teleg" not in p.lower()
 ]
 
-# Add extension path only (mcp-server is started by the extension, NOT loaded by pi)
+# Add extension path only (mcp-server is a stdio MCP tool, NOT a pi extension)
 settings["packages"].append(teleg_path)
 
 # Deduplicate while preserving order
@@ -86,10 +80,10 @@ with open(settings_file, "w") as f:
 print(f"  Updated {len(deduped)} packages in settings.json")
 PYEOF
 
-# ── Update agent mcp.json (browser MCPs only) ───────────────────────────────
+# ── Update agent mcp.json (includes teleg-bridge as stdio MCP) ────────────────
 MCP_CONFIG_FILE="$AGENT_DIR/mcp.json"
 echo ""
-echo "[4] Updating $MCP_CONFIG_FILE..."
+echo "[3] Updating $MCP_CONFIG_FILE (extension + stdio MCP servers)..."
 
 cat > "$MCP_CONFIG_FILE" << 'EOF'
 {
@@ -106,20 +100,24 @@ cat > "$MCP_CONFIG_FILE" << 'EOF'
     "browsermcp": {
       "command": "npx",
       "args": ["@browsermcp/mcp@latest"]
+    },
+    "teleg-bridge": {
+      "command": "node",
+      "args": ["/home/abhaym/Development/PTGD/teleg/mcp-server/index.js"]
     }
   }
 }
 EOF
-echo "  browser MCPs configured (teleg-bridge is an extension, not an MCP server)"
+echo "  browser MCPs + teleg-bridge stdio MCP configured"
 
 echo ""
 echo "=== Deploy complete ==="
 echo ""
-echo "Restart pi from ANY directory — extension + MCP server load automatically."
+echo "Restart pi — extension + MCP server load automatically."
 echo ""
 echo "Sessions:"
 echo "  - Extension polls Telegram, handles @sessionName routing"
-echo "  - MCP server provides send_message/send_photo/send_video tools"
-echo "  - Only the session with the polling lock handles incoming Telegram messages"
+echo "  - MCP server (stdio) provides send_message/send_photo/send_video tools"
+echo "  - teleg-bridge MCP works standalone OR with the extension"
 echo ""
 echo "Start in watch mode: ./deploy.sh --watch"
