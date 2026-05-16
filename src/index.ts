@@ -64,6 +64,7 @@ interface SessionInfo {
   lastActivity: number;
   isActive: boolean;
   announcedPresence?: boolean; // true after sending the single "connected" message for this session
+  botToken?: string;          // optional per-session Telegram bot token
 }
 
 interface SessionRegistry {
@@ -913,7 +914,15 @@ export default function (pi: ExtensionAPI): void {
         { chatId: message.chat.id, messageId: message.message_id },
       );
       if (forwardResult.ok) {
-        // Forwarded successfully, target session will handle the reply
+        // Target session processed the command — send its response to Telegram
+        if (forwardResult.response) {
+          await SharedPollingManager.sendReply(
+            String(message.chat.id),
+            message.message_id,
+            forwardResult.response,
+          );
+        }
+        // If forward was successful but no response body, just acknowledge silently
         return;
       } else {
         // Could not forward - notify user
