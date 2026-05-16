@@ -15,6 +15,13 @@ import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import {
+  startRelayServer,
+  stopRelayServer,
+  setCommandHandler,
+  forwardToSession,
+  getRelayStatus,
+} from "./relay.js";
 
 // ============================================================================
 // Constants
@@ -885,10 +892,39 @@ export default function (pi: ExtensionAPI): void {
   function isTelegramPrompt(prompt: string): boolean {
     return prompt.trimStart().startsWith(TELEGRAM_PREFIX);
   }
-  
+
   async function handleAuthorizedTelegramMessage(message: TelegramMessage, ctx: ExtensionContext): Promise<void> {
     const rawText = message.text || message.caption || "";
-    const lower = rawText.toLowerCase();
+    
+    // Strip session prefix for routing decisions
+    const sessionTagMatch = rawText.match(/^@(\S+)\s*/);
+    const cleanText = sessionTagMatch ? rawText.replace(sessionTagMatch[0], "") : rawText;
+    const targetSessionName = sessionTagMatch ? sessionTagMatch[1] : null;
+
+    // Check if this message should be forwarded to another session
+    if (targetSessionName && targetSessionName !== sessionName) {
+      // Forward command to the target session via relay
+      const forwardResult = await forwardToSession(
+        targetSessionName,
+        cleanText,
+        { chatId: message.chat.id, messageId: message.message_id },
+      );
+      if (forwardResult.ok) {
+        // Forwarded successfully, target session will handle the reply
+        return;
+      } else {
+        // Could not forward - notify user
+        await SharedPollingManager.sendReply(
+          String(message.chat.id),
+          message.message_id,
+          `⚠️ Could not reach @${targetSessionName}: ${forwardResult.error}`,
+        );
+        return;
+      }
+    }
+
+    // No prefix or targeting this session — process normally
+    const lower = cleanText.toLowerCase();
     
     if (lower === "stop" || lower === "/stop") {
       if (state.activeTurn) {
@@ -1212,7 +1248,15 @@ stop - Abort current turn`,
     state.config = await readConfig();
     await mkdir(TEMP_DIR, { recursive: true });
     await registerSession();
-    
+
+    // Start the relay server for inter-session command forwarding
+    await startRelayServer(sessionName).catch(console.error);
+    setCommandHandler(async (text, meta) => {
+      // When a forwarded command arrives, process it and return the response
+      // For now just echo back for testing
+      return `[${sessionName}] Received: ${text}`;
+    });
+
     if (state.config.botToken) {
       await SharedPollingManager.start();
     }
@@ -1238,6 +1282,7 @@ stop - Abort current turn`,
   pi.on("session_shutdown", async (_event, _ctx) => {
     state.activeTurn = undefined;
     SharedPollingManager.completeTurn(sessionId);
+    stopRelayServer();
     await unregisterSession();
     
     const registry = await readSessionRegistry();
