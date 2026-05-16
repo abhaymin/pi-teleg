@@ -1,12 +1,6 @@
 # Multi-Agent System for Telegram Bridge
 
 > ⚠️ **FORCE RULE: MAIN POST ONLY**
-> **CRITICAL**: Download ONLY the media from the original tweet/post specified in the URL. 
-> - ❌ DO NOT download media from replies
-> - ❌ DO NOT download media from threaded replies
-> - ❌ DO NOT download media from quoted tweets
-> - ❌ DO NOT download media from "more replies" expansions
-> - ❌ DO NOT download media from any other content on the page
 > - ✅ ONLY download media that belongs to the main tweet being requested
 > 
 > **FORCE RULE: NO SCREENSHOT FALLBACK**

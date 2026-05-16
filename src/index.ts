@@ -50,6 +50,7 @@ interface TelegramConfig {
 
 interface SessionInfo {
   sessionId: string;
+  sessionName: string;
   connectedAt: number;
   lastActivity: number;
   isActive: boolean;
@@ -105,6 +106,7 @@ interface QueuedAttachment {
 
 interface PendingTelegramTurn {
   sessionId: string;
+  sessionName: string;
   chatId: number;
   replyToMessageId: number;
   queuedAttachments: QueuedAttachment[];
@@ -141,7 +143,11 @@ Telegram bridge extension is active.
 - CRITICAL: Never send screenshot.png as fallback when no media found
 - CRITICAL: If tweet only has screenshot.png, redownload to get actual media
 - Archive downloads to {archiveRoot}/tweets/{tweet_id}/
-- Send media to Telegram via teleg_attach and send_message tools`;
+- Send media to Telegram via teleg_attach and send_message tools
+
+## Session Identity
+- This is session "{sessionName}". When you reply to Telegram, include your session name so the user knows which instance responded.
+- Messages addressed to a specific session (e.g., "@sessionName ...") are routed accordingly.`;
 
 // ============================================================================
 // Utility Functions
@@ -310,7 +316,7 @@ const SharedPollingManager = (() => {
     return [...new Set(matches)];
   }
   
-  function createTurn(sessionId: string, message: TelegramMessage): PendingTelegramTurn {
+  function createTurn(sessionId: string, sessionName: string, message: TelegramMessage): PendingTelegramTurn {
     const rawText = (message.text || message.caption || "").trim();
     const content: Array<TextContent | ImageContent> = [];
     const prompt = rawText.length > 0 ? `${TELEGRAM_PREFIX} ${rawText}` : `${TELEGRAM_PREFIX}`;
@@ -318,6 +324,7 @@ const SharedPollingManager = (() => {
     
     return {
       sessionId,
+      sessionName,
       chatId: message.chat.id,
       replyToMessageId: message.message_id,
       queuedAttachments: [],
@@ -404,6 +411,18 @@ const SharedPollingManager = (() => {
             }
           }
           
+          // Check if message is addressed to a specific session (e.g., "@teleg do X")
+          const text = message.text || message.caption || "";
+          const sessionTagMatch = text.match(/^@(\S+)\s*/);
+          if (sessionTagMatch) {
+            const tagName = sessionTagMatch[1];
+            const registry = await readSessionRegistry();
+            const namedSession = registry.sessions.find(s => s.sessionName === tagName);
+            if (namedSession) {
+              targetSessionId = namedSession.sessionId;
+            }
+          }
+          
           if (!targetSessionId) {
             const registry = await readSessionRegistry();
             if (registry.primarySessionId) {
@@ -414,11 +433,15 @@ const SharedPollingManager = (() => {
           }
           
           if (targetSessionId && messageHandler) {
-            const turn = createTurn(targetSessionId, message);
+            // Look up session name from registry for routing
+            const reg = await readSessionRegistry();
+            const sessionInfo = reg.sessions.find(s => s.sessionId === targetSessionId);
+            const sName = sessionInfo?.sessionName || targetSessionId;
+            const turn = createTurn(targetSessionId, sName, message);
             activeTurns.set(targetSessionId, turn as ActiveTelegramTurn);
             messageHandler(turn, update);
           } else {
-            const turn = createTurn("unassigned", message);
+            const turn = createTurn("unassigned", "unknown", message);
             turnQueue.push({ turn, update });
             
             if (messageHandler) {
@@ -660,11 +683,14 @@ function createSessionState(sessionId: string): SessionState {
 
 export default function (pi: ExtensionAPI): void {
   const sessionId = getSessionId();
+  // Derive a human-readable session name from the current working directory
+  const cwd = process.cwd();
+  const sessionName = cwd.split("/").filter(Boolean).pop() || "default";
   let state: SessionState = createSessionState(sessionId);
   
   function updateStatus(ctx: ExtensionContext, error?: string): void {
     const theme = ctx.ui.theme;
-    const label = theme.fg("accent", "teleg");
+    const label = `${theme.fg("accent", "teleg")}${theme.fg("muted", ":" + sessionName)}`;
     
     const pollState = SharedPollingManager.getState();
     const healthIndicator = pollState.isHealthy ? "✓" : "✗";
@@ -709,6 +735,7 @@ export default function (pi: ExtensionAPI): void {
     const existing = registry.sessions.findIndex(s => s.sessionId === sessionId);
     const sessionInfo: SessionInfo = {
       sessionId,
+      sessionName,
       connectedAt: Date.now(),
       lastActivity: Date.now(),
       isActive: true,
@@ -805,9 +832,10 @@ export default function (pi: ExtensionAPI): void {
       await SharedPollingManager.sendReply(
         String(message.chat.id),
         message.message_id,
-        `Teleg-Bridge Active!
+        `Teleg-Bridge Active! (this session: ${sessionName})
 
-Send me any message to forward to pi.
+Send any message to forward to pi.
+Prefix with @sessionName to route to a specific session.
 Include Twitter/X URLs for automatic media download.
 
 Commands:
@@ -836,7 +864,7 @@ stop - Abort current turn`,
         `polling: ${SharedPollingManager.isActive() ? "running" : "stopped"}`,
         `health: ${pollState.isHealthy ? "OK" : "DEGRADED"}`,
         `consecutive errors: ${pollState.consecutiveErrors}`,
-        `sessions: ${registry.sessions.length}`,
+        `sessions: ${registry.sessions.length}${registry.sessions.map(s => `\n  ${s.sessionName === sessionName ? "*" : " "} ${s.sessionName} (${s.sessionId.slice(0, 12)}...)${s.sessionId === sessionId ? " ← you" : ""}`).join("")}`,
         `active: ${state.activeTurn ? "yes" : "no"}`,
         `queued: ${SharedPollingManager.getQueueDepth()}`,
       ];
@@ -1146,7 +1174,8 @@ stop - Abort current turn`,
   
   pi.on("before_agent_start", async (event) => {
     const archiveRoot = getArchiveRoot(state.config);
-    const suffix = SYSTEM_PROMPT_SUFFIX.replace("{archiveRoot}", archiveRoot);
+    let suffix = SYSTEM_PROMPT_SUFFIX.replace("{archiveRoot}", archiveRoot);
+    suffix = suffix.replace("{sessionName}", sessionName);
     const promptSuffix = isTelegramPrompt(event.prompt)
       ? `${suffix}\n- The current user message came from Telegram.`
       : suffix;

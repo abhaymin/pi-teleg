@@ -32,4 +32,5 @@ teleg-bridge.json
 
 # Lock files
 package-lock.json
-yarn.lockarchive/
+yarn.lock
+archive/
