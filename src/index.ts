@@ -34,6 +34,7 @@ const DEFAULT_ARCHIVE_ROOT = join(homedir(), "pi-teleg-archive");
 const CONFIG_DIR = join(homedir(), ".pi", "agent");
 const CONFIG_FILE = join(CONFIG_DIR, "teleg-bridge.json");
 const SESSION_REGISTRY_FILE = join(CONFIG_DIR, "teleg-sessions.json");
+const CAPABILITIES_FILE = join(CONFIG_DIR, "teleg-capabilities.json");
 const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "teleg-bridge");
 const POLLING_LOCK_FILE = join(TEMP_DIR, "polling.lock");
 const POLLING_LOCK_REFRESH_MS = 15000;
@@ -69,6 +70,24 @@ interface SessionInfo {
   isActive: boolean;
   announcedPresence?: boolean; // true after sending the single "connected" message for this session
   botToken?: string;          // optional per-session Telegram bot token
+  projectDir?: string;        // working directory of the session
+  capabilities?: string[];    // declared capabilities from INFO_REL.md
+  description?: string;       // session description
+}
+
+interface CapabilitiesEntry {
+  sessionName: string;
+  sessionId: string;
+  pid: number;
+  projectDir: string;
+  capabilities: string[];
+  description: string;
+  registeredAt: number;
+}
+
+interface CapabilitiesRegistry {
+  entries: CapabilitiesEntry[];
+  lastUpdated: number;
 }
 
 interface SessionRegistry {
@@ -152,17 +171,18 @@ Telegram bridge extension is active.
 - If a [telegram] user asked for a file or generated artifact, use the teleg_attach tool with the local file path so the extension can send it with my next final reply.
 - Do not assume mentioning a local file path in plain text will send it to Telegram. Use teleg_attach.
 
-## Twitter/X Download System
-- On [telegram] messages with X.com/twitter.com URLs, automatically download the tweet media
-- CRITICAL: Download ONLY the main tweet media, NOT replies, threads, or quoted tweets
-- CRITICAL: Never send screenshot.png as fallback when no media found
-- CRITICAL: If tweet only has screenshot.png, redownload to get actual media
-- Archive downloads to {archiveRoot}/tweets/{tweet_id}/
-- Send media to Telegram via teleg_attach and send_message tools
-
-## Session Identity
-- This is session "{sessionName}". When you reply to Telegram, include your session name so the user knows which instance responded.
-- Messages addressed to a specific session (e.g., "@sessionName ...") are routed accordingly.`;
+## Session Identity & Capabilities
+- This is session "{sessionName}" running in {projectDir}.
+- This session has registered its capabilities with the teleg bridge based on project documentation.
+- To declare what this session handles, create an INFO_REL.md in the project root with:
+  # INFO_REL
+  ## capabilities
+  keyword1, keyword2, ...
+  ## description
+  What this session does
+- Other sessions with matching capabilities will get relevant messages relayed to them automatically.
+- Messages addressed to a specific session (e.g., "@sessionName ...") are routed directly.
+- If you receive a relayed message from Telegram, process the request and send results back using send_message, send_photo, send_video, or teleg_attach tools.`;
 
 // ============================================================================
 // Utility Functions
@@ -221,6 +241,126 @@ function isAllowedUser(config: TelegramConfig, userId: number): boolean {
     return false;
   }
   return config.allowedUserIds.includes(userId);
+}
+
+// ============================================================================
+// Capabilities
+// ============================================================================
+
+function detectProjectCapabilities(projectDir: string): { capabilities: string[]; description: string } {
+  const result: { capabilities: string[]; description: string } = { capabilities: [], description: "" };
+
+  const parseCapabilitiesMd = (content: string) => {
+    const lines = content.split("\n");
+    let currentSection = "";
+    let foundCaps = false;
+    for (const line of lines) {
+      const header = line.match(/^##?\s*(.+)/);
+      if (header) {
+        currentSection = header[1].trim().toLowerCase();
+        foundCaps = false;
+        continue;
+      }
+      if (currentSection === "capabilities" && line.trim()) {
+        result.capabilities = line.split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+        foundCaps = true;
+      }
+      if (currentSection === "description" && line.trim() && !result.description) {
+        result.description = line.trim();
+      }
+    }
+    return foundCaps;
+  };
+
+  const tryFile = (filename: string): boolean => {
+    try {
+      const content = readFileSync(join(projectDir, filename), "utf8");
+      return parseCapabilitiesMd(content);
+    } catch { return false; }
+  };
+
+  if (tryFile("INFO_REL.md")) return result;
+  if (tryFile("AGENTS.md")) return result;
+
+  // Last fallback: README.md
+  try {
+    const content = readFileSync(join(projectDir, "README.md"), "utf8");
+    const firstLine = content.split("\n").find((l: string) => l.trim().length > 0 && !l.startsWith("#"))?.trim() || "";
+    if (firstLine) result.description = firstLine;
+    const folderName = projectDir.split("/").filter(Boolean).pop()?.toLowerCase() || "";
+    if (folderName) result.capabilities.push(folderName.replace(/[^a-z0-9-]/g, ""));
+  } catch { /* no README */ }
+
+  return result;
+}
+
+async function readCapabilitiesRegistry(): Promise<CapabilitiesRegistry> {
+  try {
+    const content = await readFile(CAPABILITIES_FILE, "utf8");
+    return JSON.parse(content);
+  } catch {
+    return { entries: [], lastUpdated: Date.now() };
+  }
+}
+
+async function writeCapabilitiesRegistry(reg: CapabilitiesRegistry): Promise<void> {
+  await mkdir(CONFIG_DIR, { recursive: true });
+  reg.lastUpdated = Date.now();
+  await writeFile(CAPABILITIES_FILE, JSON.stringify(reg, null, 2) + "\n", "utf8");
+}
+
+async function registerSessionCapabilities(sessionId: string, sessionName: string, pid: number, projectDir: string): Promise<void> {
+  const { capabilities, description } = detectProjectCapabilities(projectDir);
+
+  const homeDir = homedir();
+  if (projectDir === homeDir || projectDir === "/" || projectDir.startsWith(homeDir + "/.")) return;
+  if (capabilities.length === 0 && !description) return;
+
+  const reg = await readCapabilitiesRegistry();
+  reg.entries = reg.entries.filter(e => e.sessionId !== sessionId);
+  reg.entries.push({ sessionName, sessionId, pid, projectDir, capabilities, description, registeredAt: Date.now() });
+  await writeCapabilitiesRegistry(reg);
+}
+
+async function unregisterSessionCapabilities(sessionId: string): Promise<void> {
+  const reg = await readCapabilitiesRegistry();
+  reg.entries = reg.entries.filter(e => e.sessionId !== sessionId);
+  await writeCapabilitiesRegistry(reg);
+}
+
+async function cleanStaleCapabilities(): Promise<void> {
+  const reg = await readCapabilitiesRegistry();
+  const before = reg.entries.length;
+  reg.entries = reg.entries.filter(e => {
+    try { process.kill(e.pid, 0); return true; } catch { return false; }
+  });
+  if (reg.entries.length !== before) await writeCapabilitiesRegistry(reg);
+}
+
+function matchMessageToCapability(text: string, entries: CapabilitiesEntry[]): CapabilitiesEntry | null {
+  const lower = text.toLowerCase();
+  const twitterRe = /https?:\/\/(?:x|twitter)\.com\/[^\s<>"']+\/status\/\d+/i;
+  const youtubeRe = /https?:\/\/(?:www\.)?(?:youtube\.com\/(?:watch\?v=|shorts\/)|youtu\.be\/)[\w-]+/i;
+  const redditRe = /https?:\/\/(?:www\.)?reddit\.com\/r\/[^\s<>"']+\/comments\/\w+/i;
+  const hasTwitter = twitterRe.test(text);
+  const hasYoutube = youtubeRe.test(text);
+  const hasReddit = redditRe.test(text);
+
+  for (const entry of entries) {
+    try { process.kill(entry.pid, 0); } catch { continue; }
+    const caps = entry.capabilities.map(c => c.toLowerCase());
+    if (hasTwitter && caps.some(c => c.includes("twitter") || c.includes("tweet") || c.includes("media") || c.includes("download"))) return entry;
+    if (hasYoutube && caps.some(c => c.includes("youtube") || c.includes("video") || c.includes("media") || c.includes("download"))) return entry;
+    if (hasReddit && caps.some(c => c.includes("reddit") || c.includes("media") || c.includes("download"))) return entry;
+    if (entry.description) {
+      const descLower = entry.description.toLowerCase();
+      const keywords = lower.split(/\s+/).filter((w: string) => w.length > 3);
+      for (const kw of keywords) {
+        if (descLower.includes(kw)) return entry;
+      }
+    }
+  }
+  return null;
 }
 
 // ============================================================================
@@ -498,6 +638,22 @@ const SharedPollingManager = (() => {
             }
           }
           
+          if (!targetSessionId) {
+            // Try capability-based smart routing
+            const capReg = await readCapabilitiesRegistry();
+            if (capReg.entries.length > 0) {
+              const matched = matchMessageToCapability(text || "", capReg.entries);
+              if (matched) {
+                try {
+                  process.kill(matched.pid, 0);
+                  const sessReg = await readSessionRegistry();
+                  const sessInfo = sessReg.sessions.find(s => s.sessionId === matched.sessionId);
+                  if (sessInfo) targetSessionId = matched.sessionId;
+                } catch { /* dead session */ }
+              }
+            }
+          }
+
           if (!targetSessionId) {
             const registry = await readSessionRegistry();
             if (registry.primarySessionId) {
@@ -1395,6 +1551,12 @@ stop - Abort current turn`,
       await writeSessionRegistry(registry1);
     }
 
+    // Register session capabilities
+    await cleanStaleCapabilities();
+    await registerSessionCapabilities(sessionId, sessionName, process.pid, cwd).catch(
+      (err: unknown) => console.error('[teleg:' + sessionName + '] Failed to register capabilities:', err)
+    );
+
     // Start the relay server for inter-session command forwarding
     await startRelayServer(sessionName).catch(console.error);
     setCommandHandler(async (text, meta) => {
@@ -1481,6 +1643,7 @@ stop - Abort current turn`,
       }
     }
     
+    await unregisterSessionCapabilities(sessionId);
     await unregisterSession();
     
     const registry = await readSessionRegistry();
@@ -1493,6 +1656,7 @@ stop - Abort current turn`,
     const archiveRoot = getArchiveRoot(state.config);
     let suffix = SYSTEM_PROMPT_SUFFIX.replace("{archiveRoot}", archiveRoot);
     suffix = suffix.replace("{sessionName}", sessionName);
+    suffix = suffix.replace("{projectDir}", process.cwd());
     const promptSuffix = isTelegramPrompt(event.prompt)
       ? `${suffix}\n- The current user message came from Telegram.`
       : suffix;

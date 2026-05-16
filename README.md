@@ -1,62 +1,75 @@
 # pi-teleg
 
-**Telegram Bridge Extension for Pi** - A Pi extension that bridges Telegram messages to the AI agent and vice versa.
+**Telegram Bridge Extension for Pi** — Multi-session Telegram bridge with smart capability-based routing.
 
 ## Features
 
-- **Telegram Bot Integration**: Receive messages from Telegram and forward them to the AI agent
+- **Telegram Bot Integration**: Poll Telegram, receive messages, forward to Pi agent
+- **Multi-Session**: Multiple Pi sessions can share one bot via the relay system
+- **Smart Routing**: Messages are automatically routed to the session best equipped to handle them based on declared capabilities
+- **Capability Registry**: Each session declares its purpose via `INFO_REL.md`, teleg routes relevant messages to it
+- **Direct @sessionName Routing**: Prefix messages with `@sessionName` to target a specific session
+- **Fallback to Primary**: If the ideal session is offline, the primary session handles it
+- **Cross-Session Relay**: Forward messages between Pi sessions via HTTP relay
 - **Bi-directional Communication**: Send AI responses back to Telegram
-- **Twitter/X Media Download**: Automatically detect and download media from Twitter/X URLs
-- **Typing Indicators**: Shows "typing..." in Telegram while waiting for AI responses
-- **File Attachments**: Send files back to Telegram via the `teleg_attach` tool
-- **Auto-reconnect**: Automatic reconnection with exponential backoff on connection failures
-- **Health Monitoring**: Periodic health checks to detect dead connections
-- **Status Display**: Visual status indicators in Pi's UI
+- **File Attachments**: Send files via `teleg_attach` tool
+- **Auto-reconnect**: Exponential backoff on connection failures
+- **Health Monitoring**: Periodic health checks
+- **Status Display**: Visual status with queue depth in Pi's UI
 
-## Installation
+## How Smart Routing Works
 
-### From npm
+1. Each Pi session running on a project folder registers with teleg:
+   - Scans `INFO_REL.md` (preferred), `AGENTS.md`, or `README.md` for capabilities
+   - A session in a bare/home directory with no docs **does not register**
+   - Only meaningful project directories are registered
+2. When a Telegram message arrives:
+   - `@sessionName` prefix → relay directly to that session
+   - Check capability registry → if a live session matches (e.g., Twitter URL → "data-scrapper" session) → relay
+   - If matched session is dead → primary handles it
+   - No match → primary handles it
+3. The registry is ephemeral — maintained by the primary session, cleaned on disconnect/crash
 
-```bash
-npm install pi-teleg
+## INFO_REL.md Format
+
+Create in your project root to declare capabilities:
+
+```markdown
+# INFO_REL
+
+## capabilities
+media-download, twitter, youtube, reddit, gallery
+
+## description
+Downloads and archives media from various online sources
 ```
 
-### From source
+## Installation
 
 ```bash
 git clone <repository-url>
 cd pi-teleg
 npm install
 npm run build
+./deploy.sh
 ```
 
 ## Configuration
 
 ### 1. Create a Telegram Bot
-
-1. Open Telegram and search for **@BotFather**
-2. Send `/newbot` and follow the prompts
-3. Copy the bot token (format: `123456789:ABCdef...`)
-
-### 2. Configure in Pi
-
-1. In Pi, run the setup command:
-   ```
-   /teleg-setup
-   ```
-2. Enter your Telegram bot token when prompted
-3. Send `/start` to your bot from the Telegram account you want to use
+1. Talk to **@BotFather** on Telegram
+2. `/newbot` → copy the token
+3. In Pi: `/teleg-setup` → paste token → `/start` to your bot
 
 ## Commands (via Telegram)
 
 | Command | Description |
 |---------|-------------|
-| `/start` or `/help` | Show help message |
-| `/status` | Show connection status |
-| `/health` | Test Telegram connection |
-| `/healthfull` | Full health diagnostic |
+| `/start` or `/help` | Show help |
+| `/status` | Show connection, sessions, queue |
+| `/health` | Test connection |
+| `/healthfull` | Full diagnostic |
 | `/compact` | Compact Pi memory |
-| `stop` | Abort current AI turn |
 
 ## Pi Commands
 
@@ -68,53 +81,30 @@ npm run build
 | `/teleg-disconnect` | Stop polling |
 | `/teleg-reconnect` | Force reconnect |
 
-## MCP Tools
+## MCP Tools (for agents)
 
-The extension registers the following tools for use by subagents:
-
-- `send_message` - Send text to Telegram
-- `send_photo` - Send photo to Telegram
-- `send_video` - Send video to Telegram
-- `get_me` - Get bot info
-- `check_archive` - Check if tweet is archived
-- `extract_twitter_urls` - Extract URLs from text
-- `send_tweet_result` - Send archived tweet to Telegram
-- `teleg_attach` - Queue files to send with reply
-
-## Twitter/X Download Integration
-
-When a message from Telegram contains Twitter/X URLs:
-
-1. The extension extracts the URLs
-2. Forwards them to the AI agent for download processing
-3. The agent uses browserOS + chrome-devtools to download media
-4. Media is archived and sent back to Telegram
-
-**Rules**:
-- Downloads ONLY main tweet media (not replies/threads)
-- Never sends screenshots as fallback
-- Redownloads if no actual media found
+- `send_message` — Send text to Telegram
+- `send_photo` — Send photo to Telegram
+- `send_video` — Send video to Telegram
+- `get_me` — Get bot info
+- `teleg_attach` — Queue files to send with reply
 
 ## Architecture
 
 ```
-[Telegram] --> [Bot API] --> [pi-teleg Extension] --> [Pi Agent]
-                    ^                                      |
-                    |                                      |
-                    └──────── [teleg_attach/send_*] <──────┘
+Telegram ─→ teleg (polling + routing)
+                │
+         ┌──────┴──────┐
+         │             │
+    @sessionName   capability match
+         │             │
+         ▼             ▼
+    target session   best-fit session
+         │             │
+         └──────┬──────┘
+                ▼
+         sends response via teleg MCP tools
 ```
-
-## Files
-
-- `src/index.ts` - Main extension source (TypeScript)
-- `dist/` - Compiled JavaScript output
-- `package.json` - Package configuration
-
-## Dependencies
-
-- `@earendil-works/pi-ai` - Pi AI types
-- `@earendil-works/pi-coding-agent` - Pi extension API
-- `@sinclair/typebox` - Schema type definitions
 
 ## License
 
