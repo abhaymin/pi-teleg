@@ -1258,11 +1258,15 @@ stop - Abort current turn`,
     if (sessInfo && !sessInfo.announcedPresence) {
       const chatId = state.config.allowedUserIds?.[0];
       if (chatId && state.config.botToken) {
-        await fetch(`https://api.telegram.org/bot${state.config.botToken}/sendMessage`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ chat_id: chatId, text: `✅ <b>${sessionName}</b> connected`, parse_mode: "HTML" }),
-        });
+        try {
+          await fetch(`https://api.telegram.org/bot${state.config.botToken}/sendMessage`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ chat_id: chatId, text: `✅ <b>${sessionName}</b> connected`, parse_mode: "HTML" }),
+          });
+        } catch {
+          // Network unavailable — skip announcement, extension still loads
+        }
       }
       sessInfo.announcedPresence = true;
       await writeSessionRegistry(registry1);
@@ -1309,11 +1313,15 @@ stop - Abort current turn`,
     if (dying && dying.announcedPresence) {
       const chatId = state.config.allowedUserIds?.[0];
       if (chatId && state.config.botToken) {
-        await fetch(`https://api.telegram.org/bot${state.config.botToken}/sendMessage`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ chat_id: chatId, text: `⚠️ <b>${sessionName}</b> disconnected`, parse_mode: "HTML" }),
-        }).catch(() => {});
+        try {
+          await fetch(`https://api.telegram.org/bot${state.config.botToken}/sendMessage`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ chat_id: chatId, text: `⚠️ <b>${sessionName}</b> disconnected`, parse_mode: "HTML" }),
+          });
+        } catch {
+          // Network unavailable — skip
+        }
       }
     }
     
