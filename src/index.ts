@@ -29,8 +29,11 @@ import {
 
 const DEFAULT_ARCHIVE_ROOT = join(homedir(), "pi-teleg-archive");
 const CONFIG_DIR = join(homedir(), ".pi", "agent");
+const CONFIG_FILE = join(CONFIG_DIR, "teleg-bridge.json");
 const SESSION_REGISTRY_FILE = join(CONFIG_DIR, "teleg-sessions.json");
 const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "teleg-bridge");
+const POLLING_LOCK_FILE = join(TEMP_DIR, "polling.lock");
+const POLLING_LOCK_REFRESH_MS = 15000;
 const TELEGRAM_PREFIX = "[telegram]";
 const MAX_MESSAGE_LENGTH = 4096;
 const MAX_ATTACHMENTS_PER_TURN = 10;
@@ -40,14 +43,6 @@ const INITIAL_RECONNECT_DELAY_MS = 1000;
 const MAX_RECONNECT_DELAY_MS = 30000;
 const MAX_CONSECUTIVE_ERRORS = 5;
 const BASE_BACKOFF_MULTIPLIER = 2;
-
-// Per-session config and lock file helpers
-function getConfigFile(sessionName: string): string {
-  return join(CONFIG_DIR, `teleg-bridge.${sessionName}.json`);
-}
-function getPollingLockFile(sessionName: string): string {
-  return join(TEMP_DIR, `polling.lock.${sessionName}`);
-}
 
 // ============================================================================
 // Types
@@ -169,25 +164,11 @@ Telegram bridge extension is active.
 // Utility Functions
 // ============================================================================
 
-async function readConfig(sessionName?: string): Promise<TelegramConfig> {
-  // Try per-session config first, fall back to default teleg-bridge.json
-  if (sessionName) {
-    try {
-      const content = await readFile(getConfigFile(sessionName), "utf8");
-      const parsed = JSON.parse(content) as TelegramConfig & { allowedUserId?: number };
-      if (parsed.allowedUserId && (!parsed.allowedUserIds || parsed.allowedUserIds.length === 0)) {
-        parsed.allowedUserIds = [parsed.allowedUserId];
-      }
-      delete (parsed as Record<string, unknown>).allowedUserId;
-      return parsed;
-    } catch {
-      // Fall back to default config
-    }
-  }
-  const defaultConfig = join(CONFIG_DIR, "teleg-bridge.json");
+async function readConfig(): Promise<TelegramConfig> {
   try {
-    const content = await readFile(defaultConfig, "utf8");
+    const content = await readFile(CONFIG_FILE, "utf8");
     const parsed = JSON.parse(content) as TelegramConfig & { allowedUserId?: number };
+    // Migrate old allowedUserId (singular) to allowedUserIds (plural array)
     if (parsed.allowedUserId && (!parsed.allowedUserIds || parsed.allowedUserIds.length === 0)) {
       parsed.allowedUserIds = [parsed.allowedUserId];
     }
@@ -198,10 +179,9 @@ async function readConfig(sessionName?: string): Promise<TelegramConfig> {
   }
 }
 
-async function writeConfig(cfg: TelegramConfig, sessionName?: string): Promise<void> {
+async function writeConfig(cfg: TelegramConfig): Promise<void> {
   await mkdir(CONFIG_DIR, { recursive: true });
-  const configFile = sessionName ? getConfigFile(sessionName) : join(CONFIG_DIR, "teleg-bridge.json");
-  await writeFile(configFile, JSON.stringify(cfg, null, "\t") + "\n", "utf8");
+  await writeFile(CONFIG_FILE, JSON.stringify(cfg, null, "\t") + "\n", "utf8");
 }
 
 async function readSessionRegistry(): Promise<SessionRegistry> {
@@ -254,31 +234,31 @@ const SharedPollingManager = (() => {
   let pollingPromise: Promise<void> | undefined;
   let isPolling = false;
   let lockRefreshInterval: ReturnType<typeof setInterval> | undefined;
-  let currentSessionName: string | undefined;
   
-  async function acquirePollingLock(sessionName: string): Promise<boolean> {
-    const lockFile = getPollingLockFile(sessionName);
+  async function acquirePollingLock(): Promise<boolean> {
     try {
       await mkdir(TEMP_DIR, { recursive: true });
       try {
-        const existing = await readFile(lockFile, "utf8");
+        const existing = await readFile(POLLING_LOCK_FILE, "utf8");
         const parts = existing.trim().split("\n");
         const oldPid = parseInt(parts[0], 10);
         const oldTime = parseInt(parts[1] || "0", 10);
+        // Check if lock is stale (>30s without refresh)
         if (oldPid && !isNaN(oldPid)) {
           try {
-            process.kill(oldPid, 0);
-            if (Date.now() - oldTime < 45000) { // stale after 3x15s
-              return false;
+            process.kill(oldPid, 0); // Check if process exists
+            // Process alive and lock fresh
+            if (Date.now() - oldTime < POLLING_LOCK_REFRESH_MS * 3) {
+              return false; // Another process already holds the lock
             }
           } catch {
-            // Process dead, stale lock - claim it
+            // Process dead, lock is stale - we can claim it
           }
         }
       } catch {
-        // No lock file
+        // No lock file exists, we can claim it
       }
-      await writeFile(lockFile, `${process.pid}\n${Date.now()}\n`, "utf8");
+      await writeFile(POLLING_LOCK_FILE, `${process.pid}\n${Date.now()}\n`, "utf8");
       return true;
     } catch {
       return false;
@@ -286,9 +266,8 @@ const SharedPollingManager = (() => {
   }
   
   async function refreshPollingLock(): Promise<void> {
-    if (!currentSessionName) return;
     try {
-      await writeFile(getPollingLockFile(currentSessionName), `${process.pid}\n${Date.now()}\n`, "utf8");
+      await writeFile(POLLING_LOCK_FILE, `${process.pid}\n${Date.now()}\n`, "utf8");
     } catch {
       // Best effort
     }
@@ -299,12 +278,10 @@ const SharedPollingManager = (() => {
       clearInterval(lockRefreshInterval);
       lockRefreshInterval = undefined;
     }
-    if (!currentSessionName) return;
-    const lockFile = getPollingLockFile(currentSessionName);
     try {
-      const existing = await readFile(lockFile, "utf8");
+      const existing = await readFile(POLLING_LOCK_FILE, "utf8");
       if (existing.trim().startsWith(String(process.pid))) {
-        await writeFile(lockFile, "", "utf8");
+        await writeFile(POLLING_LOCK_FILE, "", "utf8");
       }
     } catch {
       // Best effort
@@ -581,22 +558,20 @@ const SharedPollingManager = (() => {
     );
   }
   
-  async function startPolling(sessionName: string): Promise<void> {
+  async function startPolling(): Promise<void> {
     if (!config.botToken || isPolling) return;
     
-    currentSessionName = sessionName;
-    
-    // Acquire per-session lock before starting polling
-    const hasLock = await acquirePollingLock(sessionName);
+    // Acquire cross-process lock before starting polling
+    const hasLock = await acquirePollingLock();
     if (!hasLock) {
-      return; // Another process already polling this session's bot, skip
+      return; // Another process is already polling, skip
     }
     
     pollingController = new AbortController();
     isPolling = true;
     
     // Refresh lock periodically so other processes can detect if we crash
-    lockRefreshInterval = setInterval(refreshPollingLock, 15000);
+    lockRefreshInterval = setInterval(refreshPollingLock, POLLING_LOCK_REFRESH_MS);
     
     pollingPromise = pollLoop(pollingController.signal).finally(() => {
       pollingPromise = undefined;
@@ -617,19 +592,19 @@ const SharedPollingManager = (() => {
   }
   
   return {
-    async init(sessionName?: string): Promise<void> {
-      config = await readConfig(sessionName);
+    async init(): Promise<void> {
+      config = await readConfig();
     },
     
-    async updateConfig(newConfig: TelegramConfig, sessionName?: string): Promise<void> {
+    async updateConfig(newConfig: TelegramConfig): Promise<void> {
       config = newConfig;
-      await writeConfig(config, sessionName);
+      await writeConfig(config);
     },
     
-    async start(sessionName?: string): Promise<void> {
-      await this.init(sessionName);
+    async start(): Promise<void> {
+      await this.init();
       if (!isPolling && config.botToken) {
-        await startPolling(sessionName || "default");
+        await startPolling();
       }
     },
     
@@ -796,9 +771,6 @@ export default function (pi: ExtensionAPI): void {
   const sessionName = cwd.split("/").filter(Boolean).pop() || "default";
   let state: SessionState = createSessionState(sessionId);
   
-  // Relay-to-agent coordination: resolve pending relay command promises
-  let pendingRelayResolve: ((response: string) => void) | null = null;
-  
   function updateStatus(ctx: ExtensionContext, error?: string): void {
     const theme = ctx.ui.theme;
     const label = `${theme.fg("accent", "teleg")}${theme.fg("muted", ":" + sessionName)}`;
@@ -908,7 +880,7 @@ export default function (pi: ExtensionAPI): void {
         allowedUserIds: state.config.allowedUserIds || [],
       };
       
-      await SharedPollingManager.updateConfig(newConfig, sessionName);
+      await SharedPollingManager.updateConfig(newConfig);
       state.config = newConfig;
       
       ctx.ui.notify(`Teleg-bridge connected: @${botInfo.username}`, "info");
@@ -1284,8 +1256,8 @@ stop - Abort current turn`,
   // ========================================================================
   
   pi.on("session_start", async (_event, ctx) => {
-    await SharedPollingManager.init(sessionName);
-    state.config = await readConfig(sessionName);
+    await SharedPollingManager.init();
+    state.config = await readConfig();
     await mkdir(TEMP_DIR, { recursive: true });
     await registerSession();
 
@@ -1312,33 +1284,13 @@ stop - Abort current turn`,
     // Start the relay server for inter-session command forwarding
     await startRelayServer(sessionName).catch(console.error);
     setCommandHandler(async (text, meta) => {
-      // Forwarded command from another session — process through this session's agent
-      if (state.activeTurn) {
-        return `[${sessionName}] Busy — try again later`;
-      }
-      
-      const responsePromise = new Promise<string>((resolve) => {
-        pendingRelayResolve = resolve;
-      });
-      
-      // Create a turn mimicking a Telegram message
-      const turn = {
-        sessionId,
-        sessionName,
-        chatId: meta.chatId,
-        replyToMessageId: meta.messageId,
-        queuedAttachments: [] as QueuedAttachment[],
-        content: [{ type: "text" as const, text: `[telegram] ${text}` }],
-        historyText: text,
-      };
-      state.activeTurn = turn as ActiveTelegramTurn;
-      pi.sendUserMessage(turn.content);
-      
-      return responsePromise;
+      // When a forwarded command arrives, process it and return the response
+      // For now just echo back for testing
+      return `[${sessionName}] Received: ${text}`;
     });
 
     if (state.config.botToken) {
-      await SharedPollingManager.start(sessionName);
+      await SharedPollingManager.start();
     }
     
     SharedPollingManager.onMessage(async (turn, update) => {
@@ -1346,25 +1298,6 @@ stop - Abort current turn`,
       if (!message) return;
       
       if (turn.sessionId !== sessionId && turn.sessionId !== "unassigned") {
-        // Message is for a different session — forward via relay
-        const reg = await readSessionRegistry();
-        const targetSession = reg.sessions.find(s => s.sessionId === turn.sessionId);
-        if (targetSession) {
-          const text = message.text || message.caption || "";
-          const cleanText = text.replace(/^@\S+\s*/, "");
-          const fwd = await forwardToSession(targetSession.sessionName, cleanText, {
-            chatId: message.chat.id,
-            messageId: message.message_id,
-          });
-          if (fwd.ok) {
-            if (fwd.response) {
-              await SharedPollingManager.sendReply(String(message.chat.id), message.message_id, fwd.response);
-            }
-          } else {
-            await SharedPollingManager.sendReply(String(message.chat.id), message.message_id,
-              `⚠️ Could not reach @${targetSession.sessionName}: ${fwd.error}`);
-          }
-        }
         return;
       }
       
@@ -1433,7 +1366,6 @@ stop - Abort current turn`,
   
   pi.on("agent_end", async (event, ctx) => {
     const turn = state.activeTurn;
-    const wasRelayed = !!pendingRelayResolve;
     state.activeTurn = undefined;
     SharedPollingManager.completeTurn(sessionId);
     updateStatus(ctx);
@@ -1455,21 +1387,10 @@ stop - Abort current turn`,
       }
     }
     
-    if (wasRelayed) {
-      // This turn came from a relay forward — resolve the pending promise
-      // instead of sending directly to Telegram (the polling session sends it)
-      const resolve = pendingRelayResolve;
-      pendingRelayResolve = null;
-      if (resolve) {
-        resolve(assistantText || "(no response)");
-      }
-    } else {
-      // Normal Telegram turn — send reply directly
-      if (assistantText) {
-        await SharedPollingManager.sendReply(String(turn.chatId), turn.replyToMessageId, assistantText);
-      } else if (turn.queuedAttachments.length > 0) {
-        await SharedPollingManager.sendReply(String(turn.chatId), turn.replyToMessageId, "Attached requested file(s).");
-      }
+    if (assistantText) {
+      await SharedPollingManager.sendReply(String(turn.chatId), turn.replyToMessageId, assistantText);
+    } else if (turn.queuedAttachments.length > 0) {
+      await SharedPollingManager.sendReply(String(turn.chatId), turn.replyToMessageId, "Attached requested file(s).");
     }
     
     for (const attachment of turn.queuedAttachments) {
