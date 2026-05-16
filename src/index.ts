@@ -25,6 +25,8 @@ const CONFIG_DIR = join(homedir(), ".pi", "agent");
 const CONFIG_FILE = join(CONFIG_DIR, "teleg-bridge.json");
 const SESSION_REGISTRY_FILE = join(CONFIG_DIR, "teleg-sessions.json");
 const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "teleg-bridge");
+const POLLING_LOCK_FILE = join(TEMP_DIR, "polling.lock");
+const POLLING_LOCK_REFRESH_MS = 15000;
 const TELEGRAM_PREFIX = "[telegram]";
 const MAX_MESSAGE_LENGTH = 4096;
 const MAX_ATTACHMENTS_PER_TURN = 10;
@@ -156,7 +158,13 @@ Telegram bridge extension is active.
 async function readConfig(): Promise<TelegramConfig> {
   try {
     const content = await readFile(CONFIG_FILE, "utf8");
-    return JSON.parse(content);
+    const parsed = JSON.parse(content) as TelegramConfig & { allowedUserId?: number };
+    // Migrate old allowedUserId (singular) to allowedUserIds (plural array)
+    if (parsed.allowedUserId && (!parsed.allowedUserIds || parsed.allowedUserIds.length === 0)) {
+      parsed.allowedUserIds = [parsed.allowedUserId];
+    }
+    delete (parsed as Record<string, unknown>).allowedUserId;
+    return parsed;
   } catch {
     return {};
   }
@@ -216,6 +224,60 @@ const SharedPollingManager = (() => {
   let pollingController: AbortController | undefined;
   let pollingPromise: Promise<void> | undefined;
   let isPolling = false;
+  let lockRefreshInterval: ReturnType<typeof setInterval> | undefined;
+  
+  async function acquirePollingLock(): Promise<boolean> {
+    try {
+      await mkdir(TEMP_DIR, { recursive: true });
+      try {
+        const existing = await readFile(POLLING_LOCK_FILE, "utf8");
+        const parts = existing.trim().split("\n");
+        const oldPid = parseInt(parts[0], 10);
+        const oldTime = parseInt(parts[1] || "0", 10);
+        // Check if lock is stale (>30s without refresh)
+        if (oldPid && !isNaN(oldPid)) {
+          try {
+            process.kill(oldPid, 0); // Check if process exists
+            // Process alive and lock fresh
+            if (Date.now() - oldTime < POLLING_LOCK_REFRESH_MS * 3) {
+              return false; // Another process already holds the lock
+            }
+          } catch {
+            // Process dead, lock is stale - we can claim it
+          }
+        }
+      } catch {
+        // No lock file exists, we can claim it
+      }
+      await writeFile(POLLING_LOCK_FILE, `${process.pid}\n${Date.now()}\n`, "utf8");
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  
+  async function refreshPollingLock(): Promise<void> {
+    try {
+      await writeFile(POLLING_LOCK_FILE, `${process.pid}\n${Date.now()}\n`, "utf8");
+    } catch {
+      // Best effort
+    }
+  }
+  
+  async function releasePollingLock(): Promise<void> {
+    if (lockRefreshInterval) {
+      clearInterval(lockRefreshInterval);
+      lockRefreshInterval = undefined;
+    }
+    try {
+      const existing = await readFile(POLLING_LOCK_FILE, "utf8");
+      if (existing.trim().startsWith(String(process.pid))) {
+        await writeFile(POLLING_LOCK_FILE, "", "utf8");
+      }
+    } catch {
+      // Best effort
+    }
+  }
   
   let pollState: PollState = {
     consecutiveErrors: 0,
@@ -489,14 +551,25 @@ const SharedPollingManager = (() => {
   
   async function startPolling(): Promise<void> {
     if (!config.botToken || isPolling) return;
+    
+    // Acquire cross-process lock before starting polling
+    const hasLock = await acquirePollingLock();
+    if (!hasLock) {
+      return; // Another process is already polling, skip
+    }
+    
     pollingController = new AbortController();
     isPolling = true;
+    
+    // Refresh lock periodically so other processes can detect if we crash
+    lockRefreshInterval = setInterval(refreshPollingLock, POLLING_LOCK_REFRESH_MS);
     
     pollingPromise = pollLoop(pollingController.signal).finally(() => {
       pollingPromise = undefined;
       pollingController = undefined;
       isPolling = false;
       stopHealthChecks();
+      releasePollingLock();
     });
   }
   
@@ -505,6 +578,7 @@ const SharedPollingManager = (() => {
     pollingController?.abort();
     pollingController = undefined;
     await pollingPromise?.catch(() => undefined);
+    await releasePollingLock();
     isPolling = false;
   }
   

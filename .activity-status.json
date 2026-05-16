@@ -1,0 +1,78 @@
+{
+  "bot": {
+    "online": true,
+    "username": "mySourceAM2_bot",
+    "checked_at": "2026-05-16T14:56:01.076Z"
+  },
+  "queue": {
+    "pending": 0,
+    "processing": 0,
+    "completed": 0,
+    "failed": 26,
+    "items": []
+  },
+  "recent_messages": [],
+  "recent_downloads": [
+    {
+      "time": "2026-05-14T19:55:10.697Z",
+      "tweet_id": "2052024741486322051",
+      "status": "failed",
+      "details": "Unknown error"
+    },
+    {
+      "time": "2026-05-14T19:55:10.695Z",
+      "tweet_id": "2052024741486322051",
+      "status": "failed",
+      "details": "spawn pi ENOENT"
+    },
+    {
+      "time": "2026-05-14T19:55:10.693Z",
+      "tweet_id": "2052024741486322051",
+      "status": "started",
+      "details": "Priority: normal"
+    },
+    {
+      "time": "2026-05-14T19:55:09.897Z",
+      "tweet_id": "2052024741486322051",
+      "status": "failed",
+      "details": "Unknown error"
+    },
+    {
+      "time": "2026-05-14T19:55:09.897Z",
+      "tweet_id": "2052024741486322051",
+      "status": "failed",
+      "details": "Unknown error"
+    },
+    {
+      "time": "2026-05-14T19:55:09.894Z",
+      "tweet_id": "2052024741486322051",
+      "status": "failed",
+      "details": "spawn pi ENOENT"
+    },
+    {
+      "time": "2026-05-14T19:55:09.892Z",
+      "tweet_id": "2052024741486322051",
+      "status": "started",
+      "details": "Priority: normal"
+    },
+    {
+      "time": "2026-05-14T19:55:09.891Z",
+      "tweet_id": "2052024741486322051",
+      "status": "failed",
+      "details": "spawn pi ENOENT"
+    },
+    {
+      "time": "2026-05-14T19:55:09.889Z",
+      "tweet_id": "2052024741486322051",
+      "status": "started",
+      "details": "Priority: normal"
+    },
+    {
+      "time": "2026-05-14T19:55:09.516Z",
+      "tweet_id": "2052024741486322051",
+      "status": "failed",
+      "details": "Unknown error"
+    }
+  ],
+  "last_updated": "2026-05-16T14:56:01.076Z"
+}
