@@ -1,28 +1,45 @@
 {
-  "name": "pi-teleg",
-  "version": "1.0.0",
-  "description": "Pi Extension: Telegram bridge with Twitter/X media download support",
-  "type": "module",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
-  "scripts": {
-    "build": "tsc",
-    "dev": "tsc --watch",
-    "prepublishOnly": "npm run build"
-  },
-  "keywords": ["pi", "telegram", "bridge", "extension", "twitter"],
-  "author": "",
-  "license": "MIT",
-  "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@sinclair/typebox": "*"
-  },
-  "devDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@sinclair/typebox": "*",
-    "@types/node": "^20.0.0",
-    "typescript": "^5.0.0"
-  }
+    "name": "teleg-bridge",
+    "version": "1.0.0",
+    "description": "Pi Extension: Telegram bridge with Twitter/X media download support",
+    "type": "module",
+    "main": "dist/index.js",
+    "types": "dist/index.d.ts",
+    "exports": {
+      "import": "./dist/index.js",
+      "default": "./dist/index.js",
+      ".": {
+        "import": "./dist/index.js",
+        "default": "./dist/index.js"
+      }
+    },
+    "scripts": {
+        "build": "tsc",
+        "dev": "tsc --watch",
+        "prepublishOnly": "npm run build",
+        "build:mcp": "cd mcp-server && npm install",
+        "deploy": "./deploy.sh",
+        "deploy:watch": "./deploy.sh --watch"
+    },
+    "keywords": [
+        "pi",
+        "telegram",
+        "bridge",
+        "extension",
+        "twitter"
+    ],
+    "author": "",
+    "license": "MIT",
+    "peerDependencies": {
+        "@earendil-works/pi-ai": "*",
+        "@earendil-works/pi-coding-agent": "*",
+        "@sinclair/typebox": "*"
+    },
+    "devDependencies": {
+        "@earendil-works/pi-ai": "*",
+        "@earendil-works/pi-coding-agent": "*",
+        "@sinclair/typebox": "*",
+        "@types/node": "^20.0.0",
+        "typescript": "^5.0.0"
+    }
 }

@@ -63,32 +63,58 @@
 >
 > **These rules are NON-NEGOTIABLE and enforced at every step of the download pipeline.**
 
-This project uses a coordinated multi-agent approach with specialized agents for different tasks.
+## Deploy System (Extension + MCP Server)
+
+This is a **monorepo** that deploys both the pi extension and an MCP server from the same source tree:
+
+```
+/home/abhaym/Development/PTGD/teleg/
+├── src/extension/          # pi extension (TypeScript, builds to dist/)
+├── mcp-server/             # Standalone MCP server (Node.js)
+├── deploy.sh              # One-command deploy: extension + MCP server + settings
+└── AGENTS.md              # This file
+```
+
+**To deploy:**
+```bash
+cd /home/abhaym/Development/PTGD/teleg
+./deploy.sh
+# Then restart pi from ANY directory
+```
+
+The deploy script:
+1. Builds the extension TypeScript → `dist/index.js`
+2. Installs MCP server dependencies
+3. Updates `~/.pi/agent/settings.json` with extension + MCP packages
+4. Updates `~/.pi/agent/mcp.json` with browser MCP configs
+
+**What each part does:**
+- **Extension** (`src/extension/`): Owns Telegram polling + message routing + @sessionName dispatch
+- **MCP server** (`mcp-server/`): Provides `send_message`, `send_photo`, `send_video` tools via HTTP to ALL AI sessions (but only extension polls)
+
+**Multi-session routing:**
+- ALL sessions load both extension + MCP server
+- Only the session with the polling lock handles incoming Telegram messages
+- Messages prefixed with `@sessionName` route to that specific session
+- Messages without prefix go to the primary session
+- Each session shows its own name in the status bar (`teleg:teleg`, `teleg:pi-mem`)
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         AGENTS.md (This File)                       │
+│                 teleg monorepo (single git repo)                     │
 ├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  ┌──────────────────────────────────────────────────────────────┐  │
-│  │                     LOCAL MODELS (Safe)                      │  │
-│  │                   qwen3.6 | llamacpp1                        │  │
-│  └──────────────────────────────────────────────────────────────┘  │
-│                            │                                        │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐          │
-│  │   Twitter/X  │    │    Browser   │    │   Download   │          │
-│  │    Agent     │───▶│    Agent     │───▶│    Agent     │          │
-│  │   (qwen3.6)  │    │  (browserOS) │    │              │          │
-│  └──────────────┘    └──────────────┘    └──────────────┘          │
-│         │                  │                   │                    │
-│         └──────────────────┴───────────────────┘                    │
-│                            │                                        │
-│                     ┌──────▼──────┐                                 │
-│                     │   Archive   │                                 │
-│                     │    Agent    │                                 │
-│                     └─────────────┘                                 │
+│  Extension (src/extension/)     │   MCP server (mcp-server/)        │
+│  • Owns Telegram polling lock  │   • HTTP tools (no polling)        │
+│  • Handles @sessionName routing│   • Works in ALL sessions          │
+│  • Registers tools via pi API  │   • Shared config at ~/.pi/agent/ │
+└──────────────┬──────────────────┴────────────────────────────────────┘
+               │
+               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ ~/.pi/agent/settings.json                                           │
+│   packages: [".../teleg/src/extension", ".../teleg/mcp-server"]    │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
