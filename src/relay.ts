@@ -9,7 +9,7 @@
  */
 
 import { createServer } from "http";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 
@@ -48,9 +48,87 @@ function generateSecret(length = 32): string {
   return result;
 }
 
+/**
+ * Remove relay files for PIDs that are no longer alive.
+ * Called on startup to prevent stale relay files from accumulating.
+ */
+export function cleanStaleRelayFiles(): void {
+  ensureRelayDir();
+  try {
+    const files = readdirSync(RELAY_DIR);
+    for (const file of files) {
+      if (!file.endsWith(".json")) continue;
+      try {
+        const relayPath = join(RELAY_DIR, file);
+        const info = JSON.parse(readFileSync(relayPath, "utf8")) as RelayInfo;
+        try {
+          process.kill(info.pid, 0);
+          // PID is alive, keep this relay file
+        } catch {
+          // PID is dead, remove stale relay file
+          unlinkSync(relayPath);
+        }
+      } catch {
+        // Corrupted relay file, remove it
+        try { unlinkSync(join(RELAY_DIR, file)); } catch {}
+      }
+    }
+  } catch {}
+}
+
+/**
+ * Return the set of session names that have alive relay servers.
+ * Used to cross-check against the session registry.
+ */
+export function getAliveSessionNames(): Set<string> {
+  const alive = new Set<string>();
+  ensureRelayDir();
+  try {
+    const files = readdirSync(RELAY_DIR);
+    for (const file of files) {
+      if (!file.endsWith(".json")) continue;
+      try {
+        const relayPath = join(RELAY_DIR, file);
+        const info = JSON.parse(readFileSync(relayPath, "utf8")) as RelayInfo;
+        try {
+          process.kill(info.pid, 0);
+          alive.add(info.sessionName);
+        } catch {
+          // PID is dead, skip
+        }
+      } catch {}
+    }
+  } catch {}
+  return alive;
+}
+
+/**
+ * Remove ALL relay files belonging to this PID.
+ * Called on shutdown to clean up duplicates from crashes.
+ */
+export function cleanRelayFilesByPid(pid: number): void {
+  ensureRelayDir();
+  try {
+    const files = readdirSync(RELAY_DIR);
+    for (const file of files) {
+      if (!file.endsWith(".json")) continue;
+      try {
+        const relayPath = join(RELAY_DIR, file);
+        const info = JSON.parse(readFileSync(relayPath, "utf8")) as RelayInfo;
+        if (info.pid === pid) {
+          unlinkSync(relayPath);
+        }
+      } catch {}
+    }
+  } catch {}
+}
+
 export function startRelayServer(sessionName: string, basePort = 9798): Promise<RelayInfo> {
   return new Promise((resolve, reject) => {
     ensureRelayDir();
+    
+    // Clean stale relay files for dead PIDs before registering
+    cleanStaleRelayFiles();
     
     // Find an available port starting from basePort
     let port = basePort;
@@ -154,7 +232,7 @@ export function stopRelayServer(): void {
       if (existsSync(relayPath)) {
         const info = JSON.parse(readFileSync(relayPath, "utf8"));
         if (info.pid === process.pid) {
-          require("fs").unlinkSync(relayPath);
+          unlinkSync(relayPath);
         }
       }
     } catch {}
@@ -224,7 +302,7 @@ export async function getRelayStatus(): Promise<Record<string, { port: number; a
   const status: Record<string, { port: number; alive: boolean }> = {};
   
   try {
-    const files = require("fs").readdirSync(RELAY_DIR);
+    const files = readdirSync(RELAY_DIR);
     for (const file of files) {
       if (!file.endsWith(".json")) continue;
       try {

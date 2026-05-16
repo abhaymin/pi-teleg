@@ -11,6 +11,7 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { readFileSync } from "node:fs";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -21,6 +22,8 @@ import {
   setCommandHandler,
   forwardToSession,
   getRelayStatus,
+  cleanStaleRelayFiles,
+  cleanRelayFilesByPid,
 } from "./relay.js";
 
 // ============================================================================
@@ -60,6 +63,7 @@ interface TelegramConfig {
 interface SessionInfo {
   sessionId: string;
   sessionName: string;
+  pid: number;                // process ID for liveness checks
   connectedAt: number;
   lastActivity: number;
   isActive: boolean;
@@ -591,6 +595,29 @@ const SharedPollingManager = (() => {
     isPolling = false;
   }
   
+  /** Check if another alive process holds the polling lock (sync). */
+  function isPollingLockHeldByOther(): boolean {
+    try {
+      const existing = readFileSync(POLLING_LOCK_FILE, "utf8");
+      const parts = existing.trim().split("\n");
+      const oldPid = parseInt(parts[0], 10);
+      const oldTime = parseInt(parts[1] || "0", 10);
+      if (oldPid && !isNaN(oldPid) && oldPid !== process.pid) {
+        try {
+          process.kill(oldPid, 0);
+          if (Date.now() - oldTime < POLLING_LOCK_REFRESH_MS * 3) {
+            return true; // Another process holds a fresh lock
+          }
+        } catch {
+          // Process dead, lock is stale
+        }
+      }
+    } catch {
+      // No lock file
+    }
+    return false;
+  }
+  
   return {
     async init(): Promise<void> {
       config = await readConfig();
@@ -614,6 +641,11 @@ const SharedPollingManager = (() => {
     
     isActive(): boolean {
       return isPolling;
+    },
+    
+    /** True if another process is actively polling and we should stay passive. */
+    isHeldByOther(): boolean {
+      return isPollingLockHeldByOther();
     },
     
     getState(): PollState {
@@ -790,7 +822,11 @@ export default function (pi: ExtensionAPI): void {
       return;
     }
     if (!SharedPollingManager.isActive()) {
-      ctx.ui.setStatus("teleg-bridge", `${label} ${theme.fg("warning", "reconnecting...")}`);
+      if (SharedPollingManager.isHeldByOther()) {
+        ctx.ui.setStatus("teleg-bridge", `${label} ${theme.fg("muted", "passive")}`);
+      } else {
+        ctx.ui.setStatus("teleg-bridge", `${label} ${theme.fg("warning", "reconnecting...")}`);
+      }
       return;
     }
     if (!state.config.allowedUserIds || state.config.allowedUserIds.length === 0) {
@@ -812,13 +848,31 @@ export default function (pi: ExtensionAPI): void {
   async function registerSession(): Promise<void> {
     const registry = await readSessionRegistry();
     
+    // Remove sessions that are older than 1 hour (no heartbeat)
     const oneHourAgo = Date.now() - 3600000;
     registry.sessions = registry.sessions.filter(s => s.lastActivity > oneHourAgo);
+    
+    // Clean stale relay files for dead PIDs to match registry with reality
+    cleanStaleRelayFiles();
+    
+    // Actively purge orphaned sessions: check PID liveness directly.
+    // This removes stale entries from crashes immediately instead of waiting 1 hour.
+    // Keeps: current session, and any session whose PID is still alive (other Pi processes).
+    registry.sessions = registry.sessions.filter(s => {
+      if (s.sessionId === sessionId) return true;        // always keep ourselves
+      try {
+        process.kill(s.pid, 0);                            // check if PID alive
+        return true;                                       // another session is still running
+      } catch {
+        return false;                                      // PID dead → remove
+      }
+    });
     
     const existing = registry.sessions.findIndex(s => s.sessionId === sessionId);
     const sessionInfo: SessionInfo = {
       sessionId,
       sessionName,
+      pid: process.pid,
       connectedAt: Date.now(),
       lastActivity: Date.now(),
       isActive: true,
@@ -842,6 +896,12 @@ export default function (pi: ExtensionAPI): void {
   async function unregisterSession(): Promise<void> {
     const registry = await readSessionRegistry();
     registry.sessions = registry.sessions.filter(s => s.sessionId !== sessionId);
+    
+    // Clean up ALL relay files belonging to our PID (handles stale duplicates from crashes)
+    cleanRelayFilesByPid(process.pid);
+    
+    // Also clean any other stale relay files for dead PIDs
+    cleanStaleRelayFiles();
     
     if (registry.primarySessionId === sessionId && registry.sessions.length > 0) {
       registry.primarySessionId = registry.sessions[0].sessionId;
@@ -980,10 +1040,19 @@ stop - Abort current turn`,
       const botInfo = SharedPollingManager.getBotInfo();
       const registry = await readSessionRegistry();
       
+      let pollingStatus: string;
+      if (SharedPollingManager.isActive()) {
+        pollingStatus = "running (active)";
+      } else if (SharedPollingManager.isHeldByOther()) {
+        pollingStatus = "passive (another session polls)";
+      } else {
+        pollingStatus = "stopped";
+      }
+      
       const lines = [
         `bot: ${botInfo.username ? `@${botInfo.username}` : "not configured"}`,
         `user: ${message.from!.id === state.config.allowedUserIds?.[0] ? "paired" : "not paired"}`,
-        `polling: ${SharedPollingManager.isActive() ? "running" : "stopped"}`,
+        `polling: ${pollingStatus}`,
         `health: ${pollState.isHealthy ? "OK" : "DEGRADED"}`,
         `consecutive errors: ${pollState.consecutiveErrors}`,
         `sessions: ${registry.sessions.length}${registry.sessions.map(s => `\n  ${s.sessionName === sessionName ? "*" : " "} ${s.sessionName} (${s.sessionId.slice(0, 12)}...)${s.sessionId === sessionId ? " ← you" : ""}`).join("")}`,
@@ -1254,7 +1323,35 @@ stop - Abort current turn`,
   // ========================================================================
   // Session Events
   // ========================================================================
+
+  // Register process signal handlers for graceful cleanup on kill/quit.
+  // These ensure relay files and session registry are cleaned even if pi is killed
+  // before session_shutdown fires.
+  function registerCleanupHandlers(): void {
+    const registered = new Set<string>();
+    
+    function cleanup(): void {
+      try {
+        stopRelayServer();
+        cleanRelayFilesByPid(process.pid);
+        cleanStaleRelayFiles();
+      } catch (err) {
+        console.error(`[teleg:${sessionName}] Cleanup error:`, err);
+      }
+    }
+    
+    for (const sig of ["SIGTERM", "SIGINT", "SIGHUP", "SIGQUIT"]) {
+      if (!registered.has(sig)) {
+        registered.add(sig);
+        process.on(sig as NodeJS.Signals, () => {
+          cleanup();
+        });
+      }
+    }
+  }
   
+  registerCleanupHandlers();
+
   pi.on("session_start", async (_event, ctx) => {
     await SharedPollingManager.init();
     state.config = await readConfig();
@@ -1304,8 +1401,19 @@ stop - Abort current turn`,
       await handleAuthorizedTelegramMessage(message, ctx);
     });
     
-    setInterval(() => {
-      heartbeatSession();
+    setInterval(async () => {
+      await heartbeatSession();
+      if (!SharedPollingManager.isActive() && state.config.botToken) {
+        if (SharedPollingManager.isHeldByOther()) {
+          // Another process is actively polling — stay passive, no retry needed
+          return;
+        }
+        // No lock holder — try to claim the polling lock
+        console.log(`[teleg:${sessionName}] Polling inactive, auto-restarting...`);
+        await SharedPollingManager.start().catch((err) =>
+          console.error(`[teleg:${sessionName}] Auto-restart failed:`, err)
+        );
+      }
     }, 30000);
     
     updateStatus(ctx);
