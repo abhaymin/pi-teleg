@@ -66,9 +66,8 @@ settings["packages"] = [
   if "teleg" not in p.lower()
 ]
 
-# Add extension and MCP server (extension first, then MCP)
+# Add extension path only (mcp-server is started by the extension, NOT loaded by pi)
 settings["packages"].append(teleg_path)
-settings["packages"].append(mcp_path)
 
 # Deduplicate while preserving order
 seen = set()
