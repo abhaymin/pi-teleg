@@ -1,0 +1,28 @@
+{
+  "name": "pi-teleg",
+  "version": "1.0.0",
+  "description": "Pi Extension: Telegram bridge with Twitter/X media download support",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": ["pi", "telegram", "bridge", "extension", "twitter"],
+  "author": "",
+  "license": "MIT",
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@sinclair/typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@sinclair/typebox": "*",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}
