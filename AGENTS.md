@@ -137,10 +137,10 @@ model: "llamacpp1"     # Direct llama.cpp
   - `chrome-devtools.list_network_requests` - Extract actual media URLs from network tab
 - **Download Method** (in priority order):
   1. **browserOS evaluate_script**: Navigate to tweet, extract `article video source` or `article img[src*="media"]` URLs
-  2. **yt-dlp --cookies-from-browser chrome** (RECOMMENDED for age-restricted content): Downloads via GraphQL API with browser session auth — reliable for age-gated tweets
-  3. **curl/ffmpeg with extracted auth**: If yt-dlp unavailable, use browserOS-extracted cookies with coded curl
-  4. **chrome-devtools network tab**: Find `video.twimg.com` or `pbs.twimg.com/media` URLs and download directly
-- **Key**: browserOS has auth session; yt-dlp with `--cookies-from-browser chrome` handles age-restricted content reliably
+  2. **curl with browserOS-extracted auth**: Extract cookies from browserOS session, use coded curl for direct download
+  3. **yt-dlp --cookies-from-browser chrome** (if available): Reliable fallback, especially for age-restricted content
+  4. **chrome-devtools network tab**: Find `video.twimg.com` or `pbs.twimg.com/media` URLs as last resort
+- **Key**: browserOS has auth session; curl with extracted auth works on all machines; yt-dlp is a convenience fallback
 
 ### 1.5 Coded Download (Fallback with Auth)
 - **Purpose**: Direct HTTP download when browserOS extraction fails
@@ -155,28 +155,27 @@ model: "llamacpp1"     # Direct llama.cpp
   // Get authorization header from fetch interceptors
   // Extract from window.__NEXUS_STATE__ or similar
   ```
-- **Coded Download Script** (Python/bash) — Use yt-dlp as primary tool:
+- **Coded Download Script** (Python/bash) — Use extracted auth with curl as primary:
   ```bash
-  # RECOMMENDED: yt-dlp with browser cookies (best for age-restricted content)
-  yt-dlp --cookies-from-browser chrome \
-    -o "{archive_path}%(title)s.%(ext)s" \
-    "{tweet_url}"
-
-  # FALLBACK: curl with auth headers if yt-dlp unavailable
+  # PRIMARY: curl with auth headers (works on all machines)
   curl -L -o "{output_path}" \
     -H "Authorization: Bearer {bearer_token}" \
     -H "Cookie: guest_id={guest}; ct0={csrf}" \
     "{media_url}"
+
+  # FALLBACK: yt-dlp with browser cookies (if available, better for age-restricted)
+  yt-dlp --cookies-from-browser chrome \
+    -o "{output_path}" "{tweet_url}"
   ```
 - **Tools for extraction**:
   - `browseros_evaluate_script` - Extract cookies/localStorage from active session
   - `bash` - Run coded download commands (curl, wget, yt-dlp)
 - **Priority**:
   1. browserOS navigate + evaluate_script (detect media type and URL)
-  2. yt-dlp --cookies-from-browser chrome (handles age-restricted + non-restricted)
-  3. Coded curl with browserOS-extracted auth cookies
+  2. curl with browserOS-extracted auth cookies (works on all machines)
+  3. yt-dlp --cookies-from-browser chrome (if available, better for age-restricted)
   4. chrome-devtools network inspection for direct URLs
-- **⚠️ Age-restricted tweets**: yt-dlp with browser cookies is the RELIABLE method — direct URL curls often fail for age-gated content. browserOS page shows the content but the blob URL cannot be downloaded directly.
+- **⚠️ Age-restricted tweets**: Try curl with auth first. If that fails and yt-dlp is available, use yt-dlp. Direct URL curls to `video.twimg.com` often fail for age-gated content even with auth.
 
 ### 2. Browser Agent (browserOS)
 - **Purpose**: Web navigation, scraping, and media capture
@@ -304,18 +303,22 @@ chains:
         task: |
           Download all media from {previous} to /home/abhaym/Development/PTGD/teleg/archive/tweets/{tweet_id}/
           Save tweet content as content.json
-      # FALLBACK: If previous step failed or returned empty, use yt-dlp (reliable for age-restricted content)
+      # FALLBACK: If previous step failed, try curl with auth, then yt-dlp if available
       - agent: "coded-download-agent"
         task: |
           IF {previous.media_urls} is empty OR download failed:
-            1. Use yt-dlp with browser cookies (RELIABLE for age-restricted tweets):
-               yt-dlp --cookies-from-browser chrome \
-                 -o "/archive/tweets/{tweet_id}/media/%(title)s.%(ext)s" \
-                 "{tweet_url}"
-            2. ONLY if yt-dlp unavailable, extract auth from browserOS session:
+            1. Extract auth from browserOS session:
                - Execute browseros_evaluate_script to get cookies/localStorage
-               - Run coded curl with auth headers
-            3. Verify download before archiving.
+            2. Try curl with auth headers first (works on all machines):
+               curl -L -o "{output_path}" \
+                 -H "Authorization: Bearer {bearer}" \
+                 -H "Cookie: guest_id={guest}; ct0={csrf}" \
+                 "{media_url}"
+            3. If curl fails and yt-dlp is available, use yt-dlp with browser cookies:
+               yt-dlp --cookies-from-browser chrome \
+                 -o "{archive_path}%(title)s.%(ext)s" \
+                 "{tweet_url}"
+            4. Verify download before archiving.
           ELSE: Skip this step (already have media from previous)
       - agent: "archive-agent"
         task: |
@@ -728,7 +731,7 @@ AUTH_COOKIE_FILE="/home/abhaym/Development/PTGD/teleg/archive/.auth_cookies.json
 BEARER_TOKEN_FILE="/home/abhaym/Development/PTGD/teleg/archive/.bearer_token.txt"
 
 # Fallback download tools priority
-FALLBACK_TOOLS="yt-dlp,browserOS,curl"  # Order of attempted tools (yt-dlp is most reliable)
+FALLBACK_TOOLS="curl,browserOS,yt-dlp"  # Order: curl-with-auth (guaranteed), browserOS, yt-dlp (optional)
 
 # Telegram bot settings
 TELEGRAM_BOT_TOKEN="your_bot_token_here"
@@ -1649,8 +1652,8 @@ show_queue() {
 5. **Every Download is Archived**: Any content from Twitter/X is immediately saved to `/home/abhaym/Development/PTGD/teleg/archive/`
 6. **Local First**: All content stored in `/home/abhaym/Development/PTGD/teleg/archive/` before notification
 7. **Complete Logging**: All actions logged to `/home/abhaym/Development/PTGD/teleg/archive/logs/`
-8. **Fallback Chain**: browserOS → yt-dlp (RECOMMENDED) → coded-curl → public-fallback
-9. **yt-dlp for Age-Restricted**: Always prefer `yt-dlp --cookies-from-browser chrome` for Twitter downloads — it reliably handles age-gated content via GraphQL API. Direct URL curls often fail for age-restricted tweets even with auth.
+8. **Fallback Chain**: browserOS → curl-with-auth → yt-dlp (if available) → public-fallback
+9. **curl-with-auth on all machines**: Prefer coded curl with browserOS-extracted auth over yt-dlp since curl is guaranteed to be available. yt-dlp is a convenience fallback.
 10. **Telegram Confirmation**: Action completed messages sent after successful archive
 11. **MultiAgent Coordination**: Use `pi-subagents` for orchestrated parallel workflows
 12. **Absolute Paths**: All file operations use `/home/abhaym/Development/PTGD/teleg/` as base
@@ -1660,9 +1663,9 @@ show_queue() {
 - **URL Invalid**: Send "❌ Invalid URL format" to Telegram
 - **Download Failed**: 
   1. Retry browserOS evaluate_script to detect media type
-  2. Use yt-dlp --cookies-from-browser chrome (RELIABLE for age-restricted content)
-  3. If yt-dlp unavailable, extract auth cookies from browserOS session and use coded curl
-  4. If auth method fails, try public fallback (no auth)
+  2. Extract auth from browserOS session and use curl with auth headers
+  3. If curl fails, try yt-dlp --cookies-from-browser chrome (if available)
+  4. If yt-dlp also fails, try public fallback (no auth)
   5. Then notify with error details if all methods exhausted
 - **Archive Full**: Alert user, clean oldest files if configured
 - **Browser Timeout**: Fallback to coded download with auth
