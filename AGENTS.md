@@ -47,19 +47,21 @@
 > - ✅ A tweet with video will have `<video>` element inside the article
 > - ❌ DO NOT only check for images - videos exist and must be detected
 > - ❌ DO NOT assume no media if only images are not found
-> - ✅ ALWAYS check both: `article.querySelectorAll('img, video')`
+> - ✅ ALWAYS check BOTH extraction methods in parallel:
+>   1. **browserOS evaluate_script**: `article img[src*="pbs.twimg.com/media"]` + `article video source`
+>   2. **chrome-devtools network tab**: filter `pbs.twimg.com/media` for images, `video.twimg.com` for videos
+> - ⚠️ Note: Some tweets use lazy-loaded media via X's internal handlers — browserOS may miss these. If browserOS returns empty, ALWAYS cross-check chrome-devtools network before marking as text-only.
 >
 > **FORCE RULE: VALIDATE MEDIA PRESENCE IN ALL BROWSER MCP**
 > **CRITICAL**: When using any browser MCP tool (browserOS, chrome-devtools, etc.), ALWAYS validate media presence:
 > - ✅ When calling `get_page_content` or similar extraction tools, ALWAYS include `includeImages: true` parameter
 > - ✅ When calling `get_page_content`, ALWAYS specify `selector: "img"` or `selector: "article"` to scope to main tweet
-> - ✅ Verify extracted image URLs contain `pbs.twimg.com/media` before attempting download
-> - ✅ For videos, verify `video` elements exist OR check network requests for `video.twimg.com` URLs
-> - ✅ If extraction returns no media, DO NOT assume tweet has no media - re-check with different selector or method
-> - ❌ DO NOT skip a tweet because one extraction method returned empty
-> - ❌ DO NOT mark a tweet as "text-only" without verifying media is actually absent
-> - ✅ Always cross-check: browserOS extract → chrome-devtools network → coded curl fallback
-> - ✅ If in doubt, navigate to `/photo/1` or `/video/1` endpoints to force media loading
+> - ✅ For images: browserOS evaluate_script + chrome-devtools network tab (filter `pbs.twimg.com/media`)
+> - ✅ For videos: browserOS evaluate_script + chrome-devtools network tab (filter `video.twimg.com`)
+> - ✅ If browserOS extraction returns empty, DO NOT stop — cross-check chrome-devtools network tab
+> - ❌ DO NOT skip a tweet because browserOS returned empty media
+> - ❌ DO NOT mark a tweet as "text-only" without checking chrome-devtools network for `pbs.twimg.com/media`
+> - ✅ Always do BOTH: browserOS evaluate_script → THEN chrome-devtools network tab check → coded curl fallback
 >
 > **These rules are NON-NEGOTIABLE and enforced at every step of the download pipeline.**
 
@@ -221,14 +223,42 @@ model: "llamacpp1"     # Direct llama.cpp
   /home/abhaym/Development/PTGD/teleg/archive/
   ├── tweets/
   │   ├── {tweet_id}/
-  │   │   ├── content.txt
+  │   │   ├── content.json       # REQUIRED - post metadata
   │   │   ├── media/
-  │   │   └── screenshot.png
+  │   │   │   ├── 01.jpg, 02.jpg   # downloaded media files
+  │   │   │   └── video.mp4
+  │   │   └── screenshot.png        # archival only (NOT sent to Telegram)
   ├── downloads/
-  │   └── {timestamp}_{original_filename}
   └── logs/
-      └── archive.log
   ```
+- **⚠️ ALWAYS create `content.json` on every media download** — this is REQUIRED:
+  ```json
+  {
+    "tweet_id": "2055599905415233885",
+    "url": "https://x.com/kakuukanojo_2nd/status/2055599905415233885",
+    "author": "架空彼女（サブ）",
+    "authorUsername": "kakuukanojo_2nd",
+    "text": "ビキニ女子💛 #AIグラビア SFW illustration. No nudity or suggestive intent.",
+    "media": {
+      "images": ["01.jpg"],
+      "videos": []
+    },
+    "archivedAt": "2026-05-16T21:55:00.000Z",
+    "source": "x.com"
+  }
+  ```
+- **content.json fields** (all required if media was downloaded):
+  - `tweet_id`: The tweet's numeric ID
+  - `url`: Full tweet URL
+  - `author`: Display name of tweet author
+  - `authorUsername`: @handle of author
+  - `text`: Full tweet text (or empty string if no text)
+  - `media.images`: Array of image filenames in media/ folder
+  - `media.videos`: Array of video filenames in media/ folder
+  - `archivedAt`: ISO timestamp of download
+  - `source`: "x.com" (or "reddit.com", "youtube.com" etc.)
+- **DO NOT skip content.json** — every media download MUST include it
+- **DO NOT use `content.txt`** — always use `content.json` with proper JSON structure
 
 ### 4. Notification Agent
 - **Purpose**: Send completion confirmation with media back to Telegram
@@ -346,11 +376,25 @@ chains:
                  "{tweet_url}"
             4. Verify download before archiving.
           ELSE: Skip this step (already have media from previous)
+      # Archive: media files + REQUIRED content.json
       - agent: "archive-agent"
         task: |
+          Archive downloaded media to /home/abhaym/Development/PTGD/teleg/archive/tweets/{tweet_id}/media/
+          Save REQUIRED content.json with post metadata:
+          {
+            "tweet_id": "{tweet_id}",
+            "url": "{tweet_url}",
+            "author": "{author}",
+            "authorUsername": "{authorHandle}",
+            "text": "{tweet_text}",
+            "media": {
+              "images": ["01.jpg", ...],
+              "videos": ["video.mp4", ...]
+            },
+            "archivedAt": "{timestamp}",
+            "source": "x.com"
+          }
           Log the download action to /home/abhaym/Development/PTGD/teleg/archive/logs/archive.log
-          Format: {timestamp} | {tweet_id} | {media_count} files | {status} | {method}
-          Note: Method should be 'browserOS', 'coded-curl', 'coded-yt-dlp', or 'public-fallback'
       - agent: "notify-agent"
         task: |
           Send confirmation: "✅ Downloaded and archived tweet {tweet_id}"
