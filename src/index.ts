@@ -771,6 +771,19 @@ const SharedPollingManager = (() => {
 })();
 
 // ============================================================================
+// Pending Forward (relay commands awaiting agent processing)
+// ============================================================================
+
+interface PendingForward {
+  chatId: number;
+  messageId: number;
+  text: string;
+  sourceSession: string;
+}
+
+const pendingForwards: PendingForward[] = [];
+
+// ============================================================================
 // Session State
 // ============================================================================
 
@@ -971,7 +984,7 @@ export default function (pi: ExtensionAPI): void {
       const forwardResult = await forwardToSession(
         targetSessionName,
         cleanText,
-        { chatId: message.chat.id, messageId: message.message_id },
+        { chatId: message.chat.id, messageId: message.message_id, sourceSession: sessionName },
       );
       if (forwardResult.ok) {
         // Target session processed the command — send its response to Telegram
@@ -1364,11 +1377,15 @@ stop - Abort current turn`,
     if (sessInfo && !sessInfo.announcedPresence) {
       const chatId = state.config.allowedUserIds?.[0];
       if (chatId && state.config.botToken) {
+        // Determine if this session will be active poller or passive
+        const isActivePoller = SharedPollingManager.isActive() || !SharedPollingManager.isHeldByOther();
+        const icon = isActivePoller ? "✅" : "🔁";
+        const role = isActivePoller ? "active" : "passive";
         try {
           await fetch(`https://api.telegram.org/bot${state.config.botToken}/sendMessage`, {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ chat_id: chatId, text: `✅ <b>${sessionName}</b> connected`, parse_mode: "HTML" }),
+            body: JSON.stringify({ chat_id: chatId, text: `${icon} <b>${sessionName}</b> connected (${role})`, parse_mode: "HTML" }),
           });
         } catch {
           // Network unavailable — skip announcement, extension still loads
@@ -1381,9 +1398,27 @@ stop - Abort current turn`,
     // Start the relay server for inter-session command forwarding
     await startRelayServer(sessionName).catch(console.error);
     setCommandHandler(async (text, meta) => {
-      // When a forwarded command arrives, process it and return the response
-      // For now just echo back for testing
-      return `[${sessionName}] Received: ${text}`;
+      // Queue the forward for agent processing on next turn
+      pendingForwards.push({
+        chatId: meta.chatId,
+        messageId: meta.messageId,
+        text,
+        sourceSession: meta.sourceSession || "unknown",
+      });
+      // Create a turn as if it came from Telegram to trigger agent processing
+      const turn: PendingTelegramTurn = {
+        sessionId,
+        sessionName,
+        chatId: meta.chatId,
+        replyToMessageId: meta.messageId,
+        queuedAttachments: [],
+        content: [{ type: "text" as const, text: `${TELEGRAM_PREFIX} ${text}` }] as Array<TextContent | ImageContent>,
+        historyText: text,
+      };
+      state.activeTurn = turn as ActiveTelegramTurn;
+      pi.sendUserMessage(turn.content);
+      // Return placeholder — the actual response is sent directly to Telegram from agent_end
+      return `[${sessionName}] Processing...`;
     });
 
     if (state.config.botToken) {
@@ -1421,6 +1456,7 @@ stop - Abort current turn`,
   
   pi.on("session_shutdown", async (_event, _ctx) => {
     state.activeTurn = undefined;
+    pendingForwards.length = 0;
     SharedPollingManager.completeTurn(sessionId);
     stopRelayServer();
     
@@ -1430,11 +1466,14 @@ stop - Abort current turn`,
     if (dying && dying.announcedPresence) {
       const chatId = state.config.allowedUserIds?.[0];
       if (chatId && state.config.botToken) {
+        const isActivePoller = SharedPollingManager.isActive() || !SharedPollingManager.isHeldByOther();
+        const icon = isActivePoller ? "⚠️" : "🔁";
+        const role = isActivePoller ? "active" : "passive";
         try {
           await fetch(`https://api.telegram.org/bot${state.config.botToken}/sendMessage`, {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ chat_id: chatId, text: `⚠️ <b>${sessionName}</b> disconnected`, parse_mode: "HTML" }),
+            body: JSON.stringify({ chat_id: chatId, text: `${icon} <b>${sessionName}</b> disconnected (${role})`, parse_mode: "HTML" }),
           });
         } catch {
           // Network unavailable — skip
@@ -1477,7 +1516,6 @@ stop - Abort current turn`,
     state.activeTurn = undefined;
     SharedPollingManager.completeTurn(sessionId);
     updateStatus(ctx);
-    if (!turn) return;
     
     let assistantText = "";
     for (let i = event.messages.length - 1; i >= 0; i--) {
@@ -1495,29 +1533,91 @@ stop - Abort current turn`,
       }
     }
     
-    if (assistantText) {
-      await SharedPollingManager.sendReply(String(turn.chatId), turn.replyToMessageId, assistantText);
-    } else if (turn.queuedAttachments.length > 0) {
-      await SharedPollingManager.sendReply(String(turn.chatId), turn.replyToMessageId, "Attached requested file(s).");
+    // Check if this turn was from a relay-forwarded command
+    const forward = turn && pendingForwards.length > 0 ? pendingForwards.shift() : null;
+    
+    if (forward) {
+      // Relay-forwarded: send response directly to Telegram with session tag
+      const response = assistantText || "(no response)";
+      const taggedResponse = `[<b>${sessionName}</b>]\n${response}`;
+      try {
+        await fetch(`https://api.telegram.org/bot${state.config.botToken}/sendMessage`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            chat_id: forward.chatId,
+            text: taggedResponse,
+            reply_to_message_id: forward.messageId,
+            parse_mode: "HTML",
+          }),
+        });
+      } catch {
+        // Best-effort delivery
+        console.error(`[teleg:${sessionName}] Failed to deliver relay response:`, forward);
+      }
+      // Send attachments if any
+      if (turn) {
+        for (const attachment of turn.queuedAttachments) {
+          const ext = attachment.fileName.split(".").pop()?.toLowerCase();
+          const isImage = ["jpg", "jpeg", "png", "gif", "webp"].includes(ext || "");
+          try {
+            const method = isImage ? "sendPhoto" : "sendDocument";
+            const fieldName = isImage ? "photo" : "document";
+            const form = new FormData();
+            form.set("chat_id", String(forward.chatId));
+            const buffer = await readFile(attachment.path);
+            form.set(fieldName, new Blob([buffer]), attachment.fileName);
+            await fetch(`https://api.telegram.org/bot${state.config.botToken}/${method}`, {
+              method: "POST",
+              body: form,
+            });
+          } catch {}
+        }
+      }
+    } else if (turn) {
+      // Normal Telegram turn: send via polling manager
+      if (assistantText) {
+        await SharedPollingManager.sendReply(String(turn.chatId), turn.replyToMessageId, assistantText);
+      } else if (turn.queuedAttachments.length > 0) {
+        await SharedPollingManager.sendReply(String(turn.chatId), turn.replyToMessageId, "Attached requested file(s).");
+      }
+      
+      for (const attachment of turn.queuedAttachments) {
+        const ext = attachment.fileName.split(".").pop()?.toLowerCase();
+        const isImage = ["jpg", "jpeg", "png", "gif", "webp"].includes(ext || "");
+        await SharedPollingManager.sendFile(
+          String(turn.chatId),
+          turn.replyToMessageId,
+          attachment.path,
+          attachment.fileName,
+          isImage
+        );
+      }
     }
     
-    for (const attachment of turn.queuedAttachments) {
-      const ext = attachment.fileName.split(".").pop()?.toLowerCase();
-      const isImage = ["jpg", "jpeg", "png", "gif", "webp"].includes(ext || "");
-      await SharedPollingManager.sendFile(
-        String(turn.chatId),
-        turn.replyToMessageId,
-        attachment.path,
-        attachment.fileName,
-        isImage
-      );
-    }
-    
-    const nextTurn = SharedPollingManager.claimNextTurn(sessionId);
-    if (nextTurn) {
-      state.activeTurn = nextTurn.turn as ActiveTelegramTurn;
+    // Check for pending forwards that didn't get consumed (relay came in during processing)
+    if (pendingForwards.length > 0 && !forward) {
+      const next = pendingForwards.shift()!;
+      const nextTurn: PendingTelegramTurn = {
+        sessionId,
+        sessionName,
+        chatId: next.chatId,
+        replyToMessageId: next.messageId,
+        queuedAttachments: [],
+        content: [{ type: "text" as const, text: `${TELEGRAM_PREFIX} ${next.text}` }] as Array<TextContent | ImageContent>,
+        historyText: next.text,
+      };
+      state.activeTurn = nextTurn as ActiveTelegramTurn;
       updateStatus(ctx);
-      pi.sendUserMessage(nextTurn.turn.content);
+      pi.sendUserMessage(nextTurn.content);
+      return;
+    }
+    
+    const nextQueueTurn = SharedPollingManager.claimNextTurn(sessionId);
+    if (nextQueueTurn) {
+      state.activeTurn = nextQueueTurn.turn as ActiveTelegramTurn;
+      updateStatus(ctx);
+      pi.sendUserMessage(nextQueueTurn.turn.content);
     }
   });
 }

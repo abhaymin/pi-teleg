@@ -172,7 +172,7 @@ export function startRelayServer(sessionName: string, basePort = 9798): Promise<
             req.on("data", (chunk: Buffer) => (body += chunk.toString()));
             req.on("end", async () => {
               try {
-                const { chatId, messageId, text, secret: incomingSecret } = JSON.parse(body);
+                const { chatId, messageId, text, secret: incomingSecret, sourceSession } = JSON.parse(body);
                 
                 if (incomingSecret !== secret) {
                   res.writeHead(401, { "Content-Type": "application/json" });
@@ -182,7 +182,7 @@ export function startRelayServer(sessionName: string, basePort = 9798): Promise<
                 
                 // Dispatch to command handler
                 if (onCommand) {
-                  const response = await onCommand(text, { chatId, messageId });
+                  const response = await onCommand(text, { chatId, messageId, sourceSession });
                   res.writeHead(200, { "Content-Type": "application/json" });
                   res.end(JSON.stringify({ ok: true, response }));
                 } else {
@@ -242,7 +242,7 @@ export function stopRelayServer(): void {
 
 // ─── Command dispatch ─────────────────────────────────────────────────────────
 
-type CommandHandler = (text: string, meta: { chatId: number; messageId: number }) => Promise<string>;
+type CommandHandler = (text: string, meta: { chatId: number; messageId: number; sourceSession?: string }) => Promise<string>;
 let onCommand: CommandHandler | null = null;
 
 export function setCommandHandler(handler: CommandHandler): void {
@@ -254,7 +254,7 @@ export function setCommandHandler(handler: CommandHandler): void {
 export async function forwardToSession(
   targetSessionName: string,
   text: string,
-  meta: { chatId: number; messageId: number }
+  meta: { chatId: number; messageId: number; sourceSession?: string }
 ): Promise<{ ok: boolean; response?: string; error?: string }> {
   const relayPath = getRelayPath(targetSessionName);
   
@@ -285,6 +285,7 @@ export async function forwardToSession(
         messageId: meta.messageId,
         text,
         secret: relayInfo.secret,
+        sourceSession: meta.sourceSession,
       }),
     });
     
