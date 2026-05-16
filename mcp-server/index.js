@@ -411,10 +411,12 @@ async function handleMcpRequest(req) {
   throw new Error(`Unknown method: ${method}`);
 }
 
+const getMe = () => tg("getMe");
+
 server.listen(PORT, () => {
   console.log(`[teleg-mcp] HTTP MCP server running on port ${PORT}`);
   console.log(`[teleg-mcp] Config: ${CONFIG_PATH}`);
-  console.log(`[teleg-mcp] Bot: @${(await getMe()).username}`);
+  getMe().then(bot => console.log(`[teleg-mcp] Bot: @${bot.username}`));
 });
 
 // ─── Cleanup ─────────────────────────────────────────────────────────────────

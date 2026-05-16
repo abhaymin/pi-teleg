@@ -63,6 +63,7 @@ interface SessionInfo {
   connectedAt: number;
   lastActivity: number;
   isActive: boolean;
+  announcedPresence?: boolean; // true after sending the single "connected" message for this session
 }
 
 interface SessionRegistry {
@@ -823,6 +824,8 @@ export default function (pi: ExtensionAPI): void {
     };
     
     if (existing >= 0) {
+      // Preserve announcedPresence flag on reconnection
+      sessionInfo.announcedPresence = registry.sessions[existing].announcedPresence;
       registry.sessions[existing] = sessionInfo;
     } else {
       registry.sessions.push(sessionInfo);
@@ -1249,6 +1252,22 @@ stop - Abort current turn`,
     await mkdir(TEMP_DIR, { recursive: true });
     await registerSession();
 
+    // Announce presence ONCE per session (not on reconnections)
+    const registry1 = await readSessionRegistry();
+    const sessInfo = registry1.sessions.find(s => s.sessionId === sessionId);
+    if (sessInfo && !sessInfo.announcedPresence) {
+      const chatId = state.config.allowedUserIds?.[0];
+      if (chatId && state.config.botToken) {
+        await fetch(`https://api.telegram.org/bot${state.config.botToken}/sendMessage`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ chat_id: chatId, text: `✅ <b>${sessionName}</b> connected`, parse_mode: "HTML" }),
+        });
+      }
+      sessInfo.announcedPresence = true;
+      await writeSessionRegistry(registry1);
+    }
+
     // Start the relay server for inter-session command forwarding
     await startRelayServer(sessionName).catch(console.error);
     setCommandHandler(async (text, meta) => {
@@ -1283,6 +1302,21 @@ stop - Abort current turn`,
     state.activeTurn = undefined;
     SharedPollingManager.completeTurn(sessionId);
     stopRelayServer();
+    
+    // Announce departure ONCE (before unregister so we still have sessionName)
+    const registry2 = await readSessionRegistry();
+    const dying = registry2.sessions.find(s => s.sessionId === sessionId);
+    if (dying && dying.announcedPresence) {
+      const chatId = state.config.allowedUserIds?.[0];
+      if (chatId && state.config.botToken) {
+        await fetch(`https://api.telegram.org/bot${state.config.botToken}/sendMessage`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ chat_id: chatId, text: `⚠️ <b>${sessionName}</b> disconnected`, parse_mode: "HTML" }),
+        }).catch(() => {});
+      }
+    }
+    
     await unregisterSession();
     
     const registry = await readSessionRegistry();
