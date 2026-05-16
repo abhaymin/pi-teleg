@@ -555,7 +555,7 @@ const SharedPollingManager = (() => {
       return { username: config.botUsername, id: config.botId };
     },
     
-    async sendReply(chatId: number, text: string, replyToMsgId?: number): Promise<number | undefined> {
+    async sendReply(chatId: string, replyToMsgId: number, text: string): Promise<number | undefined> {
       const chunks: string[] = [];
       let current = "";
       const paragraphs = text.split(/\n\n+/);
@@ -595,7 +595,7 @@ const SharedPollingManager = (() => {
       return lastMessageId;
     },
     
-    async sendFile(chatId: number, filePath: string, fileName: string, isImage: boolean, caption?: string): Promise<boolean> {
+    async sendFile(chatId: string, replyToMsgId: number, filePath: string, fileName: string, isImage: boolean, caption?: string): Promise<boolean> {
       try {
         const method = isImage ? "sendPhoto" : "sendDocument";
         const fieldName = isImage ? "photo" : "document";
@@ -794,16 +794,16 @@ export default function (pi: ExtensionAPI): void {
         state.activeTurn = undefined;
         SharedPollingManager.completeTurn(sessionId);
         updateStatus(ctx);
-        await SharedPollingManager.sendReply(message.chat.id, message.message_id, "Aborted current turn.");
+        await SharedPollingManager.sendReply(String(message.chat.id), message.message_id, "Aborted current turn.");
       } else {
-        await SharedPollingManager.sendReply(message.chat.id, message.message_id, "No active turn.");
+        await SharedPollingManager.sendReply(String(message.chat.id), message.message_id, "No active turn.");
       }
       return;
     }
     
     if (lower === "/help" || lower === "/start") {
       await SharedPollingManager.sendReply(
-        message.chat.id,
+        String(message.chat.id),
         message.message_id,
         `Teleg-Bridge Active!
 
@@ -840,16 +840,16 @@ stop - Abort current turn`,
         `active: ${state.activeTurn ? "yes" : "no"}`,
         `queued: ${SharedPollingManager.getQueueDepth()}`,
       ];
-      await SharedPollingManager.sendReply(message.chat.id, message.message_id, lines.join("\n"));
+      await SharedPollingManager.sendReply(String(message.chat.id), message.message_id, lines.join("\n"));
       return;
     }
     
     if (lower === "/health") {
       const health = SharedPollingManager.getState();
       if (health.isHealthy) {
-        await SharedPollingManager.sendReply(message.chat.id, message.message_id, "✅ Bot connection OK");
+        await SharedPollingManager.sendReply(String(message.chat.id), message.message_id, "✅ Bot connection OK");
       } else {
-        await SharedPollingManager.sendReply(message.chat.id, message.message_id, "⚠️ Connection issues detected. Auto-reconnecting...");
+        await SharedPollingManager.sendReply(String(message.chat.id), message.message_id, "⚠️ Connection issues detected. Auto-reconnecting...");
       }
       return;
     }
@@ -863,25 +863,25 @@ stop - Abort current turn`,
         `consecutive errors: ${health.consecutiveErrors}`,
         `reconnect delay: ${health.reconnectDelay}ms`,
       ];
-      await SharedPollingManager.sendReply(message.chat.id, message.message_id, lines.join("\n"));
+      await SharedPollingManager.sendReply(String(message.chat.id), message.message_id, lines.join("\n"));
       return;
     }
     
     if (lower === "/compact") {
       if (!ctx.isIdle()) {
-        await SharedPollingManager.sendReply(message.chat.id, message.message_id, "Cannot compact while busy. Send stop first.");
+        await SharedPollingManager.sendReply(String(message.chat.id), message.message_id, "Cannot compact while busy. Send stop first.");
         return;
       }
       ctx.compact({
         onComplete: () => {
-          void SharedPollingManager.sendReply(message.chat.id, message.message_id, "Compaction completed.");
+          void SharedPollingManager.sendReply(String(message.chat.id), message.message_id, "Compaction completed.");
         },
         onError: (err) => {
           const errorMessage = err instanceof Error ? err.message : String(err);
-          void SharedPollingManager.sendReply(message.chat.id, message.message_id, `Compaction failed: ${errorMessage}`);
+          void SharedPollingManager.sendReply(String(message.chat.id), message.message_id, `Compaction failed: ${errorMessage}`);
         },
       });
-      await SharedPollingManager.sendReply(message.chat.id, message.message_id, "Compaction started.");
+      await SharedPollingManager.sendReply(String(message.chat.id), message.message_id, "Compaction started.");
       return;
     }
     
@@ -980,7 +980,7 @@ stop - Abort current turn`,
       if (!targetChatId) {
         throw new Error("No chat ID available. Send /start to pair first.");
       }
-      const result = await SharedPollingManager.sendReply(targetChatId, params.text, 0);
+      const result = await SharedPollingManager.sendReply(String(targetChatId), 0, params.text);
       return { content: [{ type: "text", text: result ? `Sent message ${result}` : "Message sent" }], details: {} };
     },
   });
@@ -1006,7 +1006,8 @@ stop - Abort current turn`,
         throw new Error(`Not a file: ${params.file_path}`);
       }
       const success = await SharedPollingManager.sendFile(
-        targetChatId,
+        String(targetChatId),
+        0,
         params.file_path,
         params.file_path.split("/").pop() || "photo.jpg",
         true,
@@ -1040,7 +1041,8 @@ stop - Abort current turn`,
         throw new Error(`Not a file: ${params.file_path}`);
       }
       const success = await SharedPollingManager.sendFile(
-        targetChatId,
+        String(targetChatId),
+        0,
         params.file_path,
         params.file_path.split("/").pop() || "video.mp4",
         false,
@@ -1187,16 +1189,17 @@ stop - Abort current turn`,
     }
     
     if (assistantText) {
-      await SharedPollingManager.sendReply(turn.chatId, assistantText, turn.replyToMessageId);
+      await SharedPollingManager.sendReply(String(turn.chatId), turn.replyToMessageId, assistantText);
     } else if (turn.queuedAttachments.length > 0) {
-      await SharedPollingManager.sendReply(turn.chatId, "Attached requested file(s).", turn.replyToMessageId);
+      await SharedPollingManager.sendReply(String(turn.chatId), turn.replyToMessageId, "Attached requested file(s).");
     }
     
     for (const attachment of turn.queuedAttachments) {
       const ext = attachment.fileName.split(".").pop()?.toLowerCase();
       const isImage = ["jpg", "jpeg", "png", "gif", "webp"].includes(ext || "");
       await SharedPollingManager.sendFile(
-        turn.chatId,
+        String(turn.chatId),
+        turn.replyToMessageId,
         attachment.path,
         attachment.fileName,
         isImage
