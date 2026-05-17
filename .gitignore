@@ -30,6 +30,11 @@ temp/
 teleg-bridge.json
 .teleg-*
 
+# SQLite database (runtime)
+teleg-bridge.db
+teleg-bridge.db-shm
+teleg-bridge.db-wal
+
 # Lock files
 package-lock.json
 yarn.lock
