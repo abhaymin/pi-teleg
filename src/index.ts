@@ -10,9 +10,11 @@
  */
 
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { readFileSync } from "node:fs";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { Worker } from "node:worker_threads";
+import { fileURLToPath } from "node:url";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
@@ -25,6 +27,7 @@ import {
   cleanStaleRelayFiles,
   cleanRelayFilesByPid,
 } from "./relay.js";
+import * as Db from "./db.js";
 
 // ============================================================================
 // Constants
@@ -47,6 +50,9 @@ const INITIAL_RECONNECT_DELAY_MS = 1000;
 const MAX_RECONNECT_DELAY_MS = 30000;
 const MAX_CONSECUTIVE_ERRORS = 5;
 const BASE_BACKOFF_MULTIPLIER = 2;
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const POLL_WORKER_PATH = join(__dirname, "poll-worker.js");
 
 // ============================================================================
 // Types
@@ -370,67 +376,17 @@ function matchMessageToCapability(text: string, entries: CapabilitiesEntry[]): C
 interface TurnQueueItem {
   turn: PendingTelegramTurn;
   update: TelegramUpdate;
+  dbId?: number; // SQLite row ID for persistent queue
 }
 
 const SharedPollingManager = (() => {
   let config: TelegramConfig = {};
-  let pollingController: AbortController | undefined;
-  let pollingPromise: Promise<void> | undefined;
+  let pollWorker: Worker | null = null;
   let isPolling = false;
   let lockRefreshInterval: ReturnType<typeof setInterval> | undefined;
-  
-  async function acquirePollingLock(): Promise<boolean> {
-    try {
-      await mkdir(TEMP_DIR, { recursive: true });
-      try {
-        const existing = await readFile(POLLING_LOCK_FILE, "utf8");
-        const parts = existing.trim().split("\n");
-        const oldPid = parseInt(parts[0], 10);
-        const oldTime = parseInt(parts[1] || "0", 10);
-        // Check if lock is stale (>30s without refresh)
-        if (oldPid && !isNaN(oldPid)) {
-          try {
-            process.kill(oldPid, 0); // Check if process exists
-            // Process alive and lock fresh
-            if (Date.now() - oldTime < POLLING_LOCK_REFRESH_MS * 3) {
-              return false; // Another process already holds the lock
-            }
-          } catch {
-            // Process dead, lock is stale - we can claim it
-          }
-        }
-      } catch {
-        // No lock file exists, we can claim it
-      }
-      await writeFile(POLLING_LOCK_FILE, `${process.pid}\n${Date.now()}\n`, "utf8");
-      return true;
-    } catch {
-      return false;
-    }
-  }
-  
-  async function refreshPollingLock(): Promise<void> {
-    try {
-      await writeFile(POLLING_LOCK_FILE, `${process.pid}\n${Date.now()}\n`, "utf8");
-    } catch {
-      // Best effort
-    }
-  }
-  
-  async function releasePollingLock(): Promise<void> {
-    if (lockRefreshInterval) {
-      clearInterval(lockRefreshInterval);
-      lockRefreshInterval = undefined;
-    }
-    try {
-      const existing = await readFile(POLLING_LOCK_FILE, "utf8");
-      if (existing.trim().startsWith(String(process.pid))) {
-        await writeFile(POLLING_LOCK_FILE, "", "utf8");
-      }
-    } catch {
-      // Best effort
-    }
-  }
+  let turnQueue: TurnQueueItem[] = []; // In-flight cache; source of truth is SQLite
+  let activeTurns: Map<string, ActiveTelegramTurn> = new Map();
+  let messageHandler: ((turn: PendingTelegramTurn, update: TelegramUpdate) => void) | null = null;
   
   let pollState: PollState = {
     consecutiveErrors: 0,
@@ -440,10 +396,57 @@ const SharedPollingManager = (() => {
     lastHealthCheck: Date.now(),
   };
   
-  let healthCheckInterval: ReturnType<typeof setInterval> | undefined;
-  let turnQueue: TurnQueueItem[] = [];
-  let activeTurns: Map<string, ActiveTelegramTurn> = new Map();
-  let messageHandler: ((turn: PendingTelegramTurn, update: TelegramUpdate) => void) | null = null;
+  // ─── Polling Lock (cross-process) ──────────────────────────────────────
+  
+  async function acquirePollingLock(): Promise<boolean> {
+    try {
+      await mkdir(TEMP_DIR, { recursive: true });
+      try {
+        const existing = await readFile(POLLING_LOCK_FILE, "utf8");
+        const parts = existing.trim().split("\n");
+        const oldPid = parseInt(parts[0], 10);
+        const oldTime = parseInt(parts[1] || "0", 10);
+        if (oldPid && !isNaN(oldPid)) {
+          try {
+            process.kill(oldPid, 0);
+            if (Date.now() - oldTime < POLLING_LOCK_REFRESH_MS * 3) return false;
+          } catch { /* dead process */ }
+        }
+      } catch { /* no lock file */ }
+      await writeFile(POLLING_LOCK_FILE, `${process.pid}\n${Date.now()}\n`, "utf8");
+      return true;
+    } catch { return false; }
+  }
+  
+  async function refreshPollingLock(): Promise<void> {
+    try { await writeFile(POLLING_LOCK_FILE, `${process.pid}\n${Date.now()}\n`, "utf8"); } catch {}
+  }
+  
+  async function releasePollingLock(): Promise<void> {
+    if (lockRefreshInterval) { clearInterval(lockRefreshInterval); lockRefreshInterval = undefined; }
+    try {
+      const existing = await readFile(POLLING_LOCK_FILE, "utf8");
+      if (existing.trim().startsWith(String(process.pid))) await writeFile(POLLING_LOCK_FILE, "", "utf8");
+    } catch {}
+  }
+  
+  function isPollingLockHeldByOther(): boolean {
+    try {
+      const existing = readFileSync(POLLING_LOCK_FILE, "utf8");
+      const parts = existing.trim().split("\n");
+      const oldPid = parseInt(parts[0], 10);
+      const oldTime = parseInt(parts[1] || "0", 10);
+      if (oldPid && !isNaN(oldPid) && oldPid !== process.pid) {
+        try {
+          process.kill(oldPid, 0);
+          if (Date.now() - oldTime < POLLING_LOCK_REFRESH_MS * 3) return true;
+        } catch {}
+      }
+    } catch {}
+    return false;
+  }
+  
+  // ─── Telegram API (for sending replies — stays in main thread) ──────
   
   async function callTelegram<TResponse>(
     method: string,
@@ -451,11 +454,9 @@ const SharedPollingManager = (() => {
     options?: { signal?: AbortSignal | null; timeout?: number },
   ): Promise<TResponse> {
     if (!config.botToken) throw new Error("Telegram bot token is not configured");
-    
     const controller = new AbortController();
     const timeout = options?.timeout ?? POLL_TIMEOUT_SECONDS * 1000;
     const timeoutId = setTimeout(() => controller.abort(), timeout);
-    
     try {
       const response = await fetch(`https://api.telegram.org/bot${config.botToken}/${method}`, {
         method: "POST",
@@ -466,64 +467,18 @@ const SharedPollingManager = (() => {
           : controller.signal,
       });
       clearTimeout(timeoutId);
-      
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      }
-      
+      if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       const data = (await response.json()) as TelegramApiResponse<TResponse>;
-      if (!data.ok || data.result === undefined) {
-        throw new Error(data.description || `Telegram API ${method} failed`);
-      }
+      if (!data.ok || data.result === undefined) throw new Error(data.description || `Telegram API ${method} failed`);
       return data.result;
     } catch (error) {
       clearTimeout(timeoutId);
-      if (error instanceof Error && error.name === "AbortError") {
-        throw new Error("TIMEOUT");
-      }
+      if (error instanceof Error && error.name === "AbortError") throw new Error("TIMEOUT");
       throw error;
     }
   }
   
-  async function performHealthCheck(): Promise<boolean> {
-    if (!config.botToken) return false;
-    
-    try {
-      await callTelegram<TelegramUser>("getMe", {}, { timeout: 10000 });
-      pollState.lastHealthCheck = Date.now();
-      pollState.isHealthy = true;
-      return true;
-    } catch {
-      pollState.isHealthy = false;
-      pollState.consecutiveErrors++;
-      return false;
-    }
-  }
-  
-  function startHealthChecks(): void {
-    if (healthCheckInterval) return;
-    
-    healthCheckInterval = setInterval(async () => {
-      if (!isPolling || !config.botToken) return;
-      
-      const now = Date.now();
-      const timeSinceLastPoll = now - pollState.lastSuccessfulPoll;
-      
-      if (timeSinceLastPoll > HEALTH_CHECK_INTERVAL_MS * 2) {
-        const healthy = await performHealthCheck();
-        if (!healthy) {
-          scheduleReconnect();
-        }
-      }
-    }, HEALTH_CHECK_INTERVAL_MS);
-  }
-  
-  function stopHealthChecks(): void {
-    if (healthCheckInterval) {
-      clearInterval(healthCheckInterval);
-      healthCheckInterval = undefined;
-    }
-  }
+  // ─── Helpers ────────────────────────────────────────────────────────────
   
   function extractTwitterUrls(text: string): string[] {
     const urlPattern = /https?:\/\/(?:x|twitter)\.com\/[^\s<>"]+\/status\/\d+/gi;
@@ -536,10 +491,8 @@ const SharedPollingManager = (() => {
     const content: Array<TextContent | ImageContent> = [];
     const prompt = rawText.length > 0 ? `${TELEGRAM_PREFIX} ${rawText}` : `${TELEGRAM_PREFIX}`;
     content.push({ type: "text", text: prompt });
-    
     return {
-      sessionId,
-      sessionName,
+      sessionId, sessionName,
       chatId: message.chat.id,
       replyToMessageId: message.message_id,
       queuedAttachments: [],
@@ -549,342 +502,281 @@ const SharedPollingManager = (() => {
     };
   }
   
-  async function pollLoop(signal: AbortSignal): Promise<void> {
-    if (!config.botToken) return;
+  // ─── Worker Thread Message Handler ───────────────────────────────────
+  // Runs for EVERY message received by the poll worker.
+  // Dispatches to the correct session concurrently — multiple sessions
+  // can process in parallel (orchestrator behaviour).
+  
+  async function handleWorkerMessage(update: TelegramUpdate, dbId: number): Promise<void> {
+    const message = update.message || update.edited_message;
+    if (!message || message.chat.type !== "private" || !message.from || message.from.is_bot) return;
+    if (!isAllowedUser(config, message.from.id)) return;
     
-    try {
-      await callTelegram("deleteWebhook", { drop_pending_updates: true }, { signal, timeout: 10000 });
-    } catch {
-      // Continue anyway
+    let targetSessionId: string | null = null;
+    
+    // 1. Session affinity: if a session already has an active turn for this chat
+    for (const [sid] of activeTurns) {
+      const t = activeTurns.get(sid);
+      if (t && t.chatId === message.chat.id) { targetSessionId = sid; break; }
     }
     
-    if (config.lastUpdateId === undefined) {
-      try {
-        const updates = await callTelegram<TelegramUpdate[]>(
-          "getUpdates",
-          { offset: -1, limit: 1, timeout: 5 },
-          { signal, timeout: 10000 }
-        );
-        const last = updates.at(-1);
-        if (last) {
-          config.lastUpdateId = last.update_id;
-          await writeConfig(config);
+    // 2. Check in-memory queue for chat affinity
+    if (!targetSessionId && turnQueue.length > 0) {
+      const queuedForChat = turnQueue.find(q => q.turn.chatId === message.chat.id);
+      if (queuedForChat) targetSessionId = queuedForChat.turn.sessionId;
+    }
+    
+    // 3. Check @sessionName prefix
+    const text = message.text || message.caption || "";
+    const sessionTagMatch = text.match(/^@(\S+)\s*/);
+    if (sessionTagMatch) {
+      const tagName = sessionTagMatch[1];
+      const registry = await readSessionRegistry();
+      const namedSession = registry.sessions.find(s => s.sessionName === tagName);
+      if (namedSession) targetSessionId = namedSession.sessionId;
+    }
+    
+    // 4. Capability-based smart routing
+    if (!targetSessionId) {
+      const capReg = await readCapabilitiesRegistry();
+      if (capReg.entries.length > 0) {
+        const matched = matchMessageToCapability(text || "", capReg.entries);
+        if (matched) {
+          try {
+            process.kill(matched.pid, 0);
+            const sessReg = await readSessionRegistry();
+            const sessInfo = sessReg.sessions.find(s => s.sessionId === matched.sessionId);
+            if (sessInfo) targetSessionId = matched.sessionId;
+          } catch { /* dead session */ }
         }
-      } catch {
-        // Will use default
       }
     }
     
-    startHealthChecks();
+    // 5. Fallback to primary session
+    if (!targetSessionId) {
+      const registry = await readSessionRegistry();
+      if (registry.primarySessionId) targetSessionId = registry.primarySessionId;
+      else if (registry.sessions.length > 0) targetSessionId = registry.sessions[0].sessionId;
+    }
     
-    while (!signal.aborted) {
-      try {
-        const updates = await callTelegram<TelegramUpdate[]>(
-          "getUpdates",
-          {
-            offset: config.lastUpdateId !== undefined ? config.lastUpdateId + 1 : undefined,
-            limit: 10,
-            timeout: POLL_TIMEOUT_SECONDS,
-            allowed_updates: ["message", "edited_message"],
-          },
-          { signal },
-        );
-        
-        pollState.consecutiveErrors = 0;
-        pollState.reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
-        pollState.lastSuccessfulPoll = Date.now();
-        pollState.isHealthy = true;
-        
-        for (const update of updates) {
-          config.lastUpdateId = update.update_id;
-          if (update.update_id % 100 === 0) {
-            await writeConfig(config);
-          }
-          
-          const message = update.message || update.edited_message;
-          if (!message || message.chat.type !== "private" || !message.from || message.from.is_bot) {
-            continue;
-          }
-          
-          if (!isAllowedUser(config, message.from.id)) {
-            continue;
-          }
-          
-          let targetSessionId: string | null = null;
-          
-          for (const [sid, turn] of activeTurns) {
-            if (turn.chatId === message.chat.id) {
-              targetSessionId = sid;
-              break;
-            }
-          }
-          
-          if (!targetSessionId && turnQueue.length > 0) {
-            const queuedForChat = turnQueue.find(q => q.turn.chatId === message.chat.id);
-            if (queuedForChat) {
-              targetSessionId = queuedForChat.turn.sessionId;
-            }
-          }
-          
-          // Check if message is addressed to a specific session (e.g., "@teleg do X")
-          const text = message.text || message.caption || "";
-          const sessionTagMatch = text.match(/^@(\S+)\s*/);
-          if (sessionTagMatch) {
-            const tagName = sessionTagMatch[1];
-            const registry = await readSessionRegistry();
-            const namedSession = registry.sessions.find(s => s.sessionName === tagName);
-            if (namedSession) {
-              targetSessionId = namedSession.sessionId;
-            }
-          }
-          
-          if (!targetSessionId) {
-            // Try capability-based smart routing
-            const capReg = await readCapabilitiesRegistry();
-            if (capReg.entries.length > 0) {
-              const matched = matchMessageToCapability(text || "", capReg.entries);
-              if (matched) {
-                try {
-                  process.kill(matched.pid, 0);
-                  const sessReg = await readSessionRegistry();
-                  const sessInfo = sessReg.sessions.find(s => s.sessionId === matched.sessionId);
-                  if (sessInfo) targetSessionId = matched.sessionId;
-                } catch { /* dead session */ }
-              }
-            }
-          }
-
-          if (!targetSessionId) {
-            const registry = await readSessionRegistry();
-            if (registry.primarySessionId) {
-              targetSessionId = registry.primarySessionId;
-            } else if (registry.sessions.length > 0) {
-              targetSessionId = registry.sessions[0].sessionId;
-            }
-          }
-          
-          if (targetSessionId && messageHandler) {
-            // Look up session name from registry for routing
-            const reg = await readSessionRegistry();
-            const sessionInfo = reg.sessions.find(s => s.sessionId === targetSessionId);
-            const sName = sessionInfo?.sessionName || targetSessionId;
-            const turn = createTurn(targetSessionId, sName, message);
-            activeTurns.set(targetSessionId, turn as ActiveTelegramTurn);
-            messageHandler(turn, update);
-          } else {
-            const turn = createTurn("unassigned", "unknown", message);
-            turnQueue.push({ turn, update });
-            
-            if (messageHandler) {
-              messageHandler(turn, update);
-            }
-          }
-        }
-      } catch (error) {
-        if (signal.aborted) return;
-        
-        const msg = error instanceof Error ? error.message : String(error);
-        
-        if (msg === "TIMEOUT") {
-          pollState.lastSuccessfulPoll = Date.now();
-          continue;
-        }
-        
-        if (error instanceof DOMException && error.name === "AbortError") {
-          return;
-        }
-        
-        pollState.consecutiveErrors++;
-        await scheduleReconnect();
+    // Dispatch — route to the target session
+    if (targetSessionId) {
+      const reg = await readSessionRegistry();
+      const sessionInfo = reg.sessions.find(s => s.sessionId === targetSessionId);
+      const sName = sessionInfo?.sessionName || targetSessionId;
+      const turn = createTurn(targetSessionId, sName, message);
+      
+      // If this session already has an active turn → queue it (preserves ordering per session)
+      if (activeTurns.has(targetSessionId)) {
+        turnQueue.push({ turn, update, dbId });
+        return;
       }
+      
+      activeTurns.set(targetSessionId, turn as ActiveTelegramTurn);
+      
+      // Update SQLite to assigned + processing
+      try {
+        Db.getDb().prepare(
+          "UPDATE message_queue SET session_id = ?, session_name = ?, status = 'processing', started_at = ? WHERE id = ?"
+        ).run(targetSessionId, sName, Date.now(), dbId);
+      } catch {}
+      
+      // Fire message handler — does NOT block. Each session processes concurrently.
+      if (messageHandler) messageHandler(turn, update);
+    } else {
+      // No target session — queue for later
+      const turn = createTurn("unassigned", "unknown", message);
+      turnQueue.push({ turn, update, dbId });
+      if (messageHandler) messageHandler(turn, update);
     }
   }
   
-  async function scheduleReconnect(): Promise<void> {
-    if (pollingController?.signal.aborted) return;
+  // ─── Worker Thread Management ────────────────────────────────────────
+  
+  function spawnPollWorker(): void {
+    if (pollWorker) return;
     
-    if (pollState.consecutiveErrors > MAX_CONSECUTIVE_ERRORS) {
-      pollState.reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
-      pollState.consecutiveErrors = 0;
-      config.lastUpdateId = undefined;
-      await writeConfig(config);
-    }
+    pollWorker = new Worker(POLL_WORKER_PATH, {
+      workerData: {
+        dbPath: join(__dirname, "..", "teleg-bridge.db"),
+        pollTimeoutSeconds: POLL_TIMEOUT_SECONDS,
+        healthCheckIntervalMs: HEALTH_CHECK_INTERVAL_MS,
+        maxConsecutiveErrors: MAX_CONSECUTIVE_ERRORS,
+        initialReconnectDelayMs: INITIAL_RECONNECT_DELAY_MS,
+        maxReconnectDelayMs: MAX_RECONNECT_DELAY_MS,
+      },
+    });
     
-    await new Promise((resolve) => setTimeout(resolve, pollState.reconnectDelay));
+    pollWorker.on("message", (msg: { type: string; update?: TelegramUpdate; dbId?: number; healthy?: boolean; consecutiveErrors?: number; error?: string }) => {
+      switch (msg.type) {
+        case "message":
+          if (msg.update && msg.dbId) {
+            handleWorkerMessage(msg.update, msg.dbId).catch(err => {
+              console.error("[teleg-pm] Dispatch error:", err);
+            });
+          }
+          break;
+        case "health":
+          if (msg.healthy !== undefined) pollState.isHealthy = msg.healthy;
+          if (msg.consecutiveErrors !== undefined) pollState.consecutiveErrors = msg.consecutiveErrors;
+          break;
+        case "error":
+          console.error(`[teleg-pm] Poll worker error: ${msg.error}`);
+          break;
+      }
+    });
     
-    pollState.reconnectDelay = Math.min(
-      pollState.reconnectDelay * BASE_BACKOFF_MULTIPLIER,
-      MAX_RECONNECT_DELAY_MS
-    );
+    pollWorker.on("error", (err) => {
+      console.error("[teleg-pm] Poll worker crashed:", err);
+      pollWorker = null;
+      isPolling = false;
+      if (config.botToken) {
+        setTimeout(() => {
+          console.log("[teleg-pm] Attempting poll worker restart...");
+          startPolling().catch(e => console.error("[teleg-pm] Restart failed:", e));
+        }, 5000);
+      }
+    });
+    
+    pollWorker.on("exit", (code) => {
+      if (code !== 0) console.error(`[teleg-pm] Poll worker exited with code ${code}`);
+      pollWorker = null;
+      isPolling = false;
+    });
   }
   
   async function startPolling(): Promise<void> {
     if (!config.botToken || isPolling) return;
-    
-    // Acquire cross-process lock before starting polling
     const hasLock = await acquirePollingLock();
-    if (!hasLock) {
-      return; // Another process is already polling, skip
-    }
+    if (!hasLock) return;
     
-    pollingController = new AbortController();
     isPolling = true;
-    
-    // Refresh lock periodically so other processes can detect if we crash
     lockRefreshInterval = setInterval(refreshPollingLock, POLLING_LOCK_REFRESH_MS);
     
-    pollingPromise = pollLoop(pollingController.signal).finally(() => {
-      pollingPromise = undefined;
-      pollingController = undefined;
-      isPolling = false;
-      stopHealthChecks();
-      releasePollingLock();
+    spawnPollWorker();
+    pollWorker!.postMessage({
+      type: "start",
+      config: { botToken: config.botToken, lastUpdateId: config.lastUpdateId },
     });
   }
   
   async function stopPolling(): Promise<void> {
-    stopHealthChecks();
-    pollingController?.abort();
-    pollingController = undefined;
-    await pollingPromise?.catch(() => undefined);
-    await releasePollingLock();
+    if (pollWorker) {
+      pollWorker.postMessage({ type: "stop" });
+      await new Promise<void>((resolve) => {
+        const timeout = setTimeout(() => { pollWorker?.terminate(); resolve(); }, 3000);
+        pollWorker!.once("exit", () => { clearTimeout(timeout); resolve(); });
+        pollWorker!.once("message", (msg: { type: string }) => {
+          if (msg.type === "stopped") { clearTimeout(timeout); resolve(); }
+        });
+      });
+      pollWorker = null;
+    }
     isPolling = false;
+    await releasePollingLock();
   }
   
-  /** Check if another alive process holds the polling lock (sync). */
-  function isPollingLockHeldByOther(): boolean {
-    try {
-      const existing = readFileSync(POLLING_LOCK_FILE, "utf8");
-      const parts = existing.trim().split("\n");
-      const oldPid = parseInt(parts[0], 10);
-      const oldTime = parseInt(parts[1] || "0", 10);
-      if (oldPid && !isNaN(oldPid) && oldPid !== process.pid) {
-        try {
-          process.kill(oldPid, 0);
-          if (Date.now() - oldTime < POLLING_LOCK_REFRESH_MS * 3) {
-            return true; // Another process holds a fresh lock
-          }
-        } catch {
-          // Process dead, lock is stale
-        }
-      }
-    } catch {
-      // No lock file
-    }
-    return false;
-  }
+  // ─── Public API ──────────────────────────────────────────────────────
   
   return {
-    async init(): Promise<void> {
-      config = await readConfig();
-    },
+    async init(): Promise<void> { config = await readConfig(); },
     
     async updateConfig(newConfig: TelegramConfig): Promise<void> {
       config = newConfig;
       await writeConfig(config);
+      if (pollWorker) {
+        pollWorker.postMessage({ type: "update_config", config: { lastUpdateId: newConfig.lastUpdateId } });
+      }
     },
     
     async start(): Promise<void> {
       await this.init();
-      if (!isPolling && config.botToken) {
-        await startPolling();
-      }
+      if (!isPolling && config.botToken) await startPolling();
     },
     
-    async stop(): Promise<void> {
-      await stopPolling();
-    },
+    async stop(): Promise<void> { await stopPolling(); },
+    isActive(): boolean { return isPolling; },
+    isHeldByOther(): boolean { return isPollingLockHeldByOther(); },
+    getState(): PollState { return { ...pollState }; },
     
-    isActive(): boolean {
-      return isPolling;
-    },
+    onMessage(handler: (turn: PendingTelegramTurn, update: TelegramUpdate) => void): void { messageHandler = handler; },
+    completeTurn(sessionId: string): void { activeTurns.delete(sessionId); },
     
-    /** True if another process is actively polling and we should stay passive. */
-    isHeldByOther(): boolean {
-      return isPollingLockHeldByOther();
-    },
-    
-    getState(): PollState {
-      return { ...pollState };
-    },
-    
-    onMessage(handler: (turn: PendingTelegramTurn, update: TelegramUpdate) => void): void {
-      messageHandler = handler;
-    },
-    
-    completeTurn(sessionId: string): void {
-      activeTurns.delete(sessionId);
-    },
-    
-    claimNextTurn(sessionId: string): TurnQueueItem | null {
+    claimNextTurn(sessionId: string, sName?: string): TurnQueueItem | null {
+      // 1. In-memory fast path
       const idx = turnQueue.findIndex(q => q.turn.sessionId === "unassigned" || q.turn.sessionId === sessionId);
       if (idx >= 0) {
         const item = turnQueue.splice(idx, 1)[0];
         item.turn.sessionId = sessionId;
         activeTurns.set(sessionId, item.turn as ActiveTelegramTurn);
+        if (item.dbId) { try { Db.completeMessage(item.dbId); } catch {} }
         return item;
+      }
+      // 2. SQLite pending messages
+      const name = sName || "unknown";
+      const dbMsg = Db.claimNextMessage(sessionId, name);
+      if (dbMsg) {
+        const turn: PendingTelegramTurn = {
+          sessionId, sessionName: name,
+          chatId: dbMsg.chat_id, replyToMessageId: dbMsg.message_id,
+          queuedAttachments: [],
+          content: [{ type: "text", text: `${TELEGRAM_PREFIX} ${dbMsg.text}` }],
+          historyText: dbMsg.text,
+        };
+        activeTurns.set(sessionId, turn as ActiveTelegramTurn);
+        const syntheticUpdate: TelegramUpdate = {
+          update_id: dbMsg.id,
+          message: {
+            message_id: dbMsg.message_id,
+            from: { id: dbMsg.from_user_id, is_bot: false, first_name: dbMsg.from_username || "User" },
+            chat: { id: dbMsg.chat_id, type: "private" },
+            text: dbMsg.text,
+          },
+        };
+        return { turn, update: syntheticUpdate, dbId: dbMsg.id };
       }
       return null;
     },
     
     getQueueDepth(): number {
-      return turnQueue.length;
+      try { return Db.getQueueDepth(); } catch { return turnQueue.length; }
     },
     
-    isUserAllowed(userId: number): boolean {
-      return isAllowedUser(config, userId);
-    },
+    hasActiveTurnFor(sessionId: string): boolean { return activeTurns.has(sessionId); },
+    isUserAllowed(userId: number): boolean { return isAllowedUser(config, userId); },
     
     async addAllowedUser(userId: number): Promise<void> {
-      if (!config.allowedUserIds) {
-        config.allowedUserIds = [];
-      }
-      if (!config.allowedUserIds.includes(userId)) {
-        config.allowedUserIds.push(userId);
-        await writeConfig(config);
-      }
+      if (!config.allowedUserIds) config.allowedUserIds = [];
+      if (!config.allowedUserIds.includes(userId)) { config.allowedUserIds.push(userId); await writeConfig(config); }
     },
     
-    getBotInfo(): { username?: string; id?: number } {
-      return { username: config.botUsername, id: config.botId };
-    },
+    getBotInfo(): { username?: string; id?: number } { return { username: config.botUsername, id: config.botId }; },
     
     async sendReply(chatId: string, replyToMsgId: number, text: string): Promise<number | undefined> {
       const chunks: string[] = [];
       let current = "";
       const paragraphs = text.split(/\n\n+/);
-      
       for (const para of paragraphs) {
         if (para.length <= MAX_MESSAGE_LENGTH) {
           const candidate = current.length === 0 ? para : `${current}\n\n${para}`;
-          if (candidate.length <= MAX_MESSAGE_LENGTH) {
-            current = candidate;
-            continue;
-          }
+          if (candidate.length <= MAX_MESSAGE_LENGTH) { current = candidate; continue; }
           if (current) chunks.push(current);
-          current = para;
-          continue;
+          current = para; continue;
         }
         if (current) chunks.push(current);
         current = "";
-        for (let i = 0; i < para.length; i += MAX_MESSAGE_LENGTH) {
-          chunks.push(para.slice(i, i + MAX_MESSAGE_LENGTH));
-        }
+        for (let i = 0; i < para.length; i += MAX_MESSAGE_LENGTH) chunks.push(para.slice(i, i + MAX_MESSAGE_LENGTH));
       }
       if (current) chunks.push(current);
-      
       let lastMessageId: number | undefined;
       for (const chunk of chunks) {
         try {
           const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
-            chat_id: chatId,
-            text: chunk,
+            chat_id: chatId, text: chunk,
             ...(replyToMsgId ? { reply_to_message_id: replyToMsgId } : {}),
           }, { timeout: 10000 });
           lastMessageId = sent.message_id;
-        } catch {
-          // Continue
-        }
+        } catch {}
       }
       return lastMessageId;
     },
@@ -893,39 +785,27 @@ const SharedPollingManager = (() => {
       try {
         const method = isImage ? "sendPhoto" : "sendDocument";
         const fieldName = isImage ? "photo" : "document";
-        
         const form = new FormData();
         form.set("chat_id", chatId);
         if (caption) form.set("caption", caption);
         const buffer = await readFile(filePath);
         form.set(fieldName, new Blob([buffer]), fileName);
-        
-        const response = await fetch(`https://api.telegram.org/bot${config.botToken}/${method}`, {
-          method: "POST",
-          body: form,
-        });
+        const response = await fetch(`https://api.telegram.org/bot${config.botToken}/${method}`, { method: "POST", body: form });
         const data = (await response.json()) as TelegramApiResponse<TelegramSentMessage>;
         return data.ok;
-      } catch {
-        return false;
-      }
+      } catch { return false; }
     },
     
     async verifyToken(token: string): Promise<TelegramUser | null> {
       try {
         const response = await fetch(`https://api.telegram.org/bot${token}/getMe`);
         const data = (await response.json()) as TelegramApiResponse<TelegramUser>;
-        if (data.ok && data.result) {
-          return data.result;
-        }
+        if (data.ok && data.result) return data.result;
         return null;
-      } catch {
-        return null;
-      }
+      } catch { return null; }
     },
   };
 })();
-
 // ============================================================================
 // Pending Forward (relay commands awaiting agent processing)
 // ============================================================================
@@ -1190,7 +1070,8 @@ Prefix with @sessionName to route to a specific session.
 Include Twitter/X URLs for automatic media download.
 
 Commands:
-/status - Connection status
+/status - All sessions, relay state & queue
+/queue [session] - Queue for session (or primary)
 /compact - Compact memory
 /health - Test connection
 /healthfull - Full health diagnostic
@@ -1208,26 +1089,120 @@ stop - Abort current turn`,
       const pollState = SharedPollingManager.getState();
       const botInfo = SharedPollingManager.getBotInfo();
       const registry = await readSessionRegistry();
+      const queueStats = Db.getQueueStats();
+      const relaySessions = Db.getAliveRelaySessions();
+      const relayStatus = await getRelayStatus();
       
       let pollingStatus: string;
       if (SharedPollingManager.isActive()) {
-        pollingStatus = "running (active)";
+        pollingStatus = "✅ active";
       } else if (SharedPollingManager.isHeldByOther()) {
-        pollingStatus = "passive (another session polls)";
+        pollingStatus = "🔁 passive";
       } else {
-        pollingStatus = "stopped";
+        pollingStatus = "⏹ stopped";
       }
       
-      const lines = [
-        `bot: ${botInfo.username ? `@${botInfo.username}` : "not configured"}`,
-        `user: ${message.from!.id === state.config.allowedUserIds?.[0] ? "paired" : "not paired"}`,
-        `polling: ${pollingStatus}`,
-        `health: ${pollState.isHealthy ? "OK" : "DEGRADED"}`,
-        `consecutive errors: ${pollState.consecutiveErrors}`,
-        `sessions: ${registry.sessions.length}${registry.sessions.map(s => `\n  ${s.sessionName === sessionName ? "*" : " "} ${s.sessionName} (${s.sessionId.slice(0, 12)}...)${s.sessionId === sessionId ? " ← you" : ""}`).join("")}`,
-        `active: ${state.activeTurn ? "yes" : "no"}`,
-        `queued: ${SharedPollingManager.getQueueDepth()}`,
+      const lines: string[] = [
+        `<b>═══ Teleg Bridge Status ═══</b>`,
+        ``,
+        `🤖 <b>Bot:</b> ${botInfo.username ? `@${botInfo.username}` : "not configured"}`,
+        `📡 <b>Polling:</b> ${pollingStatus}`,
+        `💚 <b>Health:</b> ${pollState.isHealthy ? "OK" : `DEGRADED (${pollState.consecutiveErrors} errs)`}`,
+        ``,
+        `<b>📊 Queue:</b> ${queueStats.pending} pending · ${queueStats.processing} active · ${queueStats.completed} done · ${queueStats.failed} failed`,
+        ``,
+        `<b>🖥 Sessions (${registry.sessions.length}):</b>`,
       ];
+      
+      // Detailed session info from SQLite relay + registry
+      for (const s of registry.sessions) {
+        const isSelf = s.sessionId === sessionId;
+        const hasActiveTurn = SharedPollingManager.hasActiveTurnFor(s.sessionId);
+        const role = s.sessionId === sessionId
+          ? (SharedPollingManager.isActive() ? "active" : "passive")
+          : "relay";
+        const relayInfo = relaySessions.find(r => r.session_name === s.sessionName);
+        const relayAlive = relayStatus[s.sessionName]?.alive ?? false;
+        const capabilities = relayInfo?.capabilities ? JSON.parse(relayInfo.capabilities).join(", ") : "—";
+        const capReg = await readCapabilitiesRegistry();
+        const capEntry = capReg.entries.find(e => e.sessionName === s.sessionName);
+        const caps = capEntry?.capabilities?.join(", ") || capabilities || "—";
+        
+        // Get per-session queue stats from DB
+        const sessPending = Db.getDb().prepare(
+          "SELECT COUNT(*) as c FROM message_queue WHERE session_name = ? AND status IN ('pending','processing')"
+        ).get(s.sessionName) as { c: number };
+        const sessDone = Db.getDb().prepare(
+          "SELECT COUNT(*) as c FROM message_queue WHERE session_name = ? AND status = 'completed'"
+        ).get(s.sessionName) as { c: number };
+        
+        const statusIcon = hasActiveTurn ? "●" : (relayAlive ? "○" : "✗");
+        const selfTag = isSelf ? " ← you" : "";
+        const activeTag = hasActiveTurn ? " ⚡ busy" : "";
+        const relayTag = !relayAlive && !isSelf ? " 🔴 offline" : "";
+        
+        lines.push(`  ${statusIcon} <b>${s.sessionName}</b> [${role}]${activeTag}${relayTag}${selfTag}`);
+        lines.push(`    caps: ${caps}`);
+        lines.push(`    queue: ${sessPending.c} pending · ${sessDone.c} done · pid:${s.pid}`);
+      }
+      
+      await SharedPollingManager.sendReply(String(message.chat.id), message.message_id, lines.join("\n"));
+      return;
+    }
+    
+    if (lower.startsWith("/queue")) {
+      const parts = cleanText.trim().split(/\s+/);
+      const targetName = parts.length > 1 ? parts[1] : sessionName;
+      
+      // Find the session name from registry if not this session
+      const registry = await readSessionRegistry();
+      const targetSession = registry.sessions.find(s => s.sessionName === targetName);
+      
+      if (!targetSession && targetName !== sessionName) {
+        await SharedPollingManager.sendReply(
+          String(message.chat.id),
+          message.message_id,
+          `❌ Session "${targetName}" not found. Active: ${registry.sessions.map(s => s.sessionName).join(", ")}`
+        );
+        return;
+      }
+      
+      const d = Db.getDb();
+      const stats = d.prepare(`
+        SELECT status, COUNT(*) as c FROM message_queue WHERE session_name = ? GROUP BY status
+      `).all(targetName) as Array<{ status: string; c: number }>;
+      
+      const pending = stats.find(s => s.status === "pending")?.c || 0;
+      const processing = stats.find(s => s.status === "processing")?.c || 0;
+      const completed = stats.find(s => s.status === "completed")?.c || 0;
+      const failed = stats.find(s => s.status === "failed")?.c || 0;
+      
+      // Get recent messages for this session
+      const recent = d.prepare(`
+        SELECT id, text, status, created_at, completed_at, error FROM message_queue
+        WHERE session_name = ? ORDER BY id DESC LIMIT 10
+      `).all(targetName) as Array<{ id: number; text: string; status: string; created_at: number; completed_at: number | null; error: string | null }>;
+      
+      const lines: string[] = [
+        `<b>📋 Queue: ${targetName}</b>`,
+        ``,
+        `Pending: ${pending} · Processing: ${processing} · Done: ${completed} · Failed: ${failed}`,
+        ``,
+        `<b>Recent:</b>`,
+      ];
+      
+      for (const msg of recent) {
+        const time = new Date(msg.created_at).toLocaleTimeString();
+        const preview = msg.text.length > 60 ? msg.text.slice(0, 57) + "..." : msg.text;
+        const icon = msg.status === "completed" ? "✅" : msg.status === "failed" ? "❌" : msg.status === "processing" ? "⏳" : "⏸";
+        const err = msg.error ? ` (${msg.error.slice(0, 40)})` : "";
+        lines.push(`  ${icon} <code>#${msg.id}</code> ${time} ${preview}${err}`);
+      }
+      
+      if (recent.length === 0) {
+        lines.push("  (empty)");
+      }
+      
       await SharedPollingManager.sendReply(String(message.chat.id), message.message_id, lines.join("\n"));
       return;
     }
@@ -1522,6 +1497,12 @@ stop - Abort current turn`,
   registerCleanupHandlers();
 
   pi.on("session_start", async (_event, ctx) => {
+    // Run SQLite startup recovery (recover stale messages, clean dead sessions)
+    const recovery = Db.runStartupRecovery();
+    if (recovery.recoveredMessages > 0 || recovery.cleanedSessions > 0) {
+      console.log(`[teleg:${sessionName}] DB recovery: ${recovery.recoveredMessages} messages recovered, ${recovery.cleanedSessions} stale sessions cleaned`);
+    }
+    
     await SharedPollingManager.init();
     state.config = await readConfig();
     await mkdir(TEMP_DIR, { recursive: true });
@@ -1667,7 +1648,7 @@ stop - Abort current turn`,
   
   pi.on("agent_start", async (_event, ctx) => {
     if (!state.activeTurn) {
-      const queued = SharedPollingManager.claimNextTurn(sessionId);
+      const queued = SharedPollingManager.claimNextTurn(sessionId, sessionName);
       if (queued) {
         state.activeTurn = queued.turn as ActiveTelegramTurn;
       }
@@ -1777,7 +1758,7 @@ stop - Abort current turn`,
       return;
     }
     
-    const nextQueueTurn = SharedPollingManager.claimNextTurn(sessionId);
+    const nextQueueTurn = SharedPollingManager.claimNextTurn(sessionId, sessionName);
     if (nextQueueTurn) {
       state.activeTurn = nextQueueTurn.turn as ActiveTelegramTurn;
       updateStatus(ctx);
