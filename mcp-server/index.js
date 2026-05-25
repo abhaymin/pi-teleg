@@ -15,9 +15,10 @@
  * }
  */
 
-import { readFileSync, writeFileSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, createReadStream } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
+import { DatabaseSync } from "node:sqlite";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -42,6 +43,9 @@ const BOT_TOKEN = config?.botToken;
 const BASE_URL = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : null;
 const CHAT_ID = config?.allowedUserIds?.[0] || null;
 
+const DEFAULT_DB_PATH = join(process.env.HOME || "~", ".pi", "agent", "teleg-bridge.db");
+const DB_PATH = process.env.TELEG_DB_PATH || DEFAULT_DB_PATH;
+
 // ─── Telegram API ────────────────────────────────────────────────────────────
 
 async function tg(method, body = {}) {
@@ -61,16 +65,65 @@ async function sendMessage(text, chatId = CHAT_ID) {
   return tg("sendMessage", { chat_id: chatId, text, parse_mode: "HTML" });
 }
 
+// ─── Streaming Upload Helpers ────────────────────────────────────────────────
+
+/**
+ * Build a multipart/form-data body using streaming for large files.
+ * Avoids loading entire file into memory.
+ */
+async function streamUpload(filePath, fieldName, extraFields = {}) {
+  const fileName = filePath.split("/").pop();
+  const fileSize = (await import("fs")).statSync(filePath).size;
+  
+  // Generate boundary
+  const boundary = `----FormBoundary${Date.now()}${Math.random().toString(36).slice(2)}`;
+  
+  // Build header (non-streaming, small)
+  let header = `--${boundary}\r\n`;
+  for (const [key, value] of Object.entries(extraFields)) {
+    header += `Content-Disposition: form-data; name="${key}"\r\n\r\n${value}\r\n--${boundary}\r\n`;
+  }
+  header += `Content-Disposition: form-data; name="${fieldName}"; filename="${fileName}"\r\n`;
+  header += `Content-Type: application/octet-stream\r\n\r\n`;
+  
+  // Create readable stream for header + file + footer
+  const { Readable } = await import("stream");
+  const footer = `\r\n--${boundary}--\r\n`;
+  
+  const headerStream = Readable.from([Buffer.from(header)]);
+  const fileStream = createReadStream(filePath);
+  const footerStream = Readable.from([Buffer.from(footer)]);
+  
+  const combined = Readable.from([
+    headerStream,
+    fileStream,
+    footerStream
+  ]);
+  
+  const res = await fetch(`${BASE_URL}/${fieldName}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": `multipart/form-data; boundary=${boundary}`,
+      "Content-Length": String(Buffer.byteLength(header) + fileSize + Buffer.byteLength(footer)),
+    },
+    body: combined,
+    // Increase timeout for large files
+    signal: AbortSignal.timeout(300_000), // 5 min timeout
+  });
+  
+  return res;
+}
+
 async function sendPhoto(filePath, caption = "", chatId = CHAT_ID) {
   if (!chatId) throw new Error("No chat ID configured");
-  const { readFileSync } = await import("fs");
-  const buf = readFileSync(filePath);
-  const form = new FormData();
-  form.append("chat_id", chatId);
-  form.append("photo", new Blob([buf]), filePath.split("/").pop());
-  form.append("caption", caption);
-  form.append("parse_mode", "HTML");
-  const res = await fetch(`${BASE_URL}/sendPhoto`, { method: "POST", body });
+  if (!existsSync(filePath)) throw new Error(`File not found: ${filePath}`);
+  
+  const res = await streamUpload(filePath, "sendPhoto", {
+    chat_id: chatId,
+    caption,
+    parse_mode: "HTML",
+  });
+  
   const data = await res.json();
   if (!data.ok) throw new Error(`Telegram: ${data.description}`);
   return data.result;
@@ -78,14 +131,14 @@ async function sendPhoto(filePath, caption = "", chatId = CHAT_ID) {
 
 async function sendVideo(filePath, caption = "", chatId = CHAT_ID) {
   if (!chatId) throw new Error("No chat ID configured");
-  const { readFileSync } = await import("fs");
-  const buf = readFileSync(filePath);
-  const form = new FormData();
-  form.append("chat_id", chatId);
-  form.append("video", new Blob([buf]), filePath.split("/").pop());
-  form.append("caption", caption);
-  form.append("parse_mode", "HTML");
-  const res = await fetch(`${BASE_URL}/sendVideo`, { method: "POST", body });
+  if (!existsSync(filePath)) throw new Error(`File not found: ${filePath}`);
+  
+  const res = await streamUpload(filePath, "sendVideo", {
+    chat_id: chatId,
+    caption,
+    parse_mode: "HTML",
+  });
+  
   const data = await res.json();
   if (!data.ok) throw new Error(`Telegram: ${data.description}`);
   return data.result;
@@ -95,11 +148,44 @@ async function getMe() {
   return tg("getMe");
 }
 
+// ─── Queue Stats ────────────────────────────────────────────────────────────
+
+function getQueueStats() {
+  const db = new DatabaseSync(DB_PATH, { readonly: true, fileMustExist: false });
+  try {
+    const rows = db.prepare(`SELECT status, COUNT(*) as count FROM message_queue GROUP BY status`).all();
+    const stats = { pending: 0, processing: 0, completed: 0, failed: 0, total: 0 };
+    for (const row of rows) {
+      if (row.status in stats) stats[row.status] = row.count;
+      stats.total += row.count;
+    }
+    const depth = db.prepare(`SELECT COUNT(*) as count FROM message_queue WHERE status IN ('pending','processing')`).get();
+    return { ...stats, depth: depth?.count ?? 0 };
+  } finally {
+    db.close();
+  }
+}
+
+function getDownloadStats() {
+  const db = new DatabaseSync(DB_PATH, { readonly: true, fileMustExist: false });
+  try {
+    const rows = db.prepare(`SELECT status, COUNT(*) as count FROM download_queue GROUP BY status`).all();
+    const stats = { pending: 0, processing: 0, completed: 0, failed: 0, total: 0 };
+    for (const row of rows) {
+      if (row.status in stats) stats[row.status] = row.count;
+      stats.total += row.count;
+    }
+    return stats;
+  } finally {
+    db.close();
+  }
+}
+
 // ─── MCP Protocol (stdio) ────────────────────────────────────────────────────
 
 const TOOL_DEFINITIONS = [
   {
-    name: "send_message",
+    name: "teleg-send_message",
     description: "Send a text message to Telegram",
     inputSchema: {
       type: "object",
@@ -111,7 +197,7 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
-    name: "send_photo",
+    name: "teleg-send_photo",
     description: "Send a photo to Telegram",
     inputSchema: {
       type: "object",
@@ -124,7 +210,7 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
-    name: "send_video",
+    name: "teleg-send_video",
     description: "Send a video to Telegram",
     inputSchema: {
       type: "object",
@@ -142,7 +228,17 @@ const TOOL_DEFINITIONS = [
     inputSchema: { type: "object", properties: {} },
   },
   {
-    name: "teleg_attach",
+    name: "get_queue_count",
+    description: "Get the number of pending and processing messages in the queue",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "get_queue_stats",
+    description: "Get full queue statistics for messages and downloads",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "teleg-attach",
     description: "Queue files for next reply (no-op in standalone MCP, extension handles actual sending)",
     inputSchema: {
       type: "object",
@@ -152,9 +248,30 @@ const TOOL_DEFINITIONS = [
       required: ["paths"],
     },
   },
+  {
+    name: "teleg-clear_backlog",
+    description: "Clear/reset the message backlog queue. Use 'reset' to unstick stale processing messages, 'purge' to delete old completed/failed entries, or 'complete' to manually mark a message done.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          enum: ["reset", "purge", "complete", "fail"],
+          description: "Action: 'reset' = unstick stuck processing→pending, 'purge' = delete old completed/failed entries, 'complete' = mark a message completed, 'fail' = mark a message failed",
+        },
+        id: { type: "number", description: "Message ID (required for complete/fail actions)" },
+        keep_count: { type: "number", description: "How many completed/failed entries to keep on purge (default 500)" },
+      },
+      required: ["action"],
+    },
+  },
 ];
 
 let pendingAttachments = [];
+
+// NOTE: teleg_attach is registered by the extension via pi.registerTool().
+// The MCP server does NOT handle file attachments — the extension does that
+// at agent_end via state.activeTurn.queuedAttachments.
 
 // Read JSON-RPC request from stdin
 function readRequest() {
@@ -227,36 +344,70 @@ async function handleRequest(req) {
 
     if (method === "tools/call") {
       const { name, arguments: args } = params ?? {};
-      const chatId = args?.chat_id || CHAT_ID;
 
-      switch (name) {
-        case "send_message":
-          if (!args?.text) throw new Error("Missing text");
-          const r1 = await sendMessage(args.text, chatId);
-          sendResponse(id, { content: [{ type: "text", text: JSON.stringify(r1) }] });
-          break;
-        case "send_photo":
-          if (!args?.file_path) throw new Error("Missing file_path");
-          const r2 = await sendPhoto(args.file_path, args.caption || "", chatId);
-          sendResponse(id, { content: [{ type: "text", text: JSON.stringify(r2) }] });
-          break;
-        case "send_video":
-          if (!args?.file_path) throw new Error("Missing file_path");
-          const r3 = await sendVideo(args.file_path, args.caption || "", chatId);
-          sendResponse(id, { content: [{ type: "text", text: JSON.stringify(r3) }] });
-          break;
-        case "get_me":
-          const r4 = await getMe();
-          sendResponse(id, { content: [{ type: "text", text: JSON.stringify(r4) }] });
-          break;
-        case "teleg_attach":
-          if (args?.paths) pendingAttachments.push(...args.paths);
-          sendResponse(id, { content: [{ type: "text", text: `Queued ${args?.paths?.length || 0} attachment(s)` }] });
-          break;
-        default:
-          throw new Error(`Unknown tool: ${name}`);
+      // All actual Telegram tools are handled by the extension.
+      // The MCP server only receives the teleg_attach definition in its manifest
+      // for backward compatibility, but never executes it — the extension owns that.
+      if (name === "teleg-send_message") {
+        sendResponse(id, await sendMessage(args.text, args.chat_id));
+        return;
       }
-      return;
+      if (name === "teleg-send_photo") {
+        sendResponse(id, await sendPhoto(args.file_path, args.caption, args.chat_id));
+        return;
+      }
+      if (name === "teleg-send_video") {
+        sendResponse(id, await sendVideo(args.file_path, args.caption, args.chat_id));
+        return;
+      }
+      if (name === "get_me") {
+        sendResponse(id, await getMe());
+        return;
+      }
+      if (name === "get_queue_count") {
+        const stats = getQueueStats();
+        sendResponse(id, { count: stats.depth, pending: stats.pending, processing: stats.processing });
+        return;
+      }
+      if (name === "get_queue_stats") {
+        sendResponse(id, { messages: getQueueStats(), downloads: getDownloadStats() });
+        return;
+      }
+      if (name === "teleg-attach") {
+        pendingAttachments = args.paths ?? [];
+        sendResponse(id, { queued: pendingAttachments.length });
+        return;
+      }
+      if (name === "teleg-clear_backlog") {
+        const db = new DatabaseSync(DB_PATH);
+        let count = 0;
+        let action = args.action;
+        try {
+          if (action === "reset") {
+            count = db.prepare("UPDATE message_queue SET status = 'pending', session_id = 'unassigned', session_name = 'unknown', started_at = NULL WHERE status = 'processing'").run().changes;
+          } else if (action === "purge") {
+            const keep = args.keep_count ?? 500;
+            const row = db.prepare("SELECT id FROM message_queue WHERE status IN ('completed','failed') ORDER BY id DESC LIMIT 1 OFFSET ?").get(keep);
+            if (row) {
+              count = db.prepare("DELETE FROM message_queue WHERE status IN ('completed','failed') AND id < ?").run(row.id).changes;
+            }
+          } else if (action === "complete") {
+            if (!args.id) throw new Error("id required for complete action");
+            db.prepare("UPDATE message_queue SET status = 'completed', completed_at = ? WHERE id = ?").run(Date.now(), args.id);
+            count = 1;
+          } else if (action === "fail") {
+            if (!args.id) throw new Error("id required for fail action");
+            db.prepare("UPDATE message_queue SET status = 'failed', completed_at = ?, error = ? WHERE id = ?").run(Date.now(), "Manually marked as failed", args.id);
+            count = 1;
+          }
+        } finally {
+          db.close();
+        }
+        sendResponse(id, { action, count });
+        return;
+      }
+
+      throw new Error(`Unknown tool: ${name}`);
     }
 
     // Unknown method

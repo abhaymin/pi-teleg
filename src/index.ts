@@ -11,7 +11,7 @@
 
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { Worker } from "node:worker_threads";
 import { fileURLToPath } from "node:url";
@@ -22,12 +22,14 @@ import {
   startRelayServer,
   stopRelayServer,
   setCommandHandler,
+  setCompleteHandler,
   forwardToSession,
   getRelayStatus,
   cleanStaleRelayFiles,
   cleanRelayFilesByPid,
 } from "./relay.js";
 import * as Db from "./db.js";
+import { resolveBotContext, detectSplitDb, type BotContext } from "./config.js";
 
 // ============================================================================
 // Constants
@@ -153,6 +155,7 @@ interface PendingTelegramTurn {
   content: Array<TextContent | ImageContent>;
   historyText: string;
   twitterUrls?: string[];
+  dbId?: number; // SQLite row ID for the queued message
 }
 
 type ActiveTelegramTurn = PendingTelegramTurn;
@@ -163,6 +166,7 @@ interface PollState {
   lastSuccessfulPoll: number;
   isHealthy: boolean;
   lastHealthCheck: number;
+  pendingRetries: Map<number, number>; // dbId → retry count for in-progress messages
 }
 
 // ============================================================================
@@ -174,8 +178,8 @@ const SYSTEM_PROMPT_SUFFIX = `
 Telegram bridge extension is active.
 - Messages forwarded from Telegram are prefixed with "[telegram]".
 - [telegram] messages may include local temp file paths for Telegram attachments. Read those files as needed.
-- If a [telegram] user asked for a file or generated artifact, use the teleg_attach tool with the local file path so the extension can send it with my next final reply.
-- Do not assume mentioning a local file path in plain text will send it to Telegram. Use teleg_attach.
+- If a [telegram] user asked for a file or generated artifact, use the teleg-attach tool with the local file path so the extension can send it with my next final reply.
+- Do not assume mentioning a local file path in plain text will send it to Telegram. Use teleg-attach.
 
 ## Session Identity & Capabilities
 - This is session "{sessionName}" running in {projectDir}.
@@ -188,7 +192,7 @@ Telegram bridge extension is active.
   What this session does
 - Other sessions with matching capabilities will get relevant messages relayed to them automatically.
 - Messages addressed to a specific session (e.g., "@sessionName ...") are routed directly.
-- If you receive a relayed message from Telegram, process the request and send results back using send_message, send_photo, send_video, or teleg_attach tools.`;
+- If you receive a relayed message from Telegram, process the request and send results back using teleg-send_message, teleg-send_photo, teleg-send_video, or teleg-attach tools.`;
 
 // ============================================================================
 // Utility Functions
@@ -384,16 +388,66 @@ const SharedPollingManager = (() => {
   let pollWorker: Worker | null = null;
   let isPolling = false;
   let lockRefreshInterval: ReturnType<typeof setInterval> | undefined;
-  let turnQueue: TurnQueueItem[] = []; // In-flight cache; source of truth is SQLite
-  let activeTurns: Map<string, ActiveTelegramTurn> = new Map();
   let messageHandler: ((turn: PendingTelegramTurn, update: TelegramUpdate) => void) | null = null;
   
+  // ─── Session state pulled fresh from SQLite on every call ──────────────────
+  // These functions read from DB instead of in-memory state so any session
+  // can accurately query/update the queue regardless of which session is polling.
+
+  /**
+   * Check if a session has an active turn by looking at DB, not in-memory state.
+   * This allows any session to know what's happening without needing the
+   * polling session to maintain shared in-memory state.
+   */
+  function hasActiveTurnInDb(sessionId: string): boolean {
+    try {
+      const row = Db.getDb().prepare(
+        "SELECT 1 FROM message_queue WHERE session_id = ? AND status = 'processing' LIMIT 1"
+      ).get(sessionId);
+      return !!row;
+    } catch { return false; }
+  }
+
+  /**
+   * Get all message IDs that are currently 'processing' for a given session
+   * from the database (source of truth, not in-memory cache).
+   */
+  function getProcessingMessageIds(sessionId: string): number[] {
+    try {
+      const rows = Db.getDb().prepare(
+        "SELECT id FROM message_queue WHERE session_id = ? AND status = 'processing'"
+      ).all(sessionId) as Array<{ id: number }>;
+      return rows.map(r => r.id);
+    } catch { return []; }
+  }
+
+  /**
+   * Check the DB for any session already processing a message from this chat.
+   * Used for chat affinity — ensures messages from the same chat go to the
+   * same session even across process boundaries.
+   */
+  function getSessionProcessingChat(chatId: number): string | null {
+    try {
+      const row = Db.getDb().prepare(
+        "SELECT session_id FROM message_queue WHERE chat_id = ? AND status = 'processing' ORDER BY started_at DESC LIMIT 1"
+      ).get(chatId) as { session_id: string } | undefined;
+      return row?.session_id ?? null;
+    } catch { return null; }
+  }
+
+  // ─── In-memory turn tracking (per-process cache of DB state) ────────────
+  // activeTurns: tracks turns in-flight within this process. Cross-process state
+  // lives in SQLite (see hasActiveTurnInDb, getSessionProcessingChat above).
+  // turnQueue: NOT needed — ordering is handled by the SQLite queue.
+  let activeTurns: Map<string, ActiveTelegramTurn> = new Map();
+
   let pollState: PollState = {
     consecutiveErrors: 0,
     reconnectDelay: INITIAL_RECONNECT_DELAY_MS,
     lastSuccessfulPoll: Date.now(),
     isHealthy: true,
     lastHealthCheck: Date.now(),
+    pendingRetries: new Map<number, number>(),
   };
   
   // ─── Polling Lock (cross-process) ──────────────────────────────────────
@@ -514,28 +568,82 @@ const SharedPollingManager = (() => {
     
     let targetSessionId: string | null = null;
     
-    // 1. Session affinity: if a session already has an active turn for this chat
-    for (const [sid] of activeTurns) {
-      const t = activeTurns.get(sid);
-      if (t && t.chatId === message.chat.id) { targetSessionId = sid; break; }
-    }
+    // 1. Session affinity via DB: if any session is already processing a message from this chat
+    // (cross-process awareness — works even if the processing session is a different Pi process)
+    const existingSessionForChat = getSessionProcessingChat(message.chat.id);
+    if (existingSessionForChat) targetSessionId = existingSessionForChat;
     
-    // 2. Check in-memory queue for chat affinity
-    if (!targetSessionId && turnQueue.length > 0) {
-      const queuedForChat = turnQueue.find(q => q.turn.chatId === message.chat.id);
-      if (queuedForChat) targetSessionId = queuedForChat.turn.sessionId;
-    }
-    
-    // 3. Check @sessionName prefix
+    // 3. @sessionName prefix → forward via relay (relay sends final reply to Telegram)
     const text = message.text || message.caption || "";
     const sessionTagMatch = text.match(/^@(\S+)\s*/);
     if (sessionTagMatch) {
-      const tagName = sessionTagMatch[1];
+      const targetName = sessionTagMatch[1];
       const registry = await readSessionRegistry();
-      const namedSession = registry.sessions.find(s => s.sessionName === tagName);
-      if (namedSession) targetSessionId = namedSession.sessionId;
+      const targetSession = registry.sessions.find(s => s.sessionName === targetName);
+
+      if (targetSession) {
+        // Mark message as processing in DB before forwarding
+        try {
+          Db.getDb().prepare(
+            "UPDATE message_queue SET session_id = ?, session_name = ?, status = 'processing', started_at = ? WHERE id = ?"
+          ).run(targetSession.sessionId, targetName, Date.now(), dbId);
+        } catch {}
+
+        // Forward via relay — data-scrapper processes and sends reply directly to Telegram
+        const relayPath = join(process.env.HOME || "~", ".pi/agent/tmp/teleg-relay", `${targetName}.json`);
+        if (existsSync(relayPath)) {
+          try {
+            const relayInfo = JSON.parse(readFileSync(relayPath, "utf8"));
+            try { process.kill(relayInfo.pid, 0); } catch {
+              try {
+                Db.getDb().prepare(
+                  "UPDATE message_queue SET status = 'failed', error = ? WHERE id = ?"
+                ).run(`Session "${targetName}" not running`, dbId);
+              } catch {}
+              return;
+            }
+            // Clean text (without @prefix) for relay
+            const cleanText = text.replace(sessionTagMatch[0], "").trim();
+            const res = await fetch(`http://127.0.0.1:${relayInfo.port}/command`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                chatId: message.chat.id,
+                messageId: message.message_id,
+                text: cleanText,
+                secret: relayInfo.secret,
+                sourceSession: process.cwd().split("/").filter(Boolean).pop() || "teleg",
+              }),
+            });
+            // Forward-and-forget: data-scrapper calls /complete when done processing.
+            // We don't wait for a response here — the relay's /complete endpoint handles cleanup.
+            return;
+          } catch (err) {
+            try {
+              Db.getDb().prepare(
+                "UPDATE message_queue SET status = 'failed', error = ? WHERE id = ?"
+              ).run(String(err), dbId);
+            } catch {}
+            return;
+          }
+        } else {
+          try {
+            Db.getDb().prepare(
+              "UPDATE message_queue SET status = 'failed', error = ? WHERE id = ?"
+            ).run(`Session "${targetName}" relay not found`, dbId);
+          } catch {}
+          return;
+        }
+      } else {
+        try {
+          Db.getDb().prepare(
+            "UPDATE message_queue SET status = 'failed', error = ? WHERE id = ?"
+          ).run(`Session "${targetName}" not found`, dbId);
+        } catch {}
+        return;
+      }
     }
-    
+
     // 4. Capability-based smart routing
     if (!targetSessionId) {
       const capReg = await readCapabilitiesRegistry();
@@ -559,35 +667,50 @@ const SharedPollingManager = (() => {
       else if (registry.sessions.length > 0) targetSessionId = registry.sessions[0].sessionId;
     }
     
-    // Dispatch — route to the target session
+    // Dispatch — route to the target session.
+    // "Active turns" tracked in DB (source of truth for cross-process awareness)
+    // and in-memory Map (fast path for current process). See hasActiveTurnInDb().
     if (targetSessionId) {
       const reg = await readSessionRegistry();
       const sessionInfo = reg.sessions.find(s => s.sessionId === targetSessionId);
       const sName = sessionInfo?.sessionName || targetSessionId;
       const turn = createTurn(targetSessionId, sName, message);
+      turn.dbId = dbId; // Track the DB row ID
       
-      // If this session already has an active turn → queue it (preserves ordering per session)
-      if (activeTurns.has(targetSessionId)) {
-        turnQueue.push({ turn, update, dbId });
+      // If the target session is already busy (check DB for cross-process accuracy),
+      // mark preferred session and let it claim when free. No in-memory queue.
+      const dbBusy = hasActiveTurnInDb(targetSessionId);
+      if (dbBusy) {
+        try {
+          Db.getDb().prepare(
+            "UPDATE message_queue SET session_id = ?, session_name = ? WHERE id = ? AND status = 'pending'"
+          ).run(targetSessionId, sName, dbId);
+        } catch {}
         return;
       }
       
       activeTurns.set(targetSessionId, turn as ActiveTelegramTurn);
       
-      // Update SQLite to assigned + processing
+      // Update SQLite to processing
       try {
         Db.getDb().prepare(
           "UPDATE message_queue SET session_id = ?, session_name = ?, status = 'processing', started_at = ? WHERE id = ?"
         ).run(targetSessionId, sName, Date.now(), dbId);
       } catch {}
       
-      // Fire message handler — does NOT block. Each session processes concurrently.
+      // Fire message handler — non-blocking. Each session processes concurrently.
       if (messageHandler) messageHandler(turn, update);
     } else {
-      // No target session — queue for later
-      const turn = createTurn("unassigned", "unknown", message);
-      turnQueue.push({ turn, update, dbId });
-      if (messageHandler) messageHandler(turn, update);
+      // No target session — leave unassigned in DB
+      try {
+        Db.getDb().prepare(
+          "UPDATE message_queue SET session_id = 'unassigned', session_name = 'unknown' WHERE id = ?"
+        ).run(dbId);
+      } catch {}
+      if (messageHandler) {
+        const turn = createTurn("unassigned", "unknown", message);
+        messageHandler(turn, update);
+      }
     }
   }
   
@@ -598,7 +721,7 @@ const SharedPollingManager = (() => {
     
     pollWorker = new Worker(POLL_WORKER_PATH, {
       workerData: {
-        dbPath: join(__dirname, "..", "teleg-bridge.db"),
+        dbPath: join(homedir(), ".pi", "agent", "teleg-bridge.db"),
         pollTimeoutSeconds: POLL_TIMEOUT_SECONDS,
         healthCheckIntervalMs: HEALTH_CHECK_INTERVAL_MS,
         maxConsecutiveErrors: MAX_CONSECUTIVE_ERRORS,
@@ -699,20 +822,48 @@ const SharedPollingManager = (() => {
     isHeldByOther(): boolean { return isPollingLockHeldByOther(); },
     getState(): PollState { return { ...pollState }; },
     
-    onMessage(handler: (turn: PendingTelegramTurn, update: TelegramUpdate) => void): void { messageHandler = handler; },
-    completeTurn(sessionId: string): void { activeTurns.delete(sessionId); },
-    
-    claimNextTurn(sessionId: string, sName?: string): TurnQueueItem | null {
-      // 1. In-memory fast path
-      const idx = turnQueue.findIndex(q => q.turn.sessionId === "unassigned" || q.turn.sessionId === sessionId);
-      if (idx >= 0) {
-        const item = turnQueue.splice(idx, 1)[0];
-        item.turn.sessionId = sessionId;
-        activeTurns.set(sessionId, item.turn as ActiveTelegramTurn);
-        if (item.dbId) { try { Db.completeMessage(item.dbId); } catch {} }
-        return item;
+    onMessage(handler: (turn: PendingTelegramTurn, update: TelegramUpdate) => void): void {
+      messageHandler = handler;
+    },
+
+    /**
+     * Complete a specific message by ID, then cleanup orphans.
+     * @param sessionId - The session completing the message
+     * @param dbId - The specific message ID to mark completed (optional, resets all if omitted)
+     */
+    completeTurn(sessionId: string, dbId?: number): void {
+      activeTurns.delete(sessionId);
+      try {
+        if (typeof dbId === 'number') {
+          // Mark ONLY this specific message as completed
+          Db.getDb().prepare(
+            "UPDATE message_queue SET status = 'completed', completed_at = ? WHERE id = ? AND status = 'processing'"
+          ).run(Date.now(), dbId);
+        } else {
+          // No dbId — this happens on crash recovery paths.
+          // Reset ALL processing messages to pending so they re-drain.
+          Db.getDb().prepare(
+            "UPDATE message_queue SET status = 'pending', session_id = 'unassigned', session_name = 'unknown', started_at = NULL WHERE session_id = ? AND status = 'processing'"
+          ).run(sessionId);
+        }
+      } catch (err) {
+        console.error("[teleg-pm] completeTurn error:", err);
       }
-      // 2. SQLite pending messages
+    },
+
+    hasActiveTurnFor(sessionId: string): boolean {
+      // DB is source of truth (cross-process), in-memory is a fast shortcut for current process
+      if (hasActiveTurnInDb(sessionId)) return true;
+      return activeTurns.has(sessionId);
+    },
+
+    getProcessingDbIds(sessionId: string): number[] {
+      return getProcessingMessageIds(sessionId);
+    },
+
+    claimNextTurn(sessionId: string, sName?: string): TurnQueueItem | null {
+      // Source of truth is SQLite — any session can atomically claim any pending message.
+      // The DB's claimNextMessage prevents race conditions across processes.
       const name = sName || "unknown";
       const dbMsg = Db.claimNextMessage(sessionId, name);
       if (dbMsg) {
@@ -722,6 +873,7 @@ const SharedPollingManager = (() => {
           queuedAttachments: [],
           content: [{ type: "text", text: `${TELEGRAM_PREFIX} ${dbMsg.text}` }],
           historyText: dbMsg.text,
+          dbId: dbMsg.id, // Track the DB row ID
         };
         activeTurns.set(sessionId, turn as ActiveTelegramTurn);
         const syntheticUpdate: TelegramUpdate = {
@@ -737,12 +889,52 @@ const SharedPollingManager = (() => {
       }
       return null;
     },
-    
+
     getQueueDepth(): number {
-      try { return Db.getQueueDepth(); } catch { return turnQueue.length; }
+      try { return Db.getQueueDepth(); } catch { return 0; }
     },
-    
-    hasActiveTurnFor(sessionId: string): boolean { return activeTurns.has(sessionId); },
+
+    /**
+     * Claim the next pending message strictly for this session.
+     * Does NOT claim unassigned messages — for sessions to actively monitor their own queue.
+     */
+    claimNextTurnForSession(sessionName: string): TurnQueueItem | null {
+      const dbMsg = Db.claimNextMessageForSession(sessionName);
+      if (dbMsg) {
+        const sessionId = `__session__:${sessionName}`;
+        const turn: PendingTelegramTurn = {
+          sessionId, sessionName,
+          chatId: dbMsg.chat_id, replyToMessageId: dbMsg.message_id,
+          queuedAttachments: [],
+          content: [{ type: "text", text: `${TELEGRAM_PREFIX} ${dbMsg.text}` }],
+          historyText: dbMsg.text,
+          dbId: dbMsg.id,
+        };
+        activeTurns.set(sessionId, turn as ActiveTelegramTurn);
+        return {
+          turn,
+          update: {
+            update_id: dbMsg.id,
+            message: {
+              message_id: dbMsg.message_id,
+              from: { id: dbMsg.from_user_id, is_bot: false, first_name: dbMsg.from_username || "User" },
+              chat: { id: dbMsg.chat_id, type: "private" },
+              text: dbMsg.text,
+            },
+          },
+          dbId: dbMsg.id,
+        };
+      }
+      return null;
+    },
+
+    /**
+     * Get count of pending messages for this session (for status display).
+     */
+    getPendingCountForSession(sessionName: string): number {
+      try { return Db.getPendingCountForSession(sessionName); } catch { return 0; }
+    },
+
     isUserAllowed(userId: number): boolean { return isAllowedUser(config, userId); },
     
     async addAllowedUser(userId: number): Promise<void> {
@@ -769,31 +961,70 @@ const SharedPollingManager = (() => {
       }
       if (current) chunks.push(current);
       let lastMessageId: number | undefined;
+      const MAX_SEND_RETRIES = 2;
       for (const chunk of chunks) {
-        try {
-          const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
-            chat_id: chatId, text: chunk,
-            ...(replyToMsgId ? { reply_to_message_id: replyToMsgId } : {}),
-          }, { timeout: 10000 });
-          lastMessageId = sent.message_id;
-        } catch {}
+        for (let attempt = 1; attempt <= MAX_SEND_RETRIES; attempt++) {
+          try {
+            const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
+              chat_id: chatId, text: chunk,
+              ...(replyToMsgId ? { reply_to_message_id: replyToMsgId } : {}),
+            }, { timeout: 15000 });
+            lastMessageId = sent.message_id;
+            break; // success, move to next chunk
+          } catch (err) {
+            if (attempt < MAX_SEND_RETRIES) {
+              console.error(`[teleg] sendReply failed (attempt ${attempt}/${MAX_SEND_RETRIES}), retrying...`);
+              await new Promise(r => setTimeout(r, attempt * 2000));
+            } else {
+              console.error(`[teleg] sendReply failed after ${MAX_SEND_RETRIES} attempts:`, err instanceof Error ? err.message : err);
+            }
+          }
+        }
       }
       return lastMessageId;
     },
     
     async sendFile(chatId: string, replyToMsgId: number, filePath: string, fileName: string, isImage: boolean, caption?: string): Promise<boolean> {
-      try {
-        const method = isImage ? "sendPhoto" : "sendDocument";
-        const fieldName = isImage ? "photo" : "document";
-        const form = new FormData();
-        form.set("chat_id", chatId);
-        if (caption) form.set("caption", caption);
-        const buffer = await readFile(filePath);
-        form.set(fieldName, new Blob([buffer]), fileName);
-        const response = await fetch(`https://api.telegram.org/bot${config.botToken}/${method}`, { method: "POST", body: form });
-        const data = (await response.json()) as TelegramApiResponse<TelegramSentMessage>;
-        return data.ok;
-      } catch { return false; }
+      if (!config.botToken) { console.error("[teleg] sendFile: no botToken configured"); return false; }
+      // Use curl for file uploads — node fetch is unreliable for large POST bodies
+      const { execFile } = await import("node:child_process");
+      const method = isImage ? "sendPhoto" : "sendDocument";
+      const fieldName = isImage ? "photo" : "document";
+      const ext = fileName.split(".").pop() || (isImage ? "jpeg" : "bin");
+      const mimeType = isImage ? `image/${ext}` : "application/octet-stream";
+      const MAX_RETRIES = 3;
+      for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+          const args = [
+            "-s", "-S", "--max-time", "120",
+            "-F", `chat_id=${chatId}`,
+            ...(replyToMsgId ? ["-F", `reply_to_message_id=${replyToMsgId}`] : []),
+            ...(caption ? ["-F", `caption=${caption}`] : []),
+            "-F", `${fieldName}=@${filePath};filename=${fileName};type=${mimeType}`,
+            `https://api.telegram.org/bot${config.botToken}/${method}`,
+          ];
+          const result = await new Promise<{ ok: boolean; error: string }>((resolve) => {
+            execFile("curl", args, { timeout: 125_000 }, (err, stdout, stderr) => {
+              if (err) { resolve({ ok: false, error: stderr || err.message }); }
+              else {
+                try { const data = JSON.parse(stdout); resolve({ ok: data.ok, error: data.description }); }
+                catch { resolve({ ok: false, error: stdout.slice(0, 200) }); }
+              }
+            });
+          });
+          if (!result.ok) {
+            console.error(`[teleg] sendFile API error (attempt ${attempt}/${MAX_RETRIES}):`, result.error);
+            if (attempt < MAX_RETRIES) { await new Promise(r => setTimeout(r, attempt * 2000)); continue; }
+            return false;
+          }
+          return true;
+        } catch (err) {
+          console.error(`[teleg] sendFile failed (attempt ${attempt}/${MAX_RETRIES}):`, err instanceof Error ? err.message : err);
+          if (attempt < MAX_RETRIES) { await new Promise(r => setTimeout(r, attempt * 3000)); continue; }
+          return false;
+        }
+      }
+      return false;
     },
     
     async verifyToken(token: string): Promise<TelegramUser | null> {
@@ -825,6 +1056,7 @@ const pendingForwards: PendingForward[] = [];
 
 interface SessionState {
   sessionId: string;
+  botContext: BotContext | undefined; // Resolved bot context (Phase 1)
   config: TelegramConfig;
   activeTurn: ActiveTelegramTurn | undefined;
   typingInterval: ReturnType<typeof setInterval> | undefined;
@@ -834,6 +1066,7 @@ interface SessionState {
 function createSessionState(sessionId: string): SessionState {
   return {
     sessionId,
+    botContext: undefined, // Will be set in session_start after resolveBotContext
     config: {},
     activeTurn: undefined,
     typingInterval: undefined,
@@ -1016,6 +1249,16 @@ export default function (pi: ExtensionAPI): void {
 
     // Check if this message should be forwarded to another session
     if (targetSessionName && targetSessionName !== sessionName) {
+      // Mark the DB row as belonging to the target session BEFORE forwarding.
+      // This ensures /queue reports accurately even when the forward is async.
+      // (The message will be in the target session's queue in the DB.)
+      // Note: the actual claim/processing happens in the target session's relay handler.
+      try {
+        Db.getDb().prepare(
+          "UPDATE message_queue SET session_name = ?, session_id = ? WHERE chat_id = ? AND message_id = ? AND status = 'pending'"
+        ).run(targetSessionName, targetSessionName, message.chat.id, message.message_id);
+      } catch {}
+      
       // Forward command to the target session via relay
       const forwardResult = await forwardToSession(
         targetSessionName,
@@ -1049,8 +1292,9 @@ export default function (pi: ExtensionAPI): void {
     
     if (lower === "stop" || lower === "/stop") {
       if (state.activeTurn) {
+        const turnDbId = state.activeTurn.dbId;
         state.activeTurn = undefined;
-        SharedPollingManager.completeTurn(sessionId);
+        SharedPollingManager.completeTurn(sessionId, turnDbId);
         updateStatus(ctx);
         await SharedPollingManager.sendReply(String(message.chat.id), message.message_id, "Aborted current turn.");
       } else {
@@ -1329,7 +1573,7 @@ stop - Abort current turn`,
   // ========================================================================
   
   pi.registerTool({
-    name: "send_message",
+    name: "teleg-send_message",
     label: "Send Telegram Message",
     description: "Send a text message to Telegram chat",
     parameters: Type.Object({
@@ -1349,7 +1593,7 @@ stop - Abort current turn`,
   });
   
   pi.registerTool({
-    name: "send_photo",
+    name: "teleg-send_photo",
     label: "Send Telegram Photo",
     description: "Send a photo to Telegram chat",
     parameters: Type.Object({
@@ -1362,10 +1606,12 @@ stop - Abort current turn`,
         ? parseInt(params.chat_id) 
         : state.config.allowedUserIds?.[0];
       if (!targetChatId) {
+        console.error("[teleg] send_photo: no targetChatId, allowedUserIds=", state.config.allowedUserIds);
         throw new Error("No chat ID available. Send /start to pair first.");
       }
       const stats = await stat(params.file_path);
       if (!stats.isFile()) {
+        console.error("[teleg] send_photo: not a file:", params.file_path);
         throw new Error(`Not a file: ${params.file_path}`);
       }
       const success = await SharedPollingManager.sendFile(
@@ -1377,6 +1623,7 @@ stop - Abort current turn`,
         params.caption
       );
       if (!success) {
+        console.error("[teleg] send_photo: sendFile returned false for", params.file_path);
         throw new Error("Failed to send photo");
       }
       return { content: [{ type: "text", text: "Photo sent" }], details: {} };
@@ -1384,7 +1631,7 @@ stop - Abort current turn`,
   });
   
   pi.registerTool({
-    name: "send_video",
+    name: "teleg-send_video",
     label: "Send Telegram Video",
     description: "Send a video to Telegram chat",
     parameters: Type.Object({
@@ -1397,10 +1644,12 @@ stop - Abort current turn`,
         ? parseInt(params.chat_id) 
         : state.config.allowedUserIds?.[0];
       if (!targetChatId) {
+        console.error("[teleg] send_video: no targetChatId, allowedUserIds=", state.config.allowedUserIds);
         throw new Error("No chat ID available. Send /start to pair first.");
       }
       const stats = await stat(params.file_path);
       if (!stats.isFile()) {
+        console.error("[teleg] send_video: not a file:", params.file_path);
         throw new Error(`Not a file: ${params.file_path}`);
       }
       const success = await SharedPollingManager.sendFile(
@@ -1412,6 +1661,7 @@ stop - Abort current turn`,
         params.caption
       );
       if (!success) {
+        console.error("[teleg] send_video: sendFile returned false for", params.file_path);
         throw new Error("Failed to send video");
       }
       return { content: [{ type: "text", text: "Video sent" }], details: {} };
@@ -1428,21 +1678,120 @@ stop - Abort current turn`,
       return { content: [{ type: "text", text: JSON.stringify(botInfo) }], details: {} };
     },
   });
-  
+
   pi.registerTool({
-    name: "teleg_attach",
+    name: "get_queue_count",
+    label: "Get Queue Count",
+    description: "Get the number of pending and processing messages in the queue",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params) {
+      const Db = await import("./db.js");
+      const depth = Db.getQueueDepth();
+      return { content: [{ type: "text", text: `Queue depth: ${depth}` }], details: { count: depth } };
+    },
+  });
+
+  pi.registerTool({
+    name: "get_queue_stats",
+    label: "Get Queue Stats",
+    description: "Get full queue statistics for messages and downloads",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params) {
+      const Db = await import("./db.js");
+      const stats = Db.getQueueStats();
+      const dlStats = Db.getDownloadStats();
+      const text = `Messages: ${stats.pending} pending · ${stats.processing} processing · ${stats.completed} completed · ${stats.failed} failed\nDownloads: ${dlStats.pending} pending · ${dlStats.processing} processing · ${dlStats.completed} completed · ${dlStats.failed} failed`;
+      return { content: [{ type: "text", text }], details: { messages: stats, downloads: dlStats } };
+    },
+  });
+
+  pi.registerTool({
+    name: "get_queue_data",
+    label: "Get Queue Data",
+    description: "Get queue messages data. Returns recent queue messages with optional limit.",
+    parameters: Type.Object({
+      limit: Type.Optional(Type.Number({ description: "Max messages to return (default 20)" })),
+      status: Type.Optional(Type.String({ description: "Filter by status: pending, processing, completed, failed" })),
+    }),
+    async execute(_toolCallId, params) {
+      const Db = await import("./db.js");
+      const limit = params.limit ?? 20;
+      let rows;
+      if (params.status) {
+        rows = Db.getDb().prepare(`SELECT * FROM message_queue WHERE status = ? ORDER BY created_at DESC LIMIT ?`).all(params.status, limit);
+      } else {
+        rows = Db.getRecentMessages(limit);
+      }
+      return { content: [{ type: "text", text: JSON.stringify(rows, null, 2) }], details: { rows } };
+    },
+  });
+
+  pi.registerTool({
+    name: "get_queue_data_id",
+    label: "Get Queue Data By ID",
+    description: "Get a specific queue message by its ID",
+    parameters: Type.Object({
+      id: Type.Number({ description: "Queue message ID" }),
+    }),
+    async execute(_toolCallId, params) {
+      const Db = await import("./db.js");
+      const row = Db.getDb().prepare(`SELECT * FROM message_queue WHERE id = ?`).get(params.id) as Record<string, unknown> | undefined;
+      if (!row) {
+        return { content: [{ type: "text", text: `No message found with id ${params.id}` }], details: { row: null as unknown } };
+      }
+      return { content: [{ type: "text", text: JSON.stringify(row, null, 2) }], details: { row: row as unknown } };
+    },
+  });
+
+  pi.registerTool({
+    name: "set_queue_status",
+    label: "Set Queue Status",
+    description: "Update the status of a queue message",
+    parameters: Type.Object({
+      id: Type.Number({ description: "Queue message ID" }),
+      status: Type.Union([Type.Literal("pending"), Type.Literal("processing"), Type.Literal("completed"), Type.Literal("failed")], {
+        description: "New status for the message",
+      }),
+      error: Type.Optional(Type.String({ description: "Error message if status is 'failed'" })),
+    }),
+    async execute(_toolCallId, params) {
+      const Db = await import("./db.js");
+      const now = Date.now();
+      let query = `UPDATE message_queue SET status = ?`;
+      const args: (string | number)[] = [params.status];
+      
+      if (params.status === "completed") {
+        query += `, completed_at = ?`;
+        args.push(now);
+      } else if (params.status === "failed" && params.error) {
+        query += `, error = ?`;
+        args.push(params.error);
+      } else if (params.status === "pending") {
+        query += `, started_at = NULL, session_id = 'unassigned', session_name = 'unknown'`;
+      }
+      
+      query += ` WHERE id = ?`;
+      args.push(params.id);
+      
+      const result = Db.getDb().prepare(query).run(...args);
+      return { content: [{ type: "text", text: `Updated ${result.changes} message(s) to status '${params.status}'` }], details: { changes: result.changes } };
+    },
+  });
+
+  pi.registerTool({
+    name: "teleg-attach",
     label: "Telegram Attach",
     description: "Queue one or more local files to be sent with the next Telegram reply.",
     promptSnippet: "Queue local files to be sent with the next Telegram reply.",
     promptGuidelines: [
-      "When handling a [telegram] message and the user asked for a file or generated artifact, call teleg_attach with the local path.",
+      "When handling a [telegram] message and the user asked for a file or generated artifact, call teleg-attach with the local path.",
     ],
     parameters: Type.Object({
       paths: Type.Array(Type.String({ description: "Local file path to attach" })),
     }),
     async execute(_toolCallId, params) {
       if (!state.activeTurn) {
-        throw new Error("teleg_attach can only be used while replying to an active Telegram turn");
+        throw new Error("teleg-attach can only be used while replying to an active Telegram turn");
       }
       const added: string[] = [];
       for (const inputPath of params.paths) {
@@ -1463,7 +1812,65 @@ stop - Abort current turn`,
       };
     },
   });
-  
+
+  // ========================================================================
+  // Backlog / Queue Management
+  // ========================================================================
+
+  pi.registerTool({
+    name: "teleg-clear_backlog",
+    label: "Clear Telegram Backlog",
+    description: "Clear/reset the message backlog queue. Use 'reset' to unstick stale processing messages, 'purge' to delete old completed/failed entries, or 'complete' to manually mark a message done.",
+    parameters: Type.Object({
+      action: Type.Union([Type.Literal("reset"), Type.Literal("purge"), Type.Literal("complete"), Type.Literal("fail"), Type.Literal("delete")], {
+        description: "Action: 'reset' = unstick stuck processing→pending, 'purge' = delete old completed/failed entries, 'complete' = mark a message completed, 'fail' = mark a message failed, 'delete' = delete pending messages (all or by id)",
+      }),
+      id: Type.Optional(Type.Number({ description: "Message ID (required for complete/fail actions)" })),
+      keep_count: Type.Optional(Type.Number({ description: "How many completed/failed entries to keep on purge (default 500)" })),
+    }),
+    async execute(_toolCallId, params) {
+      const Db = await import("./db.js");
+      let count = 0;
+      let id: number | undefined;
+      switch (params.action) {
+        case "reset": {
+          count = Db.resetAllProcessing();
+          break;
+        }
+        case "purge": {
+          const keep = params.keep_count ?? 500;
+          count = Db.purgeOldMessages(keep);
+          break;
+        }
+        case "complete": {
+          if (!params.id) throw new Error("id required for complete action");
+          count = 1; id = params.id;
+          Db.completeMessage(params.id);
+          break;
+        }
+        case "fail": {
+          if (!params.id) throw new Error("id required for fail action");
+          count = 1; id = params.id;
+          Db.failMessage(params.id, "Manually marked as failed via clear_backlog tool");
+          break;
+        }
+        case "delete": {
+          // Delete pending messages for a specific session, or all pending if no id given
+          const d = Db.getDb();
+          if (params.id) {
+            d.prepare("DELETE FROM message_queue WHERE id = ?").run(params.id);
+            count = 1; id = params.id;
+          } else {
+            const result = d.prepare("DELETE FROM message_queue WHERE status = 'pending'").run();
+            count = result.changes;
+          }
+          break;
+        }
+      }
+      return { content: [{ type: "text", text: `Done (action=${params.action}, count=${count})` }], details: { count, id } };
+    },
+  });
+
   // ========================================================================
   // Session Events
   // ========================================================================
@@ -1499,8 +1906,25 @@ stop - Abort current turn`,
   pi.on("session_start", async (_event, ctx) => {
     // Run SQLite startup recovery (recover stale messages, clean dead sessions)
     const recovery = Db.runStartupRecovery();
-    if (recovery.recoveredMessages > 0 || recovery.cleanedSessions > 0) {
-      console.log(`[teleg:${sessionName}] DB recovery: ${recovery.recoveredMessages} messages recovered, ${recovery.cleanedSessions} stale sessions cleaned`);
+    if (recovery.recoveredMessages > 0 || recovery.cleanedSessions > 0 || (recovery.mergedFromLocal ?? 0) > 0) {
+      console.log(`[teleg:${sessionName}] DB recovery: ${recovery.recoveredMessages} messages recovered, ${recovery.cleanedSessions} stale sessions cleaned, ${recovery.mergedFromLocal ?? 0} session names merged from local DBs`);
+    }
+    
+    // Phase 1: Resolve bot context (multi-bot support)
+    // This must happen before any polling or DB access.
+    try {
+      state.botContext = await resolveBotContext(cwd);
+      console.log(`[teleg:${sessionName}] Bot context resolved: @${state.botContext.botUsername} (id=${state.botContext.botId})`);
+      
+      // Check for split DB warning
+      const splitDbWarning = await detectSplitDb(state.botContext.botId, state.botContext.dbPath);
+      if (splitDbWarning) {
+        console.warn(`[teleg:${sessionName}] ${splitDbWarning}`);
+      }
+    } catch (err) {
+      console.error(`[teleg:${sessionName}] Failed to resolve bot context: ${err}`);
+      console.error("[teleg] Set TELEG_BOT_TOKEN, TELEG_BOT_ID, or configure .pi/teleg.json");
+      // Continue without bot context — some tools (relay) may still work
     }
     
     await SharedPollingManager.init();
@@ -1548,7 +1972,9 @@ stop - Abort current turn`,
         text,
         sourceSession: meta.sourceSession || "unknown",
       });
-      // Create a turn as if it came from Telegram to trigger agent processing
+      // Create a turn as if it came from Telegram to trigger agent processing.
+      // Use deliverAs:"steer" to interrupt if the agent is mid-stream — the forwarded
+      // command is higher priority since it was explicitly routed via @sessionName.
       const turn: PendingTelegramTurn = {
         sessionId,
         sessionName,
@@ -1559,9 +1985,35 @@ stop - Abort current turn`,
         historyText: text,
       };
       state.activeTurn = turn as ActiveTelegramTurn;
-      pi.sendUserMessage(turn.content);
+      try {
+        pi.sendUserMessage(turn.content, { deliverAs: "steer" });
+      } catch {
+        // Agent is busy streaming — leave the message in the DB queue.
+        // It will be claimed via claimNextTurn when the current turn completes.
+        state.activeTurn = undefined;
+        SharedPollingManager.completeTurn(sessionId);
+        SharedPollingManager.claimNextTurn(sessionId, sessionName);
+      }
       // Return placeholder — the actual response is sent directly to Telegram from agent_end
       return `[${sessionName}] Processing...`;
+    });
+
+    setCompleteHandler((id, sourceSession) => {
+      // Called by the relay when the target session signals completion.
+      // We look up the message_queue entry by (sourceSession, id) and mark it complete.
+      if (!sourceSession || sourceSession === "unknown") return;
+      try {
+        const db = Db.getDb();
+        const row = db.prepare(
+          "SELECT id FROM message_queue WHERE session_name = ? AND id = ?"
+        ).get(sourceSession, id) as { id: number } | undefined;
+        if (row) {
+          db.prepare(`UPDATE message_queue SET status = 'completed', completed_at = ? WHERE id = ?`)
+            .run(Date.now(), row.id);
+        }
+      } catch (err) {
+        console.error("[teleg] complete handler error:", err);
+      }
     });
 
     if (state.config.botToken) {
@@ -1659,10 +2111,12 @@ stop - Abort current turn`,
   pi.on("agent_end", async (event, ctx) => {
     const turn = state.activeTurn;
     state.activeTurn = undefined;
-    SharedPollingManager.completeTurn(sessionId);
+    // Pass dbId so only this specific message gets completed, not all processing messages
+    SharedPollingManager.completeTurn(sessionId, turn?.dbId);
     updateStatus(ctx);
     
     let assistantText = "";
+    let hasError = false;
     for (let i = event.messages.length - 1; i >= 0; i--) {
       const msg = event.messages[i] as unknown as Record<string, unknown>;
       if (msg.role === "assistant") {
@@ -1675,6 +2129,16 @@ stop - Abort current turn`,
           .join("")
           .trim();
         break;
+      }
+    }
+    
+    // Check for error indicators in messages (agent failed/crashed)
+    for (const msg of event.messages as unknown as Array<{role: string; content?: unknown}>) {
+      if (msg.role === "system" && typeof msg.content === "string") {
+        const lower = msg.content.toLowerCase();
+        if (lower.includes("error") || lower.includes("failed") || lower.includes("crash")) {
+          hasError = true;
+        }
       }
     }
     
@@ -1740,29 +2204,64 @@ stop - Abort current turn`,
       }
     }
     
-    // Check for pending forwards that didn't get consumed (relay came in during processing)
-    if (pendingForwards.length > 0 && !forward) {
-      const next = pendingForwards.shift()!;
-      const nextTurn: PendingTelegramTurn = {
-        sessionId,
-        sessionName,
-        chatId: next.chatId,
-        replyToMessageId: next.messageId,
-        queuedAttachments: [],
-        content: [{ type: "text" as const, text: `${TELEGRAM_PREFIX} ${next.text}` }] as Array<TextContent | ImageContent>,
-        historyText: next.text,
-      };
-      state.activeTurn = nextTurn as ActiveTelegramTurn;
-      updateStatus(ctx);
-      pi.sendUserMessage(nextTurn.content);
-      return;
-    }
     
-    const nextQueueTurn = SharedPollingManager.claimNextTurn(sessionId, sessionName);
-    if (nextQueueTurn) {
-      state.activeTurn = nextQueueTurn.turn as ActiveTelegramTurn;
+    // ─── Active queue draining: continuously claim & process until queue is empty ───
+    // This is the key change: sessions now actively monitor and process their own queue,
+    // not waiting for manual triggers. This replaces "passive" with "active" behavior.
+    
+    /**
+     * Drain one queued message: claim it, process it, return true if there was one.
+     * Clears state.activeTurn after completion so the next call starts fresh.
+     */
+    const drainOne = async (): Promise<boolean> => {
+      // 1. Pending forwards (relay commands from other sessions) — highest priority
+      if (pendingForwards.length > 0 && !forward) {
+        const next = pendingForwards.shift()!;
+        const nextTurn: PendingTelegramTurn = {
+          sessionId,
+          sessionName,
+          chatId: next.chatId,
+          replyToMessageId: next.messageId,
+          queuedAttachments: [],
+          content: [{ type: "text" as const, text: `${TELEGRAM_PREFIX} ${next.text}` }] as Array<TextContent | ImageContent>,
+          historyText: next.text,
+        };
+        state.activeTurn = nextTurn as ActiveTelegramTurn;
+        updateStatus(ctx);
+        pi.sendUserMessage(nextTurn.content, { deliverAs: "steer" });
+        return true;
+      }
+      
+      // 2. Claim our own pending messages (session-strict claiming)
+      const queued = SharedPollingManager.claimNextTurnForSession(sessionName);
+      if (queued) {
+        state.activeTurn = queued.turn as ActiveTelegramTurn;
+        updateStatus(ctx);
+        pi.sendUserMessage(queued.turn.content, { deliverAs: "steer" });
+        return true;
+      }
+      
+      // 3. Fall back to unassigned/generic messages (cross-session help)
+      const queueMsg = SharedPollingManager.claimNextTurn(sessionId, sessionName);
+      if (queueMsg) {
+        state.activeTurn = queueMsg.turn as ActiveTelegramTurn;
+        updateStatus(ctx);
+        pi.sendUserMessage(queueMsg.turn.content, { deliverAs: "steer" });
+        return true;
+      }
+      
+      return false;
+    };
+    
+    // Drain while agent is idle and queue has messages
+    if (await drainOne()) {
+      // drainOne consumed one message and sent it to the agent.
+      // The agent will complete and trigger another agent_end → we drain again.
+      // No state.activeTurn cleanup here — agent_end will handle it on next iteration.
+    } else {
+      // Queue is empty — clean up
+      state.activeTurn = undefined;
       updateStatus(ctx);
-      pi.sendUserMessage(nextQueueTurn.turn.content);
     }
   });
 }

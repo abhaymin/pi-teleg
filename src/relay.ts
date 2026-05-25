@@ -197,6 +197,30 @@ export function startRelayServer(sessionName: string, basePort = 9798): Promise<
             return;
           }
           
+          // Mark a message as completed in the source teleg session's DB
+          if (req.url === "/complete" && req.method === "POST") {
+            let body = "";
+            req.on("data", (chunk: Buffer) => (body += chunk.toString()));
+            req.on("end", () => {
+              try {
+                const { id, sourceSession } = JSON.parse(body);
+                // Signal the parent process to complete the message — handled via onComplete callback
+                if (onComplete) {
+                  onComplete(id, sourceSession);
+                  res.writeHead(200, { "Content-Type": "application/json" });
+                  res.end(JSON.stringify({ ok: true }));
+                } else {
+                  res.writeHead(404, { "Content-Type": "application/json" });
+                  res.end(JSON.stringify({ error: "No complete handler registered" }));
+                }
+              } catch (err) {
+                res.writeHead(400, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ error: String(err) }));
+              }
+            });
+            return;
+          }
+          
           // CORS preflight
           if (req.method === "OPTIONS") {
             res.writeHead(204, {
@@ -319,4 +343,43 @@ export async function getRelayStatus(): Promise<Record<string, { port: number; a
   } catch {}
   
   return status;
+}
+
+// ─── Complete callback (called when target session finishes processing) ────────
+
+type CompleteHandler = (id: number, sourceSession?: string) => void;
+let onComplete: CompleteHandler | null = null;
+
+export function setCompleteHandler(handler: CompleteHandler): void {
+  onComplete = handler;
+}
+
+/**
+ * Signal completion of a message back to the source teleg session.
+ * Called by the session (e.g. data-scrapper) after processing.
+ * The message ID is the teleg bridge's message_queue.id (passed via sourceSession in the original command).
+ */
+export async function completeMessageOnSource(
+  sourceSession: string,
+  messageId: number,
+  sourceSecret: string
+): Promise<boolean> {
+  const relayPath = getRelayPath(sourceSession);
+  if (!existsSync(relayPath)) return false;
+  let relayInfo: RelayInfo;
+  try {
+    relayInfo = JSON.parse(readFileSync(relayPath, "utf8"));
+  } catch { return false; }
+  try {
+    process.kill(relayInfo.pid, 0);
+  } catch { return false; }
+  try {
+    const res = await fetch(`http://127.0.0.1:${relayInfo.port}/complete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: messageId, secret: sourceSecret }),
+    });
+    const data = await res.json() as { ok: boolean; error?: string };
+    return data.ok;
+  } catch { return false; }
 }

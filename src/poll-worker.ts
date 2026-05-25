@@ -9,6 +9,8 @@
  *
  * The main thread is free to process/dispatch messages concurrently
  * while this worker handles the blocking HTTP long-poll.
+ *
+ * DB path: env TELEG_DB_PATH → workerData.dbPath → ~/.pi/agent/teleg-bridge.db
  */
 
 import { parentPort, workerData } from "node:worker_threads";
@@ -17,8 +19,9 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { existsSync, mkdirSync } from "node:fs";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const DB_PATH = join(__dirname, "..", "teleg-bridge.db");
+// DB path: env override → workerData → shared default
+const DEFAULT_DB_PATH = join(process.env.HOME || "~", ".pi", "agent", "teleg-bridge.db");
+const DB_PATH = process.env.TELEG_DB_PATH || ((workerData as { dbPath?: string } | undefined)?.dbPath) || DEFAULT_DB_PATH;
 
 // ============================================================================
 // Types
@@ -106,6 +109,25 @@ function getDb(): DatabaseSync {
     db = new DatabaseSync(DB_PATH);
     db.exec("PRAGMA journal_mode=WAL");
     db.exec("PRAGMA busy_timeout=5000");
+    db.exec(`CREATE TABLE IF NOT EXISTS download_queue (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      chat_id           INTEGER NOT NULL,
+      message_id        INTEGER NOT NULL,
+      url               TEXT NOT NULL,
+      source            TEXT NOT NULL DEFAULT 'twitter' CHECK (source IN ('twitter', 'youtube', 'reddit', 'gallery', 'other')),
+      session_name      TEXT NOT NULL DEFAULT 'data-scrapper',
+      status            TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
+      retry_count       INTEGER NOT NULL DEFAULT 0,
+      error             TEXT,
+      result            TEXT,
+      created_at        INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000),
+      started_at        INTEGER,
+      completed_at      INTEGER
+    )`);
+    db.exec("CREATE INDEX IF NOT EXISTS idx_dl_status ON download_queue(status)");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_dl_session ON download_queue(session_name)");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_dl_created ON download_queue(created_at)");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_dl_url ON download_queue(url)");
   }
   return db;
 }
@@ -156,15 +178,27 @@ function persistMessage(message: TelegramMessage): number {
     INSERT INTO message_queue (chat_id, message_id, from_user_id, from_username, text, session_id, session_name, source)
     VALUES (?, ?, ?, ?, ?, 'unassigned', 'unknown', 'telegram')
   `);
-  stmt.run(
-    message.chat.id,
-    message.message_id,
-    message.from?.id ?? 0,
-    message.from?.username ?? null,
-    message.text || message.caption || "",
-  );
-  const row = d.prepare("SELECT last_insert_rowid() as id").get() as { id: number };
-  return row.id;
+  try {
+    stmt.run(
+      message.chat.id,
+      message.message_id,
+      message.from?.id ?? 0,
+      message.from?.username ?? null,
+      message.text || message.caption || "",
+    );
+    const row = d.prepare("SELECT last_insert_rowid() as id").get() as { id: number };
+    return row.id;
+  } catch (err) {
+    // Duplicate (chat_id, message_id) — Telegram redelivered after a reconnect.
+    // Return the existing ID so we skip re-processing this message.
+    if (err instanceof Error && err.message.includes('UNIQUE constraint failed')) {
+      const existing = d.prepare(
+        "SELECT id FROM message_queue WHERE chat_id = ? AND message_id = ?"
+      ).get(message.chat.id, message.message_id) as { id: number } | undefined;
+      if (existing) return existing.id;
+    }
+    throw err;
+  }
 }
 
 async function pollLoop(): Promise<void> {
@@ -187,6 +221,18 @@ async function pollLoop(): Promise<void> {
   }
 
   post({ type: "started" });
+
+  // Drain stale processing messages before starting the poll loop.
+  // This ensures any messages that got stuck in 'processing' (e.g. from a crashed
+  // data-scrapper session) are returned to 'pending' so they can be reclaimed.
+  try {
+    const recovered = getDb().prepare(
+      "UPDATE message_queue SET status = 'pending', started_at = NULL, session_id = 'unassigned', session_name = 'unknown' WHERE status = 'processing'"
+    ).run().changes;
+    if (recovered > 0) console.log(`[teleg-poll] Recovered ${recovered} stale processing messages`);
+  } catch (e) {
+    console.error("[teleg-poll] Recovery error:", e);
+  }
 
   while (!aborted) {
     try {
