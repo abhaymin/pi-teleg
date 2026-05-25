@@ -73,14 +73,16 @@ interface TelegramUpdate {
 type WorkerMessage =
   | { type: "start"; config: { botToken: string; lastUpdateId?: number } }
   | { type: "stop" }
-  | { type: "update_config"; config: { lastUpdateId?: number } };
+  | { type: "update_config"; config: { lastUpdateId?: number } }
+  | { type: "offset"; botId: number; lastUpdateId: number };
 
 type MainMessage =
   | { type: "message"; update: TelegramUpdate; dbId: number }
   | { type: "health"; healthy: boolean; consecutiveErrors: number }
   | { type: "error"; error: string }
   | { type: "started" }
-  | { type: "stopped" };
+  | { type: "stopped" }
+  | { type: "offset"; botId: number; lastUpdateId: number };
 
 // ============================================================================
 // Worker Logic
@@ -292,6 +294,11 @@ async function pollLoop(): Promise<void> {
 
         // Post to main thread for routing and dispatch
         post({ type: "message", update, dbId });
+      }
+
+      // Report offset after batch (action 3.5)
+      if (updates.length > 0 && lastUpdateId !== undefined) {
+        post({ type: "offset", botId, lastUpdateId });
       }
     } catch (error) {
       if (aborted) return;
