@@ -1,6 +1,6 @@
 # Multi-bot Polling Implementation Tasks
 
-## Status: Phase 1 Complete
+## Status: Phase 4 Complete
 
 ## Task 1: Phase 1 — Bot Context and Configuration ✅
 - **Status:** DONE (commit e5b1a5de)
@@ -9,21 +9,22 @@
 
 ## Task 2: Phase 2 — Database Schema v2 ✅
 - **Status:** DONE (commit 28522040)
-- **Files:** src/db.ts, src/poll-worker.ts, src/index.ts, src/config.ts
-- **Summary:** Added bot_id columns, schema version tracking, migration, all DB functions updated to scope by botId
+- **Files:** src/db.ts (modified)
+- **Summary:** Added bot_id columns, migration, scoped query functions
 
-## Task 3: Phase 3 — Per-bot Polling Manager
-- **Status:** 🔄 In Progress (Integration Phase)
-- **Files:** src/polling-manager.ts (new), src/poll-worker.ts (modified)
-- **Summary:** Created PollingManager class, getPollingManager registry, offset messaging. Integration with index.ts in progress.
+## Task 3: Phase 3 — Per-bot Polling Manager ✅
+- **Status:** DONE (commit 33d21dea)
+- **Files:** src/index.ts (modified)
+- **Summary:** Per-bot PollingManager registry, lock files per bot
 
-## Task 4: Phase 4 — Registry Unification
-- **Status:** Pending
-- **Depends on:** Task 2
+## Task 4: Phase 4 — Registry Unification ✅
+- **Status:** DONE (commit ea1e494f)
+- **Files:** src/relay.ts, src/index.ts
+- **Summary:** botId in relay JSON, SessionRegistry v2 with primaryByBot, DB sync
 
 ## Task 5: Phase 5 — Liveness, Reconcile, Routing Guards
 - **Status:** Pending
-- **Depends on:** Task 3, Task 4
+- **Depends on:** Task 3 ✅, Task 4 ✅
 
 ## Task 6: Phase 6 — Active Idle Drain
 - **Status:** Pending

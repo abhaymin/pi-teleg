@@ -30,6 +30,7 @@ import {
 } from "./relay.js";
 import * as Db from "./db.js";
 import { resolveBotContext, detectSplitDb, type BotContext } from "./config.js";
+import { reconcileSessions, electPrimary, checkSessionLiveness, getSessionLivenessSummary, type SessionLiveness } from "./session-registry.js";
 
 // ============================================================================
 // Constants
@@ -444,11 +445,21 @@ const SharedPollingManager = (() => {
 
   /**
    * Check the DB for any session already processing a message from this chat.
+   * Phase 5: Scoped by bot_id for multi-bot support.
    * Used for chat affinity — ensures messages from the same chat go to the
    * same session even across process boundaries.
    */
   function getSessionProcessingChat(chatId: number): string | null {
     try {
+      const botId = SharedPollingManager.getBotId();
+      if (botId) {
+        // Phase 5: scope query by bot_id
+        const row = Db.getDb().prepare(
+          "SELECT session_id FROM message_queue WHERE bot_id = ? AND chat_id = ? AND status = 'processing' ORDER BY started_at DESC LIMIT 1"
+        ).get(botId, chatId) as { session_id: string } | undefined;
+        return row?.session_id ?? null;
+      }
+      // Fallback for no bot_id (legacy behavior)
       const row = Db.getDb().prepare(
         "SELECT session_id FROM message_queue WHERE chat_id = ? AND status = 'processing' ORDER BY started_at DESC LIMIT 1"
       ).get(chatId) as { session_id: string } | undefined;
@@ -681,11 +692,32 @@ const SharedPollingManager = (() => {
       }
     }
     
-    // 5. Fallback to primary session
+    // Phase 5: Scope routing by bot_id, call reconcile before primary fallback
+    const botId = SharedPollingManager.getBotId();
+    
+    // 5. Fallback to primary session (scoped by bot_id)
     if (!targetSessionId) {
+      // Phase 5: Reconcile sessions before primary fallback - evict ghosts and re-elect
+      if (botId) {
+        const report = await reconcileSessions(botId).catch(() => null);
+        if (report?.evictedSessions.length) {
+          console.log(`[teleg] Evicted during routing: ${report.evictedSessions.join(", ")}`);
+        }
+      }
       const registry = await readSessionRegistry();
-      if (registry.primarySessionId) targetSessionId = registry.primarySessionId;
-      else if (registry.sessions.length > 0) targetSessionId = registry.sessions[0].sessionId;
+      // Phase 5: Filter by bot_id and prefer linked sessions
+      const sameBotSessions = registry.sessions.filter(s => {
+        if (botId && s.botId !== botId) return false;
+        // Check if session is linked
+        return true; // Will be verified in the dispatch step below
+      });
+      // Prefer primary session for this bot
+      const primaryName = botId ? registry.primaryByBot?.[String(botId)] : null;
+      const primarySession = primaryName 
+        ? sameBotSessions.find(s => s.sessionName === primaryName)
+        : null;
+      if (primarySession) targetSessionId = primarySession.sessionId;
+      else if (sameBotSessions.length > 0) targetSessionId = sameBotSessions[0].sessionId;
     }
     
     // Dispatch — route to the target session.
@@ -1997,6 +2029,18 @@ stop - Abort current turn`,
     await mkdir(TEMP_DIR, { recursive: true });
     await registerSession();
 
+    // Phase 5: Reconcile sessions on startup - evict ghosts and ensure primary is elected
+    const botId = state.botContext?.botId;
+    if (botId) {
+      const report = await reconcileSessions(botId);
+      if (report.evictedSessions.length > 0) {
+        console.log(`[teleg:${sessionName}] Evicted ghost sessions: ${report.evictedSessions.join(", ")}`);
+      }
+      if (report.newPrimary) {
+        console.log(`[teleg:${sessionName}] Primary elected: ${report.newPrimary}`);
+      }
+    }
+
     // Announce presence ONCE per session (not on reconnections)
     const registry1 = await readSessionRegistry();
     const sessInfo = registry1.sessions.find(s => s.sessionId === sessionId);
@@ -2113,6 +2157,12 @@ stop - Abort current turn`,
     
     setInterval(async () => {
       await heartbeatSession();
+      // Phase 5: Reconcile sessions periodically to evict ghosts and maintain primary
+      if (botId) {
+        await reconcileSessions(botId).catch((err) =>
+          console.error(`[teleg:${sessionName}] Reconcile failed:`, err)
+        );
+      }
       if (!SharedPollingManager.isActive() && state.config.botToken) {
         if (SharedPollingManager.isHeldByOther()) {
           // Another process is actively polling — stay passive, no retry needed
