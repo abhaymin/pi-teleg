@@ -123,6 +123,16 @@ async function readGlobalConfig(): Promise<GlobalConfigV2 | null> {
   }
 }
 
+// Sync version for use in migrations
+export function readGlobalConfigSync(): GlobalConfigV2 | null {
+  try {
+    const content = readFileSync(CONFIG_FILE, "utf8");
+    return JSON.parse(content) as GlobalConfigV2;
+  } catch {
+    return null;
+  }
+}
+
 async function writeGlobalConfig(cfg: GlobalConfigV2): Promise<void> {
   await mkdir(CONFIG_DIR, { recursive: true });
   await writeFile(CONFIG_FILE, JSON.stringify(cfg, null, "\t") + "\n", "utf8");

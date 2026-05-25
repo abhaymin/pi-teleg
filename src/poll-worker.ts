@@ -29,6 +29,7 @@ const DB_PATH = process.env.TELEG_DB_PATH || ((workerData as { dbPath?: string }
 
 interface PollWorkerData {
   botToken: string;
+  botId: number; // Telegram bot user ID for scoping
   dbPath: string;
   pollTimeoutSeconds: number;
   healthCheckIntervalMs: number;
@@ -92,6 +93,7 @@ const INITIAL_RECONNECT = workerData?.initialReconnectDelayMs ?? 1000;
 const MAX_RECONNECT = workerData?.maxReconnectDelayMs ?? 30000;
 
 let botToken = "";
+let botId = 0;
 let lastUpdateId: number | undefined;
 let aborted = false;
 let consecutiveErrors = 0;
@@ -109,8 +111,31 @@ function getDb(): DatabaseSync {
     db = new DatabaseSync(DB_PATH);
     db.exec("PRAGMA journal_mode=WAL");
     db.exec("PRAGMA busy_timeout=5000");
+    // Initialize message_queue schema (migrations handled by main thread's db.ts)
+    db.exec(`CREATE TABLE IF NOT EXISTS message_queue (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      bot_id            INTEGER NOT NULL DEFAULT 0,
+      chat_id           INTEGER NOT NULL,
+      message_id        INTEGER NOT NULL,
+      from_user_id      INTEGER NOT NULL,
+      from_username     TEXT,
+      text              TEXT NOT NULL DEFAULT '',
+      session_id        TEXT NOT NULL DEFAULT 'unassigned',
+      session_name      TEXT NOT NULL DEFAULT 'unknown',
+      status            TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
+      source            TEXT NOT NULL DEFAULT 'telegram' CHECK (source IN ('telegram', 'relay')),
+      source_session    TEXT,
+      created_at        INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000),
+      started_at        INTEGER,
+      completed_at      INTEGER,
+      error             TEXT,
+      response          TEXT
+    )`);
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_dedup ON message_queue(bot_id, chat_id, message_id)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_queue_status ON message_queue(status)`);
     db.exec(`CREATE TABLE IF NOT EXISTS download_queue (
       id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      bot_id            INTEGER NOT NULL DEFAULT 0,
       chat_id           INTEGER NOT NULL,
       message_id        INTEGER NOT NULL,
       url               TEXT NOT NULL,
@@ -175,11 +200,12 @@ async function callTelegram<T>(
 function persistMessage(message: TelegramMessage): number {
   const d = getDb();
   const stmt = d.prepare(`
-    INSERT INTO message_queue (chat_id, message_id, from_user_id, from_username, text, session_id, session_name, source)
-    VALUES (?, ?, ?, ?, ?, 'unassigned', 'unknown', 'telegram')
+    INSERT INTO message_queue (bot_id, chat_id, message_id, from_user_id, from_username, text, session_id, session_name, source)
+    VALUES (?, ?, ?, ?, ?, ?, 'unassigned', 'unknown', 'telegram')
   `);
   try {
     stmt.run(
+      botId,
       message.chat.id,
       message.message_id,
       message.from?.id ?? 0,
@@ -189,12 +215,12 @@ function persistMessage(message: TelegramMessage): number {
     const row = d.prepare("SELECT last_insert_rowid() as id").get() as { id: number };
     return row.id;
   } catch (err) {
-    // Duplicate (chat_id, message_id) — Telegram redelivered after a reconnect.
+    // Duplicate (bot_id, chat_id, message_id) — Telegram redelivered after a reconnect.
     // Return the existing ID so we skip re-processing this message.
     if (err instanceof Error && err.message.includes('UNIQUE constraint failed')) {
       const existing = d.prepare(
-        "SELECT id FROM message_queue WHERE chat_id = ? AND message_id = ?"
-      ).get(message.chat.id, message.message_id) as { id: number } | undefined;
+        "SELECT id FROM message_queue WHERE bot_id = ? AND chat_id = ? AND message_id = ?"
+      ).get(botId, message.chat.id, message.message_id) as { id: number } | undefined;
       if (existing) return existing.id;
     }
     throw err;
@@ -318,6 +344,7 @@ parentPort?.on("message", (msg: WorkerMessage) => {
   switch (msg.type) {
     case "start":
       botToken = msg.config.botToken;
+      botId = (workerData as PollWorkerData)?.botId ?? 0;
       lastUpdateId = msg.config.lastUpdateId;
       aborted = false;
       startHealthChecks();

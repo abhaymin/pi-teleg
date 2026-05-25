@@ -17,8 +17,12 @@ import { DatabaseSync } from "node:sqlite";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { mkdirSync, existsSync } from "node:fs";
+import { readGlobalConfigSync } from "./config.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+// Schema version for migrations
+const SCHEMA_VERSION = 2;
 
 // DB path: env override → shared default
 const DEFAULT_DB_PATH = join(process.env.HOME || "~", ".pi", "agent", "teleg-bridge.db");
@@ -30,6 +34,7 @@ const DB_PATH = process.env.TELEG_DB_PATH || DEFAULT_DB_PATH;
 
 export interface QueuedMessage {
   id: number;
+  bot_id: number; // Telegram bot user ID that received this message
   chat_id: number;
   message_id: number;
   from_user_id: number;
@@ -49,6 +54,7 @@ export interface QueuedMessage {
 
 export interface RelaySession {
   id: number;
+  bot_id: number; // Telegram bot user ID this session is linked to
   session_name: string;
   session_id: string;
   pid: number;
@@ -58,6 +64,7 @@ export interface RelaySession {
   capabilities: string | null; // JSON array
   description: string | null;
   role: "active" | "passive";
+  is_primary: boolean; // True if this session holds the polling lock for this bot
   registered_at: number;
   last_heartbeat: number;
 }
@@ -72,6 +79,7 @@ export interface QueueStats {
 
 export interface DownloadItem {
   id: number;
+  bot_id: number; // Telegram bot user ID that received the message with this download
   chat_id: number;
   message_id: number;
   url: string;
@@ -102,15 +110,124 @@ function getDb(): DatabaseSync {
     db.exec("PRAGMA journal_mode=WAL");
     db.exec("PRAGMA busy_timeout=5000");
     db.exec("PRAGMA synchronous=NORMAL");
-    initSchema(db);
+    
+    // Check and run migrations
+    runMigrations(db);
   }
   return db;
+}
+
+function runMigrations(database: DatabaseSync): void {
+  // Get current schema version
+  const versionRow = database.prepare("PRAGMA user_version").get() as { user_version: number };
+  let currentVersion = versionRow.user_version;
+
+  if (currentVersion >= SCHEMA_VERSION) {
+    // Already up to date, just ensure tables exist (for fresh DBs)
+    initSchema(database);
+    return;
+  }
+
+  console.log(`[db] Running migrations from v${currentVersion} to v${SCHEMA_VERSION}...`);
+
+  // Migration from v0/v1 to v2: Add bot_id columns
+  if (currentVersion < 2) {
+    migrateToV2(database);
+  }
+
+  // Set the final version
+  database.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+  console.log(`[db] Migration complete, schema version now ${SCHEMA_VERSION}`);
+}
+
+function migrateToV2(database: DatabaseSync): void {
+  // Get default bot_id for backfill
+  let defaultBotId = 0;
+  try {
+    const cfg = readGlobalConfigSync();
+    if (cfg && cfg.defaultBotId) {
+      defaultBotId = cfg.defaultBotId;
+    }
+  } catch {
+    console.warn("[db] Could not read global config for default bot_id, using 0");
+  }
+
+  // Add bot_id column to message_queue if it doesn't exist
+  try {
+    database.exec(`ALTER TABLE message_queue ADD COLUMN bot_id INTEGER NOT NULL DEFAULT ${defaultBotId}`);
+  } catch (err) {
+    // Column might already exist (in case of partial migration)
+    if (!(err instanceof Error && err.message.includes("duplicate column"))) {
+      console.error("[db] Error adding bot_id to message_queue:", err);
+    }
+  }
+
+  // Add bot_id column to relay_sessions if it doesn't exist
+  try {
+    database.exec(`ALTER TABLE relay_sessions ADD COLUMN bot_id INTEGER NOT NULL DEFAULT ${defaultBotId}`);
+  } catch (err) {
+    if (!(err instanceof Error && err.message.includes("duplicate column"))) {
+      console.error("[db] Error adding bot_id to relay_sessions:", err);
+    }
+  }
+
+  // Add is_primary column to relay_sessions
+  try {
+    database.exec(`ALTER TABLE relay_sessions ADD COLUMN is_primary INTEGER NOT NULL DEFAULT 0`);
+  } catch (err) {
+    if (!(err instanceof Error && err.message.includes("duplicate column"))) {
+      console.error("[db] Error adding is_primary to relay_sessions:", err);
+    }
+  }
+
+  // Add bot_id column to download_queue
+  try {
+    database.exec(`ALTER TABLE download_queue ADD COLUMN bot_id INTEGER NOT NULL DEFAULT ${defaultBotId}`);
+  } catch (err) {
+    if (!(err instanceof Error && err.message.includes("duplicate column"))) {
+      console.error("[db] Error adding bot_id to download_queue:", err);
+    }
+  }
+
+  // Drop old unique index and create new scoped index for message_queue
+  try {
+    database.exec(`DROP INDEX IF EXISTS idx_queue_dedup`);
+  } catch { /* ignore */ }
+  try {
+    database.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_dedup ON message_queue(bot_id, chat_id, message_id)`);
+  } catch (err) {
+    console.error("[db] Error creating idx_queue_dedup:", err);
+  }
+
+  // Drop old relay_sessions unique constraint and create new scoped one
+  try {
+    database.exec(`DROP INDEX IF EXISTS idx_relay_name`);
+  } catch { /* ignore */ }
+  try {
+    database.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_relay_name ON relay_sessions(bot_id, session_name)`);
+  } catch (err) {
+    console.error("[db] Error creating idx_relay_name:", err);
+  }
+
+  // Create indexes for bot_id columns
+  try {
+    database.exec(`CREATE INDEX IF NOT EXISTS idx_queue_bot_id ON message_queue(bot_id)`);
+  } catch { /* ignore */ }
+  try {
+    database.exec(`CREATE INDEX IF NOT EXISTS idx_relay_bot_id ON relay_sessions(bot_id)`);
+  } catch { /* ignore */ }
+  try {
+    database.exec(`CREATE INDEX IF NOT EXISTS idx_dl_bot_id ON download_queue(bot_id)`);
+  } catch { /* ignore */ }
+
+  console.log("[db] v2 migration: bot_id columns added, indexes updated");
 }
 
 function initSchema(database: DatabaseSync): void {
   database.exec(`
     CREATE TABLE IF NOT EXISTS message_queue (
       id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      bot_id            INTEGER NOT NULL DEFAULT 0,
       chat_id           INTEGER NOT NULL,
       message_id        INTEGER NOT NULL,
       from_user_id      INTEGER NOT NULL,
@@ -131,11 +248,12 @@ function initSchema(database: DatabaseSync): void {
     CREATE INDEX IF NOT EXISTS idx_queue_status ON message_queue(status);
     CREATE INDEX IF NOT EXISTS idx_queue_session ON message_queue(session_id);
     CREATE INDEX IF NOT EXISTS idx_queue_chat ON message_queue(chat_id);
-    -- Prevent duplicate message insertions (Telegram redelivers on reconnect)
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_dedup ON message_queue(chat_id, message_id);
+    CREATE INDEX IF NOT EXISTS idx_queue_bot_id ON message_queue(bot_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_dedup ON message_queue(bot_id, chat_id, message_id);
 
     CREATE TABLE IF NOT EXISTS download_queue (
       id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      bot_id            INTEGER NOT NULL DEFAULT 0,
       chat_id           INTEGER NOT NULL,
       message_id        INTEGER NOT NULL,
       url               TEXT NOT NULL,
@@ -154,10 +272,12 @@ function initSchema(database: DatabaseSync): void {
     CREATE INDEX IF NOT EXISTS idx_dl_session ON download_queue(session_name);
     CREATE INDEX IF NOT EXISTS idx_dl_created ON download_queue(created_at);
     CREATE INDEX IF NOT EXISTS idx_dl_url ON download_queue(url);
+    CREATE INDEX IF NOT EXISTS idx_dl_bot_id ON download_queue(bot_id);
 
     CREATE TABLE IF NOT EXISTS relay_sessions (
       id                INTEGER PRIMARY KEY AUTOINCREMENT,
-      session_name      TEXT NOT NULL UNIQUE,
+      bot_id            INTEGER NOT NULL DEFAULT 0,
+      session_name      TEXT NOT NULL,
       session_id        TEXT NOT NULL,
       pid               INTEGER NOT NULL,
       port              INTEGER NOT NULL,
@@ -166,12 +286,14 @@ function initSchema(database: DatabaseSync): void {
       capabilities      TEXT,
       description       TEXT,
       role              TEXT NOT NULL DEFAULT 'passive' CHECK (role IN ('active', 'passive')),
+      is_primary        INTEGER NOT NULL DEFAULT 0,
       registered_at     INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000),
       last_heartbeat    INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000)
     );
 
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_relay_name ON relay_sessions(bot_id, session_name);
     CREATE INDEX IF NOT EXISTS idx_relay_pid ON relay_sessions(pid);
-    CREATE INDEX IF NOT EXISTS idx_relay_name ON relay_sessions(session_name);
+    CREATE INDEX IF NOT EXISTS idx_relay_bot_id ON relay_sessions(bot_id);
 
     CREATE TABLE IF NOT EXISTS relay_history (
       id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -210,8 +332,10 @@ export function closeDb(): void {
 /**
  * Enqueue a new message from Telegram or relay.
  * Returns the auto-generated row ID.
+ * @param botId - The bot that received this message
  */
 export function enqueueMessage(params: {
+  bot_id: number;
   chat_id: number;
   message_id: number;
   from_user_id: number;
@@ -224,10 +348,11 @@ export function enqueueMessage(params: {
 }): number {
   const d = getDb();
   const stmt = d.prepare(`
-    INSERT INTO message_queue (chat_id, message_id, from_user_id, from_username, text, session_id, session_name, source, source_session)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO message_queue (bot_id, chat_id, message_id, from_user_id, from_username, text, session_id, session_name, source, source_session)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   stmt.run(
+    params.bot_id,
     params.chat_id,
     params.message_id,
     params.from_user_id,
@@ -247,8 +372,10 @@ export function enqueueMessage(params: {
  * Claim the next pending message for this session.
  * Also claims unassigned messages if this session has no pending ones (cross-session help).
  * Sets status to 'processing' and returns the message.
+ * @param botId - Scope to messages for this bot
  */
 export function claimNextMessage(
+  botId: number,
   sessionId: string,
   sessionName: string,
   options?: { onlyForSession?: boolean },
@@ -260,7 +387,7 @@ export function claimNextMessage(
   if (onlyForSession) {
     sql = `
       SELECT * FROM message_queue
-      WHERE status = 'pending'
+      WHERE bot_id = ? AND status = 'pending'
         AND (session_name = ? OR session_id = 'unassigned')
       ORDER BY
         CASE WHEN session_id = 'unassigned' THEN 0 ELSE 1 END,
@@ -270,7 +397,7 @@ export function claimNextMessage(
   } else {
     sql = `
       SELECT * FROM message_queue
-      WHERE status = 'pending'
+      WHERE bot_id = ? AND status = 'pending'
         AND (
           (session_id = 'unassigned' OR session_name = 'unknown')
           OR session_id = ?
@@ -283,7 +410,9 @@ export function claimNextMessage(
     `;
   }
 
-  const args: string[] = onlyForSession ? [sessionName] : [sessionId, sessionName];
+  const args: (string | number)[] = onlyForSession 
+    ? [botId, sessionName] 
+    : [botId, sessionId, sessionName];
   const row = d.prepare(sql).get(...args) as unknown as QueuedMessage | undefined;
 
   if (!row) return null;
@@ -305,34 +434,37 @@ export function claimNextMessage(
 /**
  * Claim the next pending message strictly for this session.
  * Does NOT skip ahead to unassigned messages — strict session affinity.
+ * @param botId - Scope to messages for this bot
  */
-export function claimNextMessageForSession(sessionName: string): QueuedMessage | null {
-  return claimNextMessage(`__session__:${sessionName}`, sessionName, { onlyForSession: true });
+export function claimNextMessageForSession(botId: number, sessionName: string): QueuedMessage | null {
+  return claimNextMessage(botId, `__session__:${sessionName}`, sessionName, { onlyForSession: true });
 }
 
 /**
  * Get count of pending messages for a specific session.
+ * @param botId - Scope to messages for this bot
  */
-export function getPendingCountForSession(sessionName: string): number {
+export function getPendingCountForSession(botId: number, sessionName: string): number {
   const row = getDb().prepare(`
     SELECT COUNT(*) as count FROM message_queue
-    WHERE status = 'pending'
+    WHERE bot_id = ? AND status = 'pending'
       AND (session_name = ? OR session_id = ?)
-  `).get(sessionName, `__session__:${sessionName}`) as { count: number };
+  `).get(botId, sessionName, `__session__:${sessionName}`) as { count: number };
   return row.count;
 }
 
 /**
  * Reset ALL processing messages for a session back to pending.
  * Used for crash recovery when a session loses its active turns unexpectedly.
+ * @param botId - Scope to messages for this bot
  */
-export function resetProcessingForSession(sessionName: string): number {
+export function resetProcessingForSession(botId: number, sessionName: string): number {
   const result = getDb().prepare(`
     UPDATE message_queue
     SET status = 'pending', session_id = 'unassigned', session_name = 'unknown', started_at = NULL
-    WHERE status = 'processing'
+    WHERE bot_id = ? AND status = 'processing'
       AND (session_name = ? OR session_id = ?)
-  `).run(sessionName, `__session__:${sessionName}`);
+  `).run(botId, sessionName, `__session__:${sessionName}`);
   return result.changes;
 }
 
@@ -359,21 +491,24 @@ export function failMessage(id: number, error: string): void {
 }
 
 /**
- * Get the current queue depth (pending + processing).
+ * Get the current queue depth (pending + processing) for a bot.
+ * @param botId - Scope to this bot's queue
  */
-export function getQueueDepth(): number {
+export function getQueueDepth(botId: number): number {
   const row = getDb().prepare(`
-    SELECT COUNT(*) as count FROM message_queue WHERE status IN ('pending', 'processing')
-  `).get() as { count: number };
+    SELECT COUNT(*) as count FROM message_queue WHERE bot_id = ? AND status IN ('pending', 'processing')
+  `).get(botId) as { count: number };
   return row.count;
 }
 
 /**
- * Get queue statistics.
+ * Get queue statistics for a specific bot.
+ * @param botId - Scope to this bot's queue (null for all bots)
  */
-export function getQueueStats(): QueueStats {
+export function getQueueStats(botId?: number): QueueStats {
+  const whereClause = botId !== undefined ? `WHERE bot_id = ${botId}` : "";
   const rows = getDb().prepare(`
-    SELECT status, COUNT(*) as count FROM message_queue GROUP BY status
+    SELECT status, COUNT(*) as count FROM message_queue ${whereClause} GROUP BY status
   `).all() as Array<{ status: string; count: number }>;
 
   const stats: QueueStats = { pending: 0, processing: 0, completed: 0, failed: 0, total: 0 };
@@ -389,67 +524,115 @@ export function getQueueStats(): QueueStats {
  * Recover stale "processing" messages back to "pending".
  * Called on startup to handle messages that were being processed when a crash occurred.
  * Returns the number of recovered messages.
+ * @param botId - Scope to this bot's queue (null for all bots)
  */
-export function recoverStaleMessages(olderThanMs: number = 60000): number {
+export function recoverStaleMessages(olderThanMs: number = 60000, botId?: number): number {
   const cutoff = Date.now() - olderThanMs;
-  const result = getDb().prepare(`
+  let sql = `
     UPDATE message_queue
     SET status = 'pending', started_at = NULL, session_id = 'unassigned', session_name = 'unknown'
     WHERE status = 'processing' AND (started_at IS NULL OR started_at < ?)
-  `).run(cutoff);
+  `;
+  const args: (number | undefined)[] = [cutoff];
+  
+  if (botId !== undefined) {
+    sql = `
+      UPDATE message_queue
+      SET status = 'pending', started_at = NULL, session_id = 'unassigned', session_name = 'unknown'
+      WHERE bot_id = ? AND status = 'processing' AND (started_at IS NULL OR started_at < ?)
+    `;
+    args.unshift(botId);
+  }
+
+  const result = getDb().prepare(sql).run(...args);
   return result.changes;
 }
 
 /**
  * Get recent messages (for status display and debugging).
+ * @param botId - Scope to this bot's queue (null for all bots)
  */
-export function getRecentMessages(limit: number = 20): QueuedMessage[] {
+export function getRecentMessages(limit: number = 20, botId?: number): QueuedMessage[] {
+  const whereClause = botId !== undefined ? `WHERE bot_id = ${botId}` : "";
   return getDb().prepare(`
-    SELECT * FROM message_queue ORDER BY created_at DESC LIMIT ?
+    SELECT * FROM message_queue ${whereClause} ORDER BY created_at DESC LIMIT ?
   `).all(limit) as unknown as QueuedMessage[];
 }
 
 /**
  * Get pending messages for a specific chat (used for session affinity).
+ * @param botId - Scope to this bot
  */
-export function getPendingForChat(chatId: number): QueuedMessage | null {
+export function getPendingForChat(botId: number, chatId: number): QueuedMessage | null {
   return getDb().prepare(`
     SELECT * FROM message_queue
-    WHERE chat_id = ? AND status IN ('pending', 'processing')
+    WHERE bot_id = ? AND chat_id = ? AND status IN ('pending', 'processing')
     ORDER BY created_at ASC LIMIT 1
-  `).get(chatId) as unknown as QueuedMessage | null;
+  `).get(botId, chatId) as unknown as QueuedMessage | null;
+}
+
+/**
+ * Get the session currently processing a message for a specific chat.
+ * Used by routing to detect if a message is already being handled.
+ * @param botId - Scope to this bot
+ * @param chatId - The chat to check
+ * @returns The session_name if a message is currently being processed, null otherwise
+ */
+export function getSessionProcessingChat(botId: number, chatId: number): string | null {
+  const row = getDb().prepare(`
+    SELECT session_name FROM message_queue
+    WHERE bot_id = ? AND chat_id = ? AND status = 'processing'
+    LIMIT 1
+  `).get(botId, chatId) as { session_name: string } | undefined;
+  return row?.session_name ?? null;
 }
 
 /**
  * Purge old completed/failed messages (housekeeping).
  * Keeps the most recent `keepCount` items.
+ * @param botId - Scope to this bot's queue (null for all bots)
  */
-export function purgeOldMessages(keepCount: number = 1000): number {
+export function purgeOldMessages(keepCount: number = 1000, botId?: number): number {
   const d = getDb();
+  const whereClause = botId !== undefined ? `AND bot_id = ${botId}` : "";
+  
   // Find the ID threshold
   const row = d.prepare(`
     SELECT id FROM message_queue
-    WHERE status IN ('completed', 'failed')
+    WHERE status IN ('completed', 'failed') ${whereClause}
     ORDER BY id DESC LIMIT 1 OFFSET ?
   `).get(keepCount) as { id: number } | undefined;
 
   if (!row) return 0;
 
   const result = d.prepare(`
-    DELETE FROM message_queue WHERE status IN ('completed', 'failed') AND id < ?
-  `).run(row.id);
+    DELETE FROM message_queue WHERE status IN ('completed', 'failed') AND bot_id = ? AND id < ?
+  `).run(botId, row.id);
   return result.changes;
 }
 
 /**
  * Reset all processing messages to pending (for manual recovery).
+ * @param botId - Scope to this bot's queue (null for all bots)
  */
-export function resetAllProcessing(): number {
-  const result = getDb().prepare(`
+export function resetAllProcessing(botId?: number): number {
+  let sql = `
     UPDATE message_queue
     SET status = 'pending', started_at = NULL, session_id = 'unassigned', session_name = 'unknown'
     WHERE status = 'processing'
-  `).run();
+  `;
+  const args: number[] = [];
+  
+  if (botId !== undefined) {
+    sql = `
+      UPDATE message_queue
+      SET status = 'pending', started_at = NULL, session_id = 'unassigned', session_name = 'unknown'
+      WHERE bot_id = ? AND status = 'processing'
+    `;
+    args.push(botId);
+  }
+
+  const result = getDb().prepare(sql).run(...args);
   return result.changes;
 }
 
@@ -459,8 +642,10 @@ export function resetAllProcessing(): number {
 
 /**
  * Register or update a relay session.
+ * @param botId - The bot this session is linked to
  */
 export function registerRelaySession(params: {
+  bot_id: number;
   session_name: string;
   session_id: string;
   pid: number;
@@ -472,9 +657,9 @@ export function registerRelaySession(params: {
   role?: "active" | "passive";
 }): void {
   getDb().prepare(`
-    INSERT INTO relay_sessions (session_name, session_id, pid, port, secret, project_dir, capabilities, description, role, registered_at, last_heartbeat)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(session_name) DO UPDATE SET
+    INSERT INTO relay_sessions (bot_id, session_name, session_id, pid, port, secret, project_dir, capabilities, description, role, registered_at, last_heartbeat)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(bot_id, session_name) DO UPDATE SET
       session_id = excluded.session_id,
       pid = excluded.pid,
       port = excluded.port,
@@ -485,6 +670,7 @@ export function registerRelaySession(params: {
       role = excluded.role,
       last_heartbeat = excluded.last_heartbeat
   `).run(
+    params.bot_id,
     params.session_name,
     params.session_id,
     params.pid,
@@ -501,28 +687,34 @@ export function registerRelaySession(params: {
 
 /**
  * Update heartbeat for a relay session.
+ * @param botId - Scope to this bot
+ * @param sessionName - The session to update
  */
-export function heartbeatRelaySession(sessionName: string): void {
+export function heartbeatRelaySession(botId: number, sessionName: string): void {
   getDb().prepare(`
-    UPDATE relay_sessions SET last_heartbeat = ? WHERE session_name = ?
-  `).run(Date.now(), sessionName);
+    UPDATE relay_sessions SET last_heartbeat = ? WHERE bot_id = ? AND session_name = ?
+  `).run(Date.now(), botId, sessionName);
 }
 
 /**
  * Unregister a relay session.
+ * @param botId - Scope to this bot
+ * @param sessionName - The session to unregister
  */
-export function unregisterRelaySession(sessionName: string): void {
+export function unregisterRelaySession(botId: number, sessionName: string): void {
   getDb().prepare(`
-    DELETE FROM relay_sessions WHERE session_name = ?
-  `).run(sessionName);
+    DELETE FROM relay_sessions WHERE bot_id = ? AND session_name = ?
+  `).run(botId, sessionName);
 }
 
 /**
- * Get all alive relay sessions.
+ * Get all alive relay sessions for a specific bot.
+ * @param botId - Scope to this bot (null for all bots)
  */
-export function getAliveRelaySessions(): RelaySession[] {
+export function getAliveRelaySessions(botId?: number): RelaySession[] {
+  const whereClause = botId !== undefined ? `WHERE bot_id = ${botId}` : "";
   const sessions = getDb().prepare(`
-    SELECT * FROM relay_sessions ORDER BY registered_at ASC
+    SELECT * FROM relay_sessions ${whereClause} ORDER BY registered_at ASC
   `).all() as unknown as RelaySession[];
 
   // Filter to only alive PIDs
@@ -538,28 +730,64 @@ export function getAliveRelaySessions(): RelaySession[] {
 
 /**
  * Get a specific relay session by name.
+ * @param botId - Scope to this bot
+ * @param sessionName - The session name
  */
-export function getRelaySession(sessionName: string): RelaySession | null {
+export function getRelaySession(botId: number, sessionName: string): RelaySession | null {
   return getDb().prepare(`
-    SELECT * FROM relay_sessions WHERE session_name = ?
-  `).get(sessionName) as unknown as RelaySession | null;
+    SELECT * FROM relay_sessions WHERE bot_id = ? AND session_name = ?
+  `).get(botId, sessionName) as unknown as RelaySession | null;
+}
+
+/**
+ * Get the primary session for a bot.
+ * @param botId - The bot to query
+ * @returns The session marked as primary, or null if none
+ */
+export function getPrimarySession(botId: number): RelaySession | null {
+  return getDb().prepare(`
+    SELECT * FROM relay_sessions WHERE bot_id = ? AND is_primary = 1
+  `).get(botId) as unknown as RelaySession | null;
+}
+
+/**
+ * Set a session as primary for a bot.
+ * Clears the is_primary flag from all other sessions for this bot first.
+ * @param botId - The bot
+ * @param sessionName - The session to make primary
+ */
+export function setPrimary(botId: number, sessionName: string): void {
+  const d = getDb();
+  d.exec("BEGIN IMMEDIATE");
+  try {
+    // Clear existing primary
+    d.prepare(`UPDATE relay_sessions SET is_primary = 0 WHERE bot_id = ?`).run(botId);
+    // Set new primary
+    d.prepare(`UPDATE relay_sessions SET is_primary = 1 WHERE bot_id = ? AND session_name = ?`).run(botId, sessionName);
+    d.exec("COMMIT");
+  } catch {
+    d.exec("ROLLBACK");
+    throw new Error(`Failed to set primary session: ${sessionName} for bot ${botId}`);
+  }
 }
 
 /**
  * Clean stale relay sessions (dead PIDs).
  * Returns the number of removed sessions.
+ * @param botId - Scope to this bot (null for all bots)
  */
-export function cleanStaleRelaySessions(): number {
+export function cleanStaleRelaySessions(botId?: number): number {
+  const whereClause = botId !== undefined ? `WHERE bot_id = ${botId}` : "";
   const sessions = getDb().prepare(`
-    SELECT session_name, pid FROM relay_sessions
-  `).all() as Array<{ session_name: string; pid: number }>;
+    SELECT session_name, pid FROM relay_sessions ${whereClause}
+  `).all() as Array<{ session_name: string; pid: number; bot_id: number }>;
 
   let removed = 0;
   for (const s of sessions) {
     try {
       process.kill(s.pid, 0);
     } catch {
-      getDb().prepare(`DELETE FROM relay_sessions WHERE session_name = ?`).run(s.session_name);
+      getDb().prepare(`DELETE FROM relay_sessions WHERE bot_id = ? AND session_name = ?`).run(s.bot_id, s.session_name);
       removed++;
     }
   }
@@ -568,20 +796,24 @@ export function cleanStaleRelaySessions(): number {
 
 /**
  * Update capabilities for a relay session.
+ * @param botId - Scope to this bot
+ * @param sessionName - The session to update
  */
-export function updateRelayCapabilities(sessionName: string, capabilities: string, description: string): void {
+export function updateRelayCapabilities(botId: number, sessionName: string, capabilities: string, description: string): void {
   getDb().prepare(`
-    UPDATE relay_sessions SET capabilities = ?, description = ? WHERE session_name = ?
-  `).run(capabilities, description, sessionName);
+    UPDATE relay_sessions SET capabilities = ?, description = ? WHERE bot_id = ? AND session_name = ?
+  `).run(capabilities, description, botId, sessionName);
 }
 
 /**
  * Update role for a relay session.
+ * @param botId - Scope to this bot
+ * @param sessionName - The session to update
  */
-export function updateRelayRole(sessionName: string, role: "active" | "passive"): void {
+export function updateRelayRole(botId: number, sessionName: string, role: "active" | "passive"): void {
   getDb().prepare(`
-    UPDATE relay_sessions SET role = ? WHERE session_name = ?
-  `).run(role, sessionName);
+    UPDATE relay_sessions SET role = ? WHERE bot_id = ? AND session_name = ?
+  `).run(role, botId, sessionName);
 }
 
 // ============================================================================
@@ -646,8 +878,10 @@ const MAX_DOWNLOAD_RETRIES = 3;
 /**
  * Enqueue a download URL.
  * Returns the row ID.
+ * @param botId - The bot that received the message containing this download
  */
 export function enqueueDownload(params: {
+  bot_id: number;
   chat_id: number;
   message_id: number;
   url: string;
@@ -656,10 +890,11 @@ export function enqueueDownload(params: {
 }): number {
   const d = getDb();
   const stmt = d.prepare(`
-    INSERT INTO download_queue (chat_id, message_id, url, source, session_name)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT INTO download_queue (bot_id, chat_id, message_id, url, source, session_name)
+    VALUES (?, ?, ?, ?, ?, ?)
   `);
   stmt.run(
+    params.bot_id,
     params.chat_id,
     params.message_id,
     params.url,
@@ -673,8 +908,9 @@ export function enqueueDownload(params: {
 /**
  * Add multiple download URLs at once (batch insert).
  * Returns the count of items inserted.
+ * @param botId - The bot that received the messages containing these downloads
  */
-export function enqueueDownloads(params: Array<{
+export function enqueueDownloads(botId: number, params: Array<{
   chat_id: number;
   message_id: number;
   url: string;
@@ -684,14 +920,14 @@ export function enqueueDownloads(params: Array<{
   if (params.length === 0) return 0;
   const d = getDb();
   const stmt = d.prepare(`
-    INSERT INTO download_queue (chat_id, message_id, url, source, session_name)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT INTO download_queue (bot_id, chat_id, message_id, url, source, session_name)
+    VALUES (?, ?, ?, ?, ?, ?)
   `);
   let count = 0;
   d.exec("BEGIN TRANSACTION");
   try {
     for (const p of params) {
-      stmt.run(p.chat_id, p.message_id, p.url, p.source || "twitter", p.session_name || "data-scrapper");
+      stmt.run(botId, p.chat_id, p.message_id, p.url, p.source || "twitter", p.session_name || "data-scrapper");
       count++;
     }
     d.exec("COMMIT");
@@ -704,12 +940,14 @@ export function enqueueDownloads(params: Array<{
 
 /**
  * Claim the next pending download for a session.
+ * @param botId - Scope to this bot's queue (null for any bot)
  */
-export function claimNextDownload(sessionName: string): DownloadItem | null {
+export function claimNextDownload(botId?: number): DownloadItem | null {
   const d = getDb();
+  const whereClause = botId !== undefined ? `WHERE bot_id = ${botId} AND` : "WHERE";
   const row = d.prepare(`
     SELECT * FROM download_queue
-    WHERE status = 'pending'
+    ${whereClause} status = 'pending'
     ORDER BY created_at ASC
     LIMIT 1
   `).get() as unknown as DownloadItem | undefined;
@@ -766,10 +1004,12 @@ export function failDownload(id: number, error: string): void {
 
 /**
  * Get download queue statistics.
+ * @param botId - Scope to this bot's queue (null for all bots)
  */
-export function getDownloadStats(): QueueStats {
+export function getDownloadStats(botId?: number): QueueStats {
+  const whereClause = botId !== undefined ? `WHERE bot_id = ${botId}` : "";
   const rows = getDb().prepare(`
-    SELECT status, COUNT(*) as count FROM download_queue GROUP BY status
+    SELECT status, COUNT(*) as count FROM download_queue ${whereClause} GROUP BY status
   `).all() as Array<{ status: string; count: number }>;
 
 
@@ -784,24 +1024,39 @@ export function getDownloadStats(): QueueStats {
 
 /**
  * Get download queue depth (pending + processing).
+ * @param botId - Scope to this bot's queue (null for all bots)
  */
-export function getDownloadDepth(): number {
+export function getDownloadDepth(botId?: number): number {
+  const whereClause = botId !== undefined ? `WHERE bot_id = ${botId} AND` : "WHERE";
   const row = getDb().prepare(`
-    SELECT COUNT(*) as count FROM download_queue WHERE status IN ('pending', 'processing')
+    SELECT COUNT(*) as count FROM download_queue ${whereClause} status IN ('pending', 'processing')
   `).get() as { count: number };
   return row.count;
 }
 
 /**
  * Recover stale "processing" downloads back to "pending".
+ * @param botId - Scope to this bot's queue (null for all bots)
  */
-export function recoverStaleDownloads(olderThanMs: number = 120000): number {
+export function recoverStaleDownloads(olderThanMs: number = 120000, botId?: number): number {
   const cutoff = Date.now() - olderThanMs;
-  const result = getDb().prepare(`
+  let sql = `
     UPDATE download_queue
     SET status = 'pending', started_at = NULL
     WHERE status = 'processing' AND (started_at IS NULL OR started_at < ?)
-  `).run(cutoff);
+  `;
+  const args: (number | undefined)[] = [cutoff];
+  
+  if (botId !== undefined) {
+    sql = `
+      UPDATE download_queue
+      SET status = 'pending', started_at = NULL
+      WHERE bot_id = ? AND status = 'processing' AND (started_at IS NULL OR started_at < ?)
+    `;
+    args.unshift(botId);
+  }
+
+  const result = getDb().prepare(sql).run(...args);
   return result.changes;
 }
 
@@ -818,22 +1073,37 @@ export function resetDownload(id: number): void {
 
 /**
  * Reset all failed downloads to pending.
+ * @param botId - Scope to this bot's queue (null for all bots)
  */
-export function resetAllFailedDownloads(): number {
-  const result = getDb().prepare(`
+export function resetAllFailedDownloads(botId?: number): number {
+  let sql = `
     UPDATE download_queue
     SET status = 'pending', retry_count = 0, error = NULL
     WHERE status = 'failed'
-  `).run();
+  `;
+  const args: number[] = [];
+  
+  if (botId !== undefined) {
+    sql = `
+      UPDATE download_queue
+      SET status = 'pending', retry_count = 0, error = NULL
+      WHERE bot_id = ? AND status = 'failed'
+    `;
+    args.push(botId);
+  }
+
+  const result = getDb().prepare(sql).run(...args);
   return result.changes;
 }
 
 /**
  * Get recent downloads (for status display).
+ * @param botId - Scope to this bot's queue (null for all bots)
  */
-export function getRecentDownloads(limit: number = 50): DownloadItem[] {
+export function getRecentDownloads(limit: number = 50, botId?: number): DownloadItem[] {
+  const whereClause = botId !== undefined ? `WHERE bot_id = ${botId}` : "";
   return getDb().prepare(`
-    SELECT * FROM download_queue ORDER BY created_at DESC LIMIT ?
+    SELECT * FROM download_queue ${whereClause} ORDER BY created_at DESC LIMIT ?
   `).all(limit) as unknown as DownloadItem[];
 }
 
@@ -843,19 +1113,20 @@ export { getDb };
 /**
  * Run all startup recovery tasks.
  * Returns a summary of what was recovered.
+ * @param botId - Optional bot to scope recovery to (null for all bots)
  */
-export function runStartupRecovery(): {
+export function runStartupRecovery(botId?: number): {
   recoveredMessages: number;
   cleanedSessions: number;
   recoveredDownloads: number;
   mergedFromLocal?: number;
 } {
-  const recoveredMessages = recoverStaleMessages();
-  const cleanedSessions = cleanStaleRelaySessions();
-  const recoveredDownloads = recoverStaleDownloads();
+  const recoveredMessages = recoverStaleMessages(60000, botId);
+  const cleanedSessions = cleanStaleRelaySessions(botId);
+  const recoveredDownloads = recoverStaleDownloads(120000, botId);
 
   // Also purge old completed/failed messages (keep last 1000)
-  purgeOldMessages(1000);
+  purgeOldMessages(1000, botId);
 
   // Merge session_name from local DB if it differs from shared DB.
   // This handles the case where the poll worker was writing to a local DB

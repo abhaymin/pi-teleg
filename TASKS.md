@@ -1,15 +1,15 @@
 # Multi-bot Polling Implementation Tasks
 
-## Status: In Progress
+## Status: Phase 1 Complete
 
-## Task 1: Phase 1 — Bot Context and Configuration
-- **Status:** Pending
-- **Agent:** worker
-- **Spec:** docs/PLAN_ACTION.md Phase 1
+## Task 1: Phase 1 — Bot Context and Configuration ✅
+- **Status:** DONE (commit e5b1a5de)
+- **Files:** src/config.ts (new), src/index.ts (modified)
+- **Summary:** Created BotContext type, resolveBotContext(), multi-bot config v2, legacy migration
 
 ## Task 2: Phase 2 — Database Schema v2
 - **Status:** Pending
-- **Depends on:** Task 1
+- **Depends on:** Task 1 ✅
 
 ## Task 3: Phase 3 — Per-bot Polling Manager
 - **Status:** Pending

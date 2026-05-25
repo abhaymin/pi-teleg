@@ -389,6 +389,16 @@ const SharedPollingManager = (() => {
   let isPolling = false;
   let lockRefreshInterval: ReturnType<typeof setInterval> | undefined;
   let messageHandler: ((turn: PendingTelegramTurn, update: TelegramUpdate) => void) | null = null;
+  // SharedPollingManager is called from MAIN extension IIFE before state is created.
+  // Use a mutable reference so it can be set once state exists.
+  let botContextRef: { botContext: { botId: number } | undefined } | null = null;
+  
+  function getBotId(): number {
+    return botContextRef?.botContext?.botId ?? 0;
+  }
+  function setBotContextRef(ref: { botContext: { botId: number } | undefined }): void {
+    botContextRef = ref;
+  }
   
   // ─── Session state pulled fresh from SQLite on every call ──────────────────
   // These functions read from DB instead of in-memory state so any session
@@ -802,6 +812,8 @@ const SharedPollingManager = (() => {
   // ─── Public API ──────────────────────────────────────────────────────
   
   return {
+    setBotContextRef,
+    getBotId,
     async init(): Promise<void> { config = await readConfig(); },
     
     async updateConfig(newConfig: TelegramConfig): Promise<void> {
@@ -865,7 +877,8 @@ const SharedPollingManager = (() => {
       // Source of truth is SQLite — any session can atomically claim any pending message.
       // The DB's claimNextMessage prevents race conditions across processes.
       const name = sName || "unknown";
-      const dbMsg = Db.claimNextMessage(sessionId, name);
+      const botId = getBotId();
+      const dbMsg = Db.claimNextMessage(botId, sessionId, name);
       if (dbMsg) {
         const turn: PendingTelegramTurn = {
           sessionId, sessionName: name,
@@ -891,7 +904,8 @@ const SharedPollingManager = (() => {
     },
 
     getQueueDepth(): number {
-      try { return Db.getQueueDepth(); } catch { return 0; }
+      const botId = getBotId();
+      try { return Db.getQueueDepth(botId); } catch { return 0; }
     },
 
     /**
@@ -899,7 +913,8 @@ const SharedPollingManager = (() => {
      * Does NOT claim unassigned messages — for sessions to actively monitor their own queue.
      */
     claimNextTurnForSession(sessionName: string): TurnQueueItem | null {
-      const dbMsg = Db.claimNextMessageForSession(sessionName);
+      const botId = getBotId();
+      const dbMsg = Db.claimNextMessageForSession(botId, sessionName);
       if (dbMsg) {
         const sessionId = `__session__:${sessionName}`;
         const turn: PendingTelegramTurn = {
@@ -932,7 +947,8 @@ const SharedPollingManager = (() => {
      * Get count of pending messages for this session (for status display).
      */
     getPendingCountForSession(sessionName: string): number {
-      try { return Db.getPendingCountForSession(sessionName); } catch { return 0; }
+      const botId = getBotId();
+      try { return Db.getPendingCountForSession(botId, sessionName); } catch { return 0; }
     },
 
     isUserAllowed(userId: number): boolean { return isAllowedUser(config, userId); },
@@ -1333,8 +1349,9 @@ stop - Abort current turn`,
       const pollState = SharedPollingManager.getState();
       const botInfo = SharedPollingManager.getBotInfo();
       const registry = await readSessionRegistry();
-      const queueStats = Db.getQueueStats();
-      const relaySessions = Db.getAliveRelaySessions();
+      const botId = SharedPollingManager.getBotId();
+      const queueStats = botId ? Db.getQueueStats(botId) : Db.getQueueStats();
+      const relaySessions = botId ? Db.getAliveRelaySessions(botId) : Db.getAliveRelaySessions();
       const relayStatus = await getRelayStatus();
       
       let pollingStatus: string;
@@ -1685,8 +1702,9 @@ stop - Abort current turn`,
     description: "Get the number of pending and processing messages in the queue",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params) {
+      const botId = SharedPollingManager.getBotId();
       const Db = await import("./db.js");
-      const depth = Db.getQueueDepth();
+      const depth = Db.getQueueDepth(botId);
       return { content: [{ type: "text", text: `Queue depth: ${depth}` }], details: { count: depth } };
     },
   });
@@ -1697,9 +1715,10 @@ stop - Abort current turn`,
     description: "Get full queue statistics for messages and downloads",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params) {
+      const botId = SharedPollingManager.getBotId();
       const Db = await import("./db.js");
-      const stats = Db.getQueueStats();
-      const dlStats = Db.getDownloadStats();
+      const stats = botId ? Db.getQueueStats(botId) : Db.getQueueStats();
+      const dlStats = botId ? Db.getDownloadStats(botId) : Db.getDownloadStats();
       const text = `Messages: ${stats.pending} pending · ${stats.processing} processing · ${stats.completed} completed · ${stats.failed} failed\nDownloads: ${dlStats.pending} pending · ${dlStats.processing} processing · ${dlStats.completed} completed · ${dlStats.failed} failed`;
       return { content: [{ type: "text", text }], details: { messages: stats, downloads: dlStats } };
     },
@@ -1915,6 +1934,9 @@ stop - Abort current turn`,
     try {
       state.botContext = await resolveBotContext(cwd);
       console.log(`[teleg:${sessionName}] Bot context resolved: @${state.botContext.botUsername} (id=${state.botContext.botId})`);
+      
+      // Wire bot context into SharedPollingManager so queue ops are scoped
+      SharedPollingManager.setBotContextRef(state);
       
       // Check for split DB warning
       const splitDbWarning = await detectSplitDb(state.botContext.botId, state.botContext.dbPath);
