@@ -32,6 +32,13 @@ export interface RelayInfo {
   secret: string;
   sessionName: string;
   pid: number;
+  botId?: number; // Added in Phase 4
+}
+
+export interface StartRelayOptions {
+  sessionName: string;
+  basePort?: number;
+  botId?: number; // Phase 4: link relay to a specific bot
 }
 
 // ─── Relay Server ─────────────────────────────────────────────────────────────
@@ -123,7 +130,11 @@ export function cleanRelayFilesByPid(pid: number): void {
   } catch {}
 }
 
-export function startRelayServer(sessionName: string, basePort = 9798): Promise<RelayInfo> {
+export function startRelayServer(
+  sessionName: string,
+  basePort = 9798,
+  botId?: number
+): Promise<RelayInfo> {
   return new Promise((resolve, reject) => {
     ensureRelayDir();
     
@@ -151,6 +162,7 @@ export function startRelayServer(sessionName: string, basePort = 9798): Promise<
           secret,
           sessionName,
           pid: process.pid,
+          botId, // Phase 4: link relay to a specific bot
         };
         
         currentRelayInfo = relayInfo;

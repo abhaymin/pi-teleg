@@ -81,6 +81,7 @@ interface SessionInfo {
   projectDir?: string;        // working directory of the session
   capabilities?: string[];    // declared capabilities from INFO_REL.md
   description?: string;       // session description
+  botId?: number;             // Phase 4: linked bot_id
 }
 
 interface CapabilitiesEntry {
@@ -99,8 +100,10 @@ interface CapabilitiesRegistry {
 }
 
 interface SessionRegistry {
+  version: number;              // Phase 4: v2 for multi-bot support
   sessions: SessionInfo[];
   primarySessionId?: string;
+  primaryByBot?: Record<string, string>; // Phase 4: primary per bot_id
 }
 
 interface TelegramApiResponse<T> {
@@ -221,9 +224,17 @@ async function writeConfig(cfg: TelegramConfig): Promise<void> {
 async function readSessionRegistry(): Promise<SessionRegistry> {
   try {
     const content = await readFile(SESSION_REGISTRY_FILE, "utf8");
-    return JSON.parse(content);
+    const data = JSON.parse(content) as Partial<SessionRegistry>;
+    // Phase 4: Support v2 format with version, primaryByBot
+    // Default values for v1 format files
+    return {
+      version: data.version ?? 1,
+      sessions: data.sessions ?? [],
+      primarySessionId: data.primarySessionId,
+      primaryByBot: data.primaryByBot ?? {},
+    };
   } catch {
-    return { sessions: [] };
+    return { version: 2, sessions: [], primaryByBot: {} }; // Phase 4: default to v2
   }
 }
 
@@ -1174,6 +1185,7 @@ export default function (pi: ExtensionAPI): void {
       connectedAt: Date.now(),
       lastActivity: Date.now(),
       isActive: true,
+      botId: state.botContext?.botId, // Phase 4: link session to bot
     };
     
     if (existing >= 0) {
@@ -1186,6 +1198,16 @@ export default function (pi: ExtensionAPI): void {
     
     if (registry.sessions.length === 1) {
       registry.primarySessionId = sessionId;
+    }
+    
+    // Phase 4: Primary election per bot_id
+    const botId = state.botContext?.botId;
+    if (botId) {
+      // If no primary exists for this bot, elect this session
+      if (!registry.primaryByBot) registry.primaryByBot = {};
+      if (!registry.primaryByBot[String(botId)]) {
+        registry.primaryByBot[String(botId)] = sessionId;
+      }
     }
     
     await writeSessionRegistry(registry);
@@ -1205,6 +1227,21 @@ export default function (pi: ExtensionAPI): void {
       registry.primarySessionId = registry.sessions[0].sessionId;
     }
     
+    // Phase 4: Clean up primaryByBot entry for this session's bot
+    const botId = state.botContext?.botId;
+    if (botId && registry.primaryByBot) {
+      const key = String(botId);
+      if (registry.primaryByBot[key] === sessionId) {
+        // Elect new primary from remaining sessions for this bot
+        const sameBotSessions = registry.sessions.filter(s => s.botId === botId);
+        if (sameBotSessions.length > 0) {
+          registry.primaryByBot[key] = sameBotSessions[0].sessionId;
+        } else {
+          delete registry.primaryByBot[key];
+        }
+      }
+    }
+    
     await writeSessionRegistry(registry);
   }
   
@@ -1214,6 +1251,12 @@ export default function (pi: ExtensionAPI): void {
     if (existing >= 0) {
       registry.sessions[existing].lastActivity = Date.now();
       await writeSessionRegistry(registry);
+    }
+    
+    // Phase 4: Also update DB heartbeat for SQLite-backed registry
+    const botId = state.botContext?.botId;
+    if (botId) {
+      Db.heartbeatRelaySession(botId, sessionName);
     }
   }
   
@@ -1985,7 +2028,22 @@ stop - Abort current turn`,
     );
 
     // Start the relay server for inter-session command forwarding
-    await startRelayServer(sessionName).catch(console.error);
+    // Phase 4: Pass botId so relay file is linked to a specific bot
+    const relayBotId = state.botContext?.botId;
+    await startRelayServer(sessionName, 9798, relayBotId).catch(console.error);
+    
+    // Phase 4: Register in SQLite relay_sessions table with bot_id
+    if (relayBotId) {
+      Db.registerRelaySession({
+        bot_id: relayBotId,
+        session_name: sessionName,
+        session_id: sessionId,
+        pid: process.pid,
+        port: 9798, // Will be updated when relay server resolves actual port
+        secret: "", // Will be updated when relay server resolves
+      });
+    }
+    
     setCommandHandler(async (text, meta) => {
       // Queue the forward for agent processing on next turn
       pendingForwards.push({
@@ -2100,6 +2158,12 @@ stop - Abort current turn`,
     
     await unregisterSessionCapabilities(sessionId);
     await unregisterSession();
+    
+    // Phase 4: Also unregister from SQLite relay_sessions table
+    const botId = state.botContext?.botId;
+    if (botId) {
+      Db.unregisterRelaySession(botId, sessionName);
+    }
     
     const registry = await readSessionRegistry();
     if (registry.sessions.length === 0) {
