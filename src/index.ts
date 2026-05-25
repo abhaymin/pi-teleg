@@ -52,6 +52,7 @@ const HEALTH_CHECK_INTERVAL_MS = 30000;
 const INITIAL_RECONNECT_DELAY_MS = 1000;
 const MAX_RECONNECT_DELAY_MS = 30000;
 const MAX_CONSECUTIVE_ERRORS = 5;
+const DRAIN_INTERVAL_MS = parseInt(process.env.TELEG_DRAIN_INTERVAL_MS || "12000", 10);
 const BASE_BACKOFF_MULTIPLIER = 2;
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -1119,6 +1120,7 @@ interface SessionState {
   config: TelegramConfig;
   activeTurn: ActiveTelegramTurn | undefined;
   typingInterval: ReturnType<typeof setInterval> | undefined;
+  drainTimer: ReturnType<typeof setInterval> | undefined; // Phase 6: idle queue drain
   setupInProgress: boolean;
 }
 
@@ -1129,6 +1131,7 @@ function createSessionState(sessionId: string): SessionState {
     config: {},
     activeTurn: undefined,
     typingInterval: undefined,
+    drainTimer: undefined, // Phase 6: idle queue drain
     setupInProgress: false,
   };
 }
@@ -2175,11 +2178,47 @@ stop - Abort current turn`,
         );
       }
     }, 30000);
-    
+
+    // Phase 6: Active idle drain timer — check queue periodically when idle
+    state.drainTimer = setInterval(async () => {
+      // Only drain if session is idle (no active agent turn)
+      if (state.activeTurn) return;
+
+      const botId = state.botContext?.botId;
+      if (!botId) return;
+
+      try {
+        // Priority 1: pendingForwards (relay commands) — already checked in drainOne
+        // but we check here for completeness
+
+        // Priority 2: Claim our own session's messages (session-strict)
+        const queued = SharedPollingManager.claimNextTurnForSession(sessionName);
+        if (queued) {
+          state.activeTurn = queued.turn as ActiveTelegramTurn;
+          pi.sendUserMessage(queued.turn.content, { deliverAs: "steer" });
+          return;
+        }
+
+        // Priority 3: Claim unassigned messages for the same bot (cross-session help)
+        const queueMsg = SharedPollingManager.claimNextTurn(sessionId, sessionName);
+        if (queueMsg) {
+          state.activeTurn = queueMsg.turn as ActiveTelegramTurn;
+          pi.sendUserMessage(queueMsg.turn.content, { deliverAs: "steer" });
+        }
+      } catch (err) {
+        console.error(`[teleg:${sessionName}] Drain error:`, err);
+      }
+    }, DRAIN_INTERVAL_MS);
+
     updateStatus(ctx);
   });
   
   pi.on("session_shutdown", async (_event, _ctx) => {
+    // Phase 6: Clear drain timer
+    if (state.drainTimer) {
+      clearInterval(state.drainTimer);
+      state.drainTimer = undefined;
+    }
     state.activeTurn = undefined;
     pendingForwards.length = 0;
     SharedPollingManager.completeTurn(sessionId);

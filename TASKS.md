@@ -1,6 +1,6 @@
 # Multi-bot Polling Implementation Tasks
 
-## Status: Phase 4 Complete
+## Status: Phase 5 Complete
 
 ## Task 1: Phase 1 — Bot Context and Configuration ✅
 - **Status:** DONE (commit e5b1a5de)
@@ -22,17 +22,18 @@
 - **Files:** src/relay.ts, src/index.ts
 - **Summary:** botId in relay JSON, SessionRegistry v2 with primaryByBot, DB sync
 
-## Task 5: Phase 5 — Liveness, Reconcile, Routing Guards
-- **Status:** Pending
-- **Depends on:** Task 3 ✅, Task 4 ✅
+## Task 5: Phase 5 — Liveness, Reconcile, Routing Guards ✅
+- **Status:** DONE (commit 93555d8d)
+- **Files:** src/session-registry.ts (new), src/index.ts (modified)
+- **Summary:** Created session-registry.ts with liveness checks (6 checks), ghost eviction, primary election, reconcile
 
 ## Task 6: Phase 6 — Active Idle Drain
 - **Status:** Pending
-- **Depends on:** Task 5
+- **Depends on:** Task 5 ✅
 
 ## Task 7: Phase 7 — Extension Commands, MCP Tools
 - **Status:** Pending
-- **Depends on:** Task 5, Task 6
+- **Depends on:** Task 5 ✅, Task 6
 
 ## Task 8: Phase R — Refactor (parallel-safe)
 - **Status:** Pending
