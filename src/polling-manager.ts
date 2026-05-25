@@ -13,6 +13,7 @@ import { join, dirname } from "node:path";
 import { existsSync, mkdirSync, readFileSync, writeFile, readFile } from "node:fs";
 import { homedir } from "node:os";
 import { mkdir, readFile as readFileAsync, writeFile as writeFileAsync } from "node:fs/promises";
+import * as Db from "./db.js";
 
 // ============================================================================
 // Types
@@ -261,9 +262,118 @@ class PollingManager {
   }
 
   getQueueDepth(): number {
-    // This will be called from index.ts, which has access to Db
-    // Import lazily to avoid circular deps
-    return 0; // Placeholder — actual value comes from Db.getQueueDepth(botId)
+    return Db.getQueueDepth(this.botId);
+  }
+
+  // ─── Active turn management ──────────────────────────────────────────
+
+  hasActiveTurnInDb(sessionId: string): boolean {
+    try {
+      const row = Db.getDb().prepare(
+        "SELECT 1 FROM message_queue WHERE session_id = ? AND status = 'processing' LIMIT 1"
+      ).get(sessionId);
+      return !!row;
+    } catch { return false; }
+  }
+
+  hasActiveTurnFor(sessionId: string): boolean {
+    if (this.hasActiveTurnInDb(sessionId)) return true;
+    return this._activeTurns.has(sessionId);
+  }
+
+  private _activeTurns: Map<string, PendingTelegramTurn> = new Map();
+
+  completeTurn(sessionId: string, dbId?: number): void {
+    this._activeTurns.delete(sessionId);
+    try {
+      if (typeof dbId === 'number') {
+        Db.getDb().prepare(
+          "UPDATE message_queue SET status = 'completed', completed_at = ? WHERE id = ? AND status = 'processing'"
+        ).run(Date.now(), dbId);
+      } else {
+        Db.getDb().prepare(
+          "UPDATE message_queue SET status = 'pending', session_id = 'unassigned', session_name = 'unknown', started_at = NULL WHERE session_id = ? AND status = 'processing'"
+        ).run(sessionId);
+      }
+    } catch (err) {
+      console.error("[polling-manager] completeTurn error:", err);
+    }
+  }
+
+  getProcessingMessageIds(sessionId: string): number[] {
+    try {
+      const rows = Db.getDb().prepare(
+        "SELECT id FROM message_queue WHERE session_id = ? AND status = 'processing'"
+      ).all(sessionId) as Array<{ id: number }>;
+      return rows.map(r => r.id);
+    } catch { return []; }
+  }
+
+  getSessionProcessingChat(chatId: number): string | null {
+    try {
+      const row = Db.getDb().prepare(
+        "SELECT session_id FROM message_queue WHERE bot_id = ? AND chat_id = ? AND status = 'processing' ORDER BY started_at DESC LIMIT 1"
+      ).get(this.botId, chatId) as { session_id: string } | undefined;
+      return row?.session_id ?? null;
+    } catch { return null; }
+  }
+
+  claimNextTurn(sessionId: string, sName?: string): TurnQueueItem | null {
+    const name = sName || "unknown";
+    const dbMsg = Db.claimNextMessage(this.botId, sessionId, name);
+    if (dbMsg) {
+      const turn: PendingTelegramTurn = {
+        sessionId, sessionName: name,
+        chatId: dbMsg.chat_id, replyToMessageId: dbMsg.message_id,
+        queuedAttachments: [],
+        content: [{ type: "text" as const, text: `[telegram] ${dbMsg.text}` }],
+        historyText: dbMsg.text,
+        dbId: dbMsg.id,
+      };
+      this._activeTurns.set(sessionId, turn);
+      const update: TelegramUpdate = {
+        update_id: dbMsg.id,
+        message: {
+          message_id: dbMsg.message_id,
+          from: { id: dbMsg.from_user_id, is_bot: false, first_name: dbMsg.from_username || "User" },
+          chat: { id: dbMsg.chat_id, type: "private" },
+          text: dbMsg.text,
+        },
+      };
+      return { turn, update, dbId: dbMsg.id };
+    }
+    return null;
+  }
+
+  claimNextTurnForSession(sessionName: string): TurnQueueItem | null {
+    const dbMsg = Db.claimNextMessageForSession(this.botId, sessionName);
+    if (dbMsg) {
+      const sessionId = `__session__:${sessionName}`;
+      const turn: PendingTelegramTurn = {
+        sessionId, sessionName,
+        chatId: dbMsg.chat_id, replyToMessageId: dbMsg.message_id,
+        queuedAttachments: [],
+        content: [{ type: "text" as const, text: `[telegram] ${dbMsg.text}` }],
+        historyText: dbMsg.text,
+        dbId: dbMsg.id,
+      };
+      this._activeTurns.set(sessionId, turn);
+      const update: TelegramUpdate = {
+        update_id: dbMsg.id,
+        message: {
+          message_id: dbMsg.message_id,
+          from: { id: dbMsg.from_user_id, is_bot: false, first_name: dbMsg.from_username || "User" },
+          chat: { id: dbMsg.chat_id, type: "private" },
+          text: dbMsg.text,
+        },
+      };
+      return { turn, update, dbId: dbMsg.id };
+    }
+    return null;
+  }
+
+  getPendingCountForSession(sessionName: string): number {
+    return Db.getPendingCountForSession(this.botId, sessionName);
   }
 
   // ─── Handlers ─────────────────────────────────────────────────────────
@@ -381,4 +491,21 @@ interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
   edited_message?: TelegramMessage;
+}
+
+interface TurnQueueItem {
+  turn: PendingTelegramTurn;
+  update: TelegramUpdate;
+  dbId: number;
+}
+
+interface PendingTelegramTurn {
+  sessionId: string;
+  sessionName: string;
+  chatId: number;
+  replyToMessageId: number;
+  queuedAttachments: { path: string; fileName: string }[];
+  content: Array<{ type: "text" | string; text: string }>;
+  historyText: string;
+  dbId?: number;
 }
