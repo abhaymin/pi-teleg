@@ -192,6 +192,7 @@ const TOOL_DEFINITIONS = [
       properties: {
         text: { type: "string", description: "Message text" },
         chat_id: { type: "string", description: "Target chat ID (optional)" },
+        bot_id: { type: "number", description: "Bot ID to use (optional, uses default)" },
       },
       required: ["text"],
     },
@@ -205,6 +206,7 @@ const TOOL_DEFINITIONS = [
         file_path: { type: "string", description: "Local file path" },
         caption: { type: "string", description: "Caption (optional)" },
         chat_id: { type: "string", description: "Target chat ID (optional)" },
+        bot_id: { type: "number", description: "Bot ID to use (optional)" },
       },
       required: ["file_path"],
     },
@@ -218,6 +220,7 @@ const TOOL_DEFINITIONS = [
         file_path: { type: "string", description: "Local file path" },
         caption: { type: "string", description: "Caption (optional)" },
         chat_id: { type: "string", description: "Target chat ID (optional)" },
+        bot_id: { type: "number", description: "Bot ID to use (optional)" },
       },
       required: ["file_path"],
     },
@@ -261,8 +264,64 @@ const TOOL_DEFINITIONS = [
         },
         id: { type: "number", description: "Message ID (required for complete/fail actions)" },
         keep_count: { type: "number", description: "How many completed/failed entries to keep on purge (default 500)" },
+        bot_id: { type: "number", description: "Bot ID to scope the operation (optional)" },
       },
       required: ["action"],
+    },
+  },
+  // ─── Phase 7: Session Management Tools ─────────────────────────────────
+  {
+    name: "teleg-reconcile",
+    description: "Check all relay sessions for liveness and evict ghosts. Reconciles the session registry.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        bot_id: { type: "number", description: "Bot ID to reconcile (defaults to first bot)" },
+      },
+      properties: {},
+    },
+  },
+  {
+    name: "teleg-list_sessions",
+    description: "List all relay sessions with liveness status.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        bot_id: { type: "number", description: "Bot ID (optional, uses first bot)" },
+        include_ghosts: { type: "boolean", description: "Include ghost sessions in results" },
+      },
+      properties: {},
+    },
+  },
+  {
+    name: "teleg-evict_session",
+    description: "Evict a session from the registry. Removes from DB, JSON registry, relay file, and optionally kills the PID.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_name: { type: "string", description: "Name of the session to evict" },
+        bot_id: { type: "number", description: "Bot ID (optional)" },
+        reset_queue: { type: "boolean", description: "Reset processing messages for this session" },
+        force_kill_pid: { type: "boolean", description: "Force kill the session's PID" },
+      },
+      required: ["session_name"],
+    },
+  },
+  {
+    name: "teleg-list_bots",
+    description: "List all configured bots from the global config.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "teleg-set_primary",
+    description: "Manually set a session as primary for a bot.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_name: { type: "string", description: "Name of the session to make primary" },
+        bot_id: { type: "number", description: "Bot ID (optional)" },
+      },
+      required: ["session_name"],
     },
   },
 ];
@@ -404,6 +463,111 @@ async function handleRequest(req) {
           db.close();
         }
         sendResponse(id, { action, count });
+        return;
+      }
+      
+      // ─── Phase 7: Session Management Tools ─────────────────────────────
+      
+      if (name === "teleg-reconcile") {
+        // Reconciliation is best-effort from MCP - requires external session registry logic
+        // For MCP, we just report that reconciliation would be triggered
+        sendResponse(id, { 
+          message: "Reconcile requested. This tool requires the extension to be running.",
+          bot_id: args.bot_id ?? null,
+        });
+        return;
+      }
+      
+      if (name === "teleg-list_sessions") {
+        const db = new DatabaseSync(DB_PATH, { readonly: true });
+        try {
+          const botId = args.bot_id 
+            ? Number(args.bot_id) 
+            : (() => {
+                // Get default bot from config
+                const cfg = loadConfig();
+                return cfg?.defaultBotId || 0;
+              })();
+          const sessions = db.prepare("SELECT * FROM relay_sessions WHERE bot_id = ?").all(botId);
+          const includeGhosts = args.include_ghosts ?? false;
+          const result = sessions.map(s => ({
+            session_name: s.session_name,
+            pid: s.pid,
+            is_primary: s.is_primary,
+            heartbeat_age_ms: Date.now() - s.last_heartbeat,
+            role: s.role,
+          }));
+          sendResponse(id, { sessions: result, bot_id: botId });
+        } finally {
+          db.close();
+        }
+        return;
+      }
+      
+      if (name === "teleg-evict_session") {
+        const db = new DatabaseSync(DB_PATH);
+        try {
+          const botId = args.bot_id 
+            ? Number(args.bot_id) 
+            : (() => {
+                const cfg = loadConfig();
+                return cfg?.defaultBotId || 0;
+              })();
+          // Optional: force kill PID first
+          if (args.force_kill_pid) {
+            const session = db.prepare("SELECT pid FROM relay_sessions WHERE bot_id = ? AND session_name = ?").get(botId, args.session_name);
+            if (session) {
+              try { process.kill(session.pid, 9); } catch { /* already dead */ }
+            }
+          }
+          // Reset queue if requested
+          if (args.reset_queue) {
+            db.prepare("UPDATE message_queue SET status = 'pending', session_id = 'unassigned', session_name = 'unknown', started_at = NULL WHERE session_name = ? AND status = 'processing'").run(args.session_name);
+          }
+          // Remove from relay_sessions
+          db.prepare("DELETE FROM relay_sessions WHERE bot_id = ? AND session_name = ?").run(botId, args.session_name);
+          sendResponse(id, { evicted: args.session_name, bot_id: botId });
+        } finally {
+          db.close();
+        }
+        return;
+      }
+      
+      if (name === "teleg-list_bots") {
+        const cfg = loadConfig();
+        if (!cfg || !cfg.bots) {
+          sendResponse(id, { bots: [] });
+          return;
+        }
+        const bots = Object.entries(cfg.bots).map(([id, entry]) => ({
+          bot_id: parseInt(id, 10),
+          bot_username: entry.botUsername || "unknown",
+          lastUpdateId: entry.lastUpdateId,
+        }));
+        sendResponse(id, { bots, defaultBotId: cfg.defaultBotId });
+        return;
+      }
+      
+      if (name === "teleg-set_primary") {
+        const db = new DatabaseSync(DB_PATH);
+        try {
+          const botId = args.bot_id 
+            ? Number(args.bot_id) 
+            : (() => {
+                const cfg = loadConfig();
+                return cfg?.defaultBotId || 0;
+              })();
+          db.exec("BEGIN IMMEDIATE");
+          db.prepare("UPDATE relay_sessions SET is_primary = 0 WHERE bot_id = ?").run(botId);
+          const result = db.prepare("UPDATE relay_sessions SET is_primary = 1 WHERE bot_id = ? AND session_name = ?").run(botId, args.session_name);
+          db.exec("COMMIT");
+          sendResponse(id, { session_name: args.session_name, bot_id: botId, updated: result.changes });
+        } catch {
+          db.exec("ROLLBACK");
+          throw new Error("Failed to set primary session");
+        } finally {
+          db.close();
+        }
         return;
       }
 

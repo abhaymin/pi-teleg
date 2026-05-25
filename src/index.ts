@@ -30,7 +30,7 @@ import {
 } from "./relay.js";
 import * as Db from "./db.js";
 import { resolveBotContext, detectSplitDb, type BotContext } from "./config.js";
-import { reconcileSessions, electPrimary, checkSessionLiveness, getSessionLivenessSummary, type SessionLiveness } from "./session-registry.js";
+import { reconcileSessions, electPrimary, checkSessionLiveness, getSessionLivenessSummary, evictSession, type SessionLiveness } from "./session-registry.js";
 
 // ============================================================================
 // Constants
@@ -1426,11 +1426,10 @@ stop - Abort current turn`,
     if (lower === "/status") {
       const pollState = SharedPollingManager.getState();
       const botInfo = SharedPollingManager.getBotInfo();
-      const registry = await readSessionRegistry();
       const botId = SharedPollingManager.getBotId();
-      const queueStats = botId ? Db.getQueueStats(botId) : Db.getQueueStats();
-      const relaySessions = botId ? Db.getAliveRelaySessions(botId) : Db.getAliveRelaySessions();
-      const relayStatus = await getRelayStatus();
+      const registry = await readSessionRegistry();
+      const { listConfiguredBots } = await import("./config.js");
+      const allBots = await listConfiguredBots();
       
       let pollingStatus: string;
       if (SharedPollingManager.isActive()) {
@@ -1441,17 +1440,51 @@ stop - Abort current turn`,
         pollingStatus = "⏹ stopped";
       }
       
+      // Get polling lock holder info if available
+      let pollerInfo = "";
+      const primary = botId ? Db.getPrimarySession(botId) : null;
+      if (primary) {
+        pollerInfo = ` (primary: ${primary.session_name}, pid:${primary.pid})`;
+      }
+      
       const lines: string[] = [
         `<b>═══ Teleg Bridge Status ═══</b>`,
         ``,
-        `🤖 <b>Bot:</b> ${botInfo.username ? `@${botInfo.username}` : "not configured"}`,
-        `📡 <b>Polling:</b> ${pollingStatus}`,
+        `🤖 <b>Bot:</b> ${botInfo.username ? `@${botInfo.username}` : "not configured"}${botId ? ` [id:${botId}]` : ""}`,
+        `📡 <b>Polling:</b> ${pollingStatus}${pollerInfo}`,
         `💚 <b>Health:</b> ${pollState.isHealthy ? "OK" : `DEGRADED (${pollState.consecutiveErrors} errs)`}`,
-        ``,
-        `<b>📊 Queue:</b> ${queueStats.pending} pending · ${queueStats.processing} active · ${queueStats.completed} done · ${queueStats.failed} failed`,
-        ``,
-        `<b>🖥 Sessions (${registry.sessions.length}):</b>`,
       ];
+      
+      // Per-bot information
+      if (allBots.length > 0) {
+        lines.push(``);
+        lines.push(`<b>🤖 Bots (${allBots.length}):</b>`);
+        for (const b of allBots) {
+          const isDefault = b.botId === botId;
+          const qStats = Db.getQueueStats(b.botId);
+          const primary = Db.getPrimarySession(b.botId);
+          const primaryName = primary ? primary.session_name : "none";
+          lines.push(`  ${isDefault ? "◆" : "◇"} Bot ${b.botId}: @${b.botUsername} | primary: ${primaryName} | queue: ${qStats.pending}↓ ${qStats.processing}⚡`);
+        }
+      }
+      
+      // Queue stats scoped to current bot
+      if (botId) {
+        const queueStats = Db.getQueueStats(botId);
+        lines.push(``);
+        lines.push(`<b>📊 Queue (bot ${botId}):</b> ${queueStats.pending} pending · ${queueStats.processing} active · ${queueStats.completed} done · ${queueStats.failed} failed`);
+      }
+      
+      // Session info with liveness
+      if (botId) {
+        const summary = await getSessionLivenessSummary(botId);
+        const relaySessions = Db.getAliveRelaySessions(botId);
+        lines.push(``);
+        lines.push(`<b>🖥 Sessions (${relaySessions.length}):</b>`);
+        lines.push(`  Linked: ${summary.linked.length > 0 ? summary.linked.join(", ") : "none"}`);
+        lines.push(`  Stale: ${summary.stale.length > 0 ? summary.stale.join(", ") : "none"}`);
+        lines.push(`  Ghost: ${summary.ghost.length > 0 ? summary.ghost.join(", ") : "none"}`);
+      }
       
       // Detailed session info from SQLite relay + registry
       for (const s of registry.sessions) {
@@ -1460,29 +1493,23 @@ stop - Abort current turn`,
         const role = s.sessionId === sessionId
           ? (SharedPollingManager.isActive() ? "active" : "passive")
           : "relay";
-        const relayInfo = relaySessions.find(r => r.session_name === s.sessionName);
-        const relayAlive = relayStatus[s.sessionName]?.alive ?? false;
+        const relayInfo = botId ? Db.getRelaySession(botId, s.sessionName) : null;
+        const relayAlive = relayInfo !== null;
+        const isPrimary = relayInfo?.is_primary ?? false;
         const capabilities = relayInfo?.capabilities ? JSON.parse(relayInfo.capabilities).join(", ") : "—";
         const capReg = await readCapabilitiesRegistry();
         const capEntry = capReg.entries.find(e => e.sessionName === s.sessionName);
         const caps = capEntry?.capabilities?.join(", ") || capabilities || "—";
         
-        // Get per-session queue stats from DB
-        const sessPending = Db.getDb().prepare(
-          "SELECT COUNT(*) as c FROM message_queue WHERE session_name = ? AND status IN ('pending','processing')"
-        ).get(s.sessionName) as { c: number };
-        const sessDone = Db.getDb().prepare(
-          "SELECT COUNT(*) as c FROM message_queue WHERE session_name = ? AND status = 'completed'"
-        ).get(s.sessionName) as { c: number };
-        
         const statusIcon = hasActiveTurn ? "●" : (relayAlive ? "○" : "✗");
         const selfTag = isSelf ? " ← you" : "";
+        const primaryTag = isPrimary ? " 👑" : "";
         const activeTag = hasActiveTurn ? " ⚡ busy" : "";
-        const relayTag = !relayAlive && !isSelf ? " 🔴 offline" : "";
         
-        lines.push(`  ${statusIcon} <b>${s.sessionName}</b> [${role}]${activeTag}${relayTag}${selfTag}`);
-        lines.push(`    caps: ${caps}`);
-        lines.push(`    queue: ${sessPending.c} pending · ${sessDone.c} done · pid:${s.pid}`);
+        lines.push(``);
+        lines.push(`  ${statusIcon} <b>${s.sessionName}</b>${primaryTag}${activeTag}${selfTag}`);
+        lines.push(`    role: ${role} | caps: ${caps}`);
+        lines.push(`    pid: ${s.pid}`);
       }
       
       await SharedPollingManager.sendReply(String(message.chat.id), message.message_id, lines.join("\n"));
@@ -1584,6 +1611,87 @@ stop - Abort current turn`,
         },
       });
       await SharedPollingManager.sendReply(String(message.chat.id), message.message_id, "Compaction started.");
+      return;
+    }
+    
+    // ─── Phase 7 Commands ───────────────────────────────────────────────
+    
+    if (lower === "/teleg-reconcile") {
+      const botId = SharedPollingManager.getBotId();
+      const report = await reconcileSessions(botId || undefined);
+      const lines = [
+        `<b>📊 Reconcile Report</b>`,
+        ``,
+        `Checked: ${report.checkedSessions} sessions`,
+        `Evicted: ${report.evictedSessions.length > 0 ? report.evictedSessions.join(", ") : "none"}`,
+        `New primary: ${report.newPrimary ?? "unchanged"}`,
+      ];
+      if (report.errors.length > 0) {
+        lines.push(`⚠️ Errors: ${report.errors.join("; ")}`);
+      }
+      await SharedPollingManager.sendReply(String(message.chat.id), message.message_id, lines.join("\n"));
+      return;
+    }
+    
+    if (lower.startsWith("/teleg-sessions")) {
+      const botId = SharedPollingManager.getBotId();
+      if (!botId) {
+        await SharedPollingManager.sendReply(String(message.chat.id), message.message_id, "❌ No bot ID");
+        return;
+      }
+      const summary = await getSessionLivenessSummary(botId);
+      const relaySessions = Db.getAliveRelaySessions(botId);
+      const lines = [
+        `<b>🖥 Sessions (${relaySessions.length})</b>`,
+        ``,
+        `<b>Linked (${summary.linked.length}):</b>`,
+        ...(summary.linked.length ? summary.linked.map(n => `  ✅ ${n}`) : ["  (none)"]),
+        ``,
+        `<b>Stale (${summary.stale.length}):</b>`,
+        ...(summary.stale.length ? summary.stale.map(n => `  ⚠️ ${n}`) : ["  (none)"]),
+        ``,
+        `<b>Ghost (${summary.ghost.length}):</b>`,
+        ...(summary.ghost.length ? summary.ghost.map(n => `  ❌ ${n}`) : ["  (none)"]),
+      ];
+      await SharedPollingManager.sendReply(String(message.chat.id), message.message_id, lines.join("\n"));
+      return;
+    }
+    
+    if (lower.startsWith("/teleg-set-primary")) {
+      const parts = cleanText.trim().split(/\s+/);
+      const targetName = parts[1];
+      if (!targetName) {
+        await SharedPollingManager.sendReply(String(message.chat.id), message.message_id, "Usage: /teleg-set-primary &lt;session_name&gt;");
+        return;
+      }
+      const botId = SharedPollingManager.getBotId();
+      if (!botId) {
+        await SharedPollingManager.sendReply(String(message.chat.id), message.message_id, "❌ No bot ID");
+        return;
+      }
+      const session = Db.getRelaySession(botId, targetName);
+      if (!session) {
+        await SharedPollingManager.sendReply(String(message.chat.id), message.message_id, `❌ Session "${targetName}" not found`);
+        return;
+      }
+      Db.setPrimary(botId, targetName);
+      await SharedPollingManager.sendReply(String(message.chat.id), message.message_id, `✅ Primary set to: ${targetName}`);
+      return;
+    }
+    
+    if (lower === "/teleg-bots") {
+      const { listConfiguredBots } = await import("./config.js");
+      const bots = await listConfiguredBots();
+      if (bots.length === 0) {
+        await SharedPollingManager.sendReply(String(message.chat.id), message.message_id, "❌ No bots configured");
+        return;
+      }
+      const lines = [
+        `<b>🤖 Configured Bots (${bots.length})</b>`,
+        ``,
+        ...bots.map(b => `  ${b.botId} · @${b.botUsername} · lastUpdateId=${b.lastUpdateId}`),
+      ];
+      await SharedPollingManager.sendReply(String(message.chat.id), message.message_id, lines.join("\n"));
       return;
     }
     
@@ -1965,6 +2073,143 @@ stop - Abort current turn`,
         }
       }
       return { content: [{ type: "text", text: `Done (action=${params.action}, count=${count})` }], details: { count, id } };
+    },
+  });
+
+  // ========================================================================
+  // Session Management Tools (Phase 7)
+  // ========================================================================
+
+  pi.registerTool({
+    name: "teleg-reconcile",
+    label: "Reconcile Sessions",
+    description: "Check all relay sessions for liveness and evict ghosts. Reconciles the session registry for a bot (or all bots if no bot specified).",
+    parameters: Type.Object({
+      bot_id: Type.Optional(Type.Number({ description: "Bot ID to reconcile (defaults to current bot)" })),
+    }),
+    async execute(_toolCallId, params) {
+      const botId = params.bot_id ?? SharedPollingManager.getBotId();
+      const report = await reconcileSessions(botId || undefined);
+      const lines = [
+        `📊 Reconcile Report${botId ? ` (bot ${botId})` : ""}`,
+        ``,
+        `Checked: ${report.checkedSessions} sessions`,
+        `Evicted: ${report.evictedSessions.length > 0 ? report.evictedSessions.join(", ") : "none"}`,
+        `New primary: ${report.newPrimary ?? "unchanged"}`,
+      ];
+      if (report.errors.length > 0) {
+        lines.push(`Errors: ${report.errors.join("; ")}`);
+      }
+      return { content: [{ type: "text", text: lines.join("\n") }], details: report };
+    },
+  });
+
+  pi.registerTool({
+    name: "teleg-list_sessions",
+    label: "List Sessions",
+    description: "List all relay sessions for a bot with liveness status.",
+    parameters: Type.Object({
+      bot_id: Type.Optional(Type.Number({ description: "Bot ID (defaults to current bot)" })),
+      include_ghosts: Type.Optional(Type.Boolean({ description: "Include ghost sessions in results" })),
+    }),
+    async execute(_toolCallId, params) {
+      const botId = params.bot_id ?? SharedPollingManager.getBotId();
+      if (!botId) {
+        throw new Error("No bot ID available");
+      }
+      const summary = await getSessionLivenessSummary(botId);
+      const db = Db.getDb();
+      const allSessions = db.prepare("SELECT * FROM relay_sessions WHERE bot_id = ?").all(botId) as unknown as Db.RelaySession[];
+      
+      const result: Record<string, unknown>[] = [];
+      for (const s of allSessions) {
+        const liveness = summary.ghost.includes(s.session_name) ? "ghost"
+          : summary.stale.includes(s.session_name) ? "stale"
+          : summary.linked.includes(s.session_name) ? "linked"
+          : "unknown";
+        if (liveness === "ghost" && !params.include_ghosts) continue;
+        result.push({
+          session_name: s.session_name,
+          pid: s.pid,
+          is_primary: s.is_primary,
+          liveness,
+          heartbeat_age_ms: Date.now() - s.last_heartbeat,
+          role: s.role,
+        });
+      }
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], details: { sessions: result } };
+    },
+  });
+
+  pi.registerTool({
+    name: "teleg-evict_session",
+    label: "Evict Session",
+    description: "Evict a session from the registry. Removes from DB, JSON registry, relay file, and optionally kills the PID.",
+    parameters: Type.Object({
+      session_name: Type.String({ description: "Name of the session to evict" }),
+      bot_id: Type.Optional(Type.Number({ description: "Bot ID (defaults to current bot)" })),
+      reset_queue: Type.Optional(Type.Boolean({ description: "Reset processing messages for this session" })),
+      force_kill_pid: Type.Optional(Type.Boolean({ description: "Force kill the session's PID" })),
+    }),
+    async execute(_toolCallId, params) {
+      const botId = params.bot_id ?? SharedPollingManager.getBotId();
+      if (!botId) {
+        throw new Error("No bot ID available");
+      }
+      
+      // Optional: force kill PID first
+      if (params.force_kill_pid) {
+        const session = Db.getRelaySession(botId, params.session_name);
+        if (session) {
+          try {
+            process.kill(session.pid, 9);
+          } catch {
+            // PID already dead, that's fine
+          }
+        }
+      }
+      
+      // Evict the session
+      evictSession(botId, params.session_name);
+      
+      return { 
+        content: [{ type: "text", text: `Evicted session: ${params.session_name}` }], 
+        details: { session_name: params.session_name, bot_id: botId } 
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "teleg-list_bots",
+    label: "List Bots",
+    description: "List all configured bots from the global config.",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params) {
+      const { listConfiguredBots } = await import("./config.js");
+      const bots = await listConfiguredBots();
+      if (bots.length === 0) {
+        return { content: [{ type: "text", text: "No bots configured" }], details: { bots: [] } };
+      }
+      const lines = bots.map(b => `- Bot ${b.botId} (@${b.botUsername}) lastUpdateId=${b.lastUpdateId}`);
+      return { content: [{ type: "text", text: lines.join("\n") }], details: { bots } };
+    },
+  });
+
+  pi.registerTool({
+    name: "teleg-set_primary",
+    label: "Set Primary Session",
+    description: "Manually set a session as primary for a bot.",
+    parameters: Type.Object({
+      session_name: Type.String({ description: "Name of the session to make primary" }),
+      bot_id: Type.Optional(Type.Number({ description: "Bot ID (defaults to current bot)" })),
+    }),
+    async execute(_toolCallId, params) {
+      const botId = params.bot_id ?? SharedPollingManager.getBotId();
+      if (!botId) {
+        throw new Error("No bot ID available");
+      }
+      Db.setPrimary(botId, params.session_name);
+      return { content: [{ type: "text", text: `Set primary to: ${params.session_name}` }], details: { session_name: params.session_name, bot_id: botId } };
     },
   });
 

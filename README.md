@@ -1,9 +1,10 @@
 # pi-teleg
 
-**Telegram Bridge Extension for Pi** — Multi-session Telegram bridge with smart capability-based routing.
+**Telegram Bridge Extension for Pi** — Multi-session, multi-bot Telegram bridge with smart capability-based routing.
 
 ## Features
 
+- **Multi-Bot Support**: Run multiple Telegram bots on one machine, each with isolated queues
 - **Telegram Bot Integration**: Poll Telegram, receive messages, forward to Pi agent
 - **Multi-Session**: Multiple Pi sessions can share one bot via the relay system
 - **Smart Routing**: Messages are automatically routed to the session best equipped to handle them based on declared capabilities
@@ -16,6 +17,7 @@
 - **Auto-reconnect**: Exponential backoff on connection failures
 - **Health Monitoring**: Periodic health checks
 - **Status Display**: Visual status with queue depth in Pi's UI
+- **Ghost Eviction**: Automatic detection and removal of dead sessions
 
 ## How Smart Routing Works
 
@@ -29,6 +31,105 @@
    - If matched session is dead → primary handles it
    - No match → primary handles it
 3. The registry is ephemeral — maintained by the primary session, cleaned on disconnect/crash
+
+## Deployment Scenarios
+
+### Scenario A: Same Host, Multiple Pi Sessions (Default)
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Host machine                                       │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  │
+│  │ Pi Session  │  │ Pi Session  │  │ Pi Session  │  │
+│  │    (A)      │  │    (B)     │  │    (C)     │  │
+│  │  Bot 123456 │  │  Bot 123456 │  │  Bot 789012 │  │
+│  │   (same)    │  │   (same)   │  │  (diff)    │  │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  │
+│         │               │               │          │
+│         └───────────────┴───────────────┘          │
+│                         │                          │
+│                    Shared DB                        │
+│              ~/.pi/agent/teleg-bridge.db           │
+└─────────────────────────────────────────────────────┘
+```
+
+**Configuration:**
+- All sessions share the same `TELEG_DB_PATH` (default)
+- Sessions with same `botId` share one polling lock
+- Sessions with different `botId` have independent polling
+
+### Scenario D: Mixed Shared/Isolated Deployments
+
+```
+┌─────────────────────┐  ┌─────────────────────┐
+│  Host 1             │  │  Host 2             │
+│  Bot 123456 (prod)  │  │  Bot 789012 (dev)   │
+│  Shared DB          │  │  Shared DB          │
+│  Multiple sessions   │  │  Multiple sessions   │
+└─────────────────────┘  └─────────────────────┘
+```
+
+**Configuration:**
+- Set `TELEG_BOT_TOKEN` or `TELEG_BOT_ID` for each host
+- Set `TELEG_DB_PATH` for isolation if needed
+
+## Environment Variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `TELEG_BOT_TOKEN` | — | Force token for process (overrides config) |
+| `TELEG_BOT_ID` | — | Select bot from global config |
+| `TELEG_DB_PATH` | `~/.pi/agent/teleg-bridge.db` | Shared SQLite DB |
+| `TELEG_LIVENESS_MS` | `300000` | Max heartbeat age (5 min) |
+| `TELEG_DRAIN_INTERVAL_MS` | `12000` | Idle queue drain interval |
+| `TELEG_CLAIM_OTHERS` | `0` | Allow claiming other sessions' pending |
+
+## Configuration Files
+
+### Global Config (`~/.pi/agent/teleg-bridge.json`)
+
+```json
+{
+  "version": 2,
+  "defaultBotId": 123456789,
+  "bots": {
+    "123456789": {
+      "botToken": "TOKEN",
+      "botUsername": "my_bot",
+      "allowedUserIds": [987654321],
+      "lastUpdateId": 0
+    }
+  }
+}
+```
+
+### Project Config (`.pi/teleg.json`)
+
+```json
+{
+  "botToken": "TOKEN",
+  "allowedUserIds": [987654321]
+}
+```
+
+## Anti-Patterns
+
+### ⚠️ Same Bot, Split DB
+
+```
+WRONG:  Session A (TELEG_DB_PATH=/path/a) + Session B (TELEG_DB_PATH=/path/b)
+        Both using same bot token → isolated queues, no message sharing
+```
+
+**Fix:** Use the same `TELEG_DB_PATH` for all sessions sharing a bot.
+
+### ⚠️ Ghost Primary
+
+```
+WRONG:  Primary session killed → messages stuck in processing forever
+```
+
+**Fix:** Run `/teleg-reconcile` or call `teleg-evict_session` to evict ghost and re-elect primary.
 
 ## INFO_REL.md Format
 
@@ -54,22 +155,19 @@ npm run build
 ./deploy.sh
 ```
 
-## Configuration
-
-### 1. Create a Telegram Bot
-1. Talk to **@BotFather** on Telegram
-2. `/newbot` → copy the token
-3. In Pi: `/teleg-setup` → paste token → `/start` to your bot
-
 ## Commands (via Telegram)
 
 | Command | Description |
 |---------|-------------|
 | `/start` or `/help` | Show help |
-| `/status` | Show connection, sessions, queue |
+| `/status` | Show connection, sessions, queue (enhanced with per-bot info) |
 | `/health` | Test connection |
 | `/healthfull` | Full diagnostic |
 | `/compact` | Compact Pi memory |
+| `/teleg-reconcile` | Reconcile sessions, evict ghosts |
+| `/teleg-sessions` | List sessions with liveness |
+| `/teleg-set-primary <name>` | Set primary session |
+| `/teleg-bots` | List configured bots |
 
 ## Pi Commands
 
@@ -83,11 +181,20 @@ npm run build
 
 ## MCP Tools (for agents)
 
-- `send_message` — Send text to Telegram
-- `send_photo` — Send photo to Telegram
-- `send_video` — Send video to Telegram
+### Core Tools
+- `teleg-send_message` — Send text to Telegram
+- `teleg-send_photo` — Send photo to Telegram
+- `teleg-send_video` — Send video to Telegram
 - `get_me` — Get bot info
-- `teleg_attach` — Queue files to send with reply
+- `teleg-attach` — Queue files to send with reply
+
+### Session Management (Phase 7)
+- `teleg-reconcile(bot_id?)` — Check sessions for liveness, evict ghosts
+- `teleg-list_sessions(bot_id?, include_ghosts?)` — List sessions with status
+- `teleg-evict_session(session_name, bot_id?, reset_queue?, force_kill_pid?)` — Evict a session
+- `teleg-list_bots()` — List configured bots
+- `teleg-set_primary(session_name, bot_id?)` — Set primary session
+- `teleg-clear_backlog` — Reset/purge queue
 
 ## Architecture
 
