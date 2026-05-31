@@ -1,92 +1,516 @@
-# pi-teleg
+# pi-teleg / teleg-bridge
 
-**Telegram Bridge Extension for Pi** — Multi-session, multi-bot Telegram bridge with smart capability-based routing.
+**Telegram Bridge Extension for Pi** — a multi-bot, multi-session Telegram bridge that connects Telegram chats to Pi agent sessions and routes messages to the best available project session by explicit address, declared capabilities, or primary-session fallback.
 
-## Features
+## Intent
 
-- **Multi-Bot Support**: Run multiple Telegram bots on one machine, each with isolated queues
-- **Telegram Bot Integration**: Poll Telegram, receive messages, forward to Pi agent
-- **Multi-Session**: Multiple Pi sessions can share one bot via the relay system
-- **Smart Routing**: Messages are automatically routed to the session best equipped to handle them based on declared capabilities
-- **Capability Registry**: Each session declares its purpose via `INFO_REL.md`, teleg routes relevant messages to it
-- **Direct @sessionName Routing**: Prefix messages with `@sessionName` to target a specific session
-- **Fallback to Primary**: If the ideal session is offline, the primary session handles it
-- **Cross-Session Relay**: Forward messages between Pi sessions via HTTP relay
-- **Bi-directional Communication**: Send AI responses back to Telegram
-- **File Attachments**: Send files via `teleg_attach` tool
-- **Auto-reconnect**: Exponential backoff on connection failures
-- **Health Monitoring**: Periodic health checks
-- **Status Display**: Visual status with queue depth in Pi's UI
-- **Ghost Eviction**: Automatic detection and removal of dead sessions
+`teleg-bridge` exists to make Telegram a practical control plane for Pi:
 
-## How Smart Routing Works
+- Forward Telegram private, group, supergroup, and configured channel messages into active Pi sessions as `[telegram]` turns.
+- Let several Pi sessions share one Telegram bot safely without duplicate polling.
+- Route work to the session that owns the relevant project or capability.
+- Send responses, generated files, photos, and videos back to Telegram.
+- Keep queue and session state recoverable across crashes and restarts.
+- Support more than one Telegram bot on the same host, scoped by `bot_id`.
 
-1. Each Pi session running on a project folder registers with teleg:
-   - Scans `INFO_REL.md` (preferred), `AGENTS.md`, or `README.md` for capabilities
-   - A session in a bare/home directory with no docs **does not register**
-   - Only meaningful project directories are registered
-2. When a Telegram message arrives:
-   - `@sessionName` prefix → relay directly to that session
-   - Check capability registry → if a live session matches (e.g., Twitter URL → "data-scrapper" session) → relay
-   - If matched session is dead → primary handles it
-   - No match → primary handles it
-3. The registry is ephemeral — maintained by the primary session, cleaned on disconnect/crash
+The project is especially useful when you keep multiple specialized Pi sessions open, such as a media downloader, code workspace, scraping workspace, analysis workspace, and operations workspace, then want Telegram messages to land in the right one automatically.
 
-## Deployment Scenarios
+## Core Capabilities
 
-### Scenario A: Same Host, Multiple Pi Sessions (Default)
+### Messaging and Telegram I/O
 
+| Capability | Description |
+|---|---|
+| Telegram polling | Uses Telegram `getUpdates` through one active poller per bot token. |
+| Message forwarding | Converts authorized Telegram messages into Pi turns prefixed with `[telegram]`. |
+| Reply delivery | Sends final agent responses back to Telegram. |
+| Chunked text replies | Handles Telegram message length constraints. |
+| Photo and video sending | `teleg-send_photo` and `teleg-send_video` send local media files. |
+| File attachments | `teleg-attach` queues local files to send with the next Telegram reply. |
+| Typing indicator | Keeps Telegram chat informed while a turn is being processed. |
+
+### Multi-session Routing
+
+| Capability | Description |
+|---|---|
+| Direct routing | `@sessionName message` is relayed to the named live session. |
+| Capability routing | Sessions declare capabilities in `INFO_REL.md`; messages are matched to live sessions. |
+| URL-aware matching | Twitter/X, YouTube, and Reddit URLs can route to media/download-capable sessions. |
+| Primary fallback | If no direct/capability match exists, the primary session for the bot handles the message. |
+| Active queue workers | Linked sessions drain their own pending queue and can process assigned work. |
+| Cross-session relay | Sessions communicate over local authenticated HTTP relay endpoints. |
+
+### Reliability and Operations
+
+| Capability | Description |
+|---|---|
+| Persistent queue | SQLite stores pending, processing, completed, and failed messages. |
+| Bot-scoped state | Queue, relay sessions, downloads, locks, and stats are scoped by `bot_id`. |
+| Polling lock | One lock file per bot prevents duplicate Telegram `getUpdates` consumers. |
+| Crash recovery | Startup recovery can reset stale processing rows and clean old sessions. |
+| Liveness checks | Validates PID, relay file, relay PID match, relay HTTP health, heartbeat, and DB row. |
+| Ghost eviction | Dead sessions can be reconciled and evicted automatically or by command/tool. |
+| Primary election | Elects or sets a primary session per bot. |
+| Split-DB detection | Warns when the same bot is used with isolated databases. |
+
+### Configuration
+
+| Capability | Description |
+|---|---|
+| Global config | `~/.pi/agent/teleg-bridge.json` supports multiple bots. |
+| Project config | `.pi/teleg.json` can provide project-local bot setup. |
+| Environment override | `TELEG_BOT_TOKEN`, `TELEG_BOT_ID`, and `TELEG_DB_PATH` override defaults. |
+| Session capability declaration | `INFO_REL.md` declares what a project/session handles. |
+
+## High-level Architecture
+
+```mermaid
+flowchart LR
+  User[Telegram User] --> Bot[Telegram Bot API]
+  Bot --> Poller[Per-bot PollingManager]
+  Poller --> Worker[Poll Worker Thread]
+  Worker --> Queue[(SQLite message_queue)]
+  Queue --> Router[Routing Decision]
+  Router --> Direct[@sessionName]
+  Router --> Caps[Capability Match]
+  Router --> Primary[Primary Fallback]
+  Direct --> Relay[Authenticated HTTP Relay]
+  Caps --> Relay
+  Relay --> Session[Target Pi Session]
+  Primary --> Session
+  Session --> Tools[MCP / Pi Tools]
+  Tools --> Bot
+  Bot --> User
 ```
-┌─────────────────────────────────────────────────────┐
-│  Host machine                                       │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  │
-│  │ Pi Session  │  │ Pi Session  │  │ Pi Session  │  │
-│  │    (A)      │  │    (B)     │  │    (C)     │  │
-│  │  Bot 123456 │  │  Bot 123456 │  │  Bot 789012 │  │
-│  │   (same)    │  │   (same)   │  │  (diff)    │  │
-│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  │
-│         │               │               │          │
-│         └───────────────┴───────────────┘          │
-│                         │                          │
-│                    Shared DB                        │
-│              ~/.pi/agent/teleg-bridge.db           │
-└─────────────────────────────────────────────────────┘
+
+### Runtime Components
+
+| Component | Path | Responsibility |
+|---|---|---|
+| Extension entrypoint | `src/index.ts` | Registers Pi commands/tools, manages session lifecycle, drains queue, handles Telegram turns. |
+| Configuration | `src/config.ts` | Resolves bot context, global/project config, DB path, bot migration, split-DB checks. |
+| SQLite persistence | `src/db.ts` | Stores message queue, relay sessions, downloads, pub-sub, stats, and schema migrations. |
+| Polling manager | `src/polling-manager.ts` | Starts/stops one worker per bot and maintains bot-specific polling locks. |
+| Poll worker | `src/poll-worker.ts` | Long-polls Telegram and persists updates into SQLite. |
+| Relay server/client | `src/relay.ts` | Runs local HTTP relay endpoints and forwards commands between sessions. |
+| Session registry | `src/session-registry.ts` | Checks liveness, reconciles sessions, evicts ghosts, elects primary. |
+| Session config | `src/session-config.ts` | Reads/writes session registry and user allowlist/archive settings. |
+| Capability registry | `src/capabilities.ts` | Detects capabilities from project docs and matches messages to sessions. |
+| MCP helper server | `mcp-server/index.js` | Exposes bridge operations as MCP tools. |
+| Build output | `dist/` | Compiled JavaScript and TypeScript declarations. |
+
+## SQLite Database Architecture
+
+`teleg-bridge` uses a local SQLite database as the durable coordination layer between the poll worker, routing logic, relay sessions, queue drainers, and operational tools.
+
+### Storage location and runtime mode
+
+| Setting | Value / Behavior |
+|---|---|
+| Default path | `~/.pi/agent/teleg-bridge.db` |
+| Override | `TELEG_DB_PATH=/path/to/teleg-bridge.db` |
+| Journal mode | `PRAGMA journal_mode=WAL` for safer concurrent session access. |
+| Busy timeout | `PRAGMA busy_timeout=5000` to reduce write-contention failures. |
+| Sync mode | `PRAGMA synchronous=NORMAL` for WAL-friendly durability/performance balance. |
+| Schema version | `PRAGMA user_version = 2` after migration. |
+| Scope key | Most runtime tables are scoped by `bot_id`. |
+
+### Database responsibility diagram
+
+```mermaid
+flowchart TD
+  Telegram[Telegram Bot API] --> Worker[poll-worker.ts]
+  Worker --> MQ[(message_queue)]
+  Router[index.ts routing] --> MQ
+  Router --> RS[(relay_sessions)]
+  Router --> RH[(relay_history)]
+  Relay[relay.ts HTTP relay] --> RS
+  Sessions[Pi sessions] --> RS
+  Sessions --> MQ
+  Sessions --> PS[(pubsub)]
+  Tools[MCP tools / Telegram commands] --> MQ
+  Tools --> RS
+  Tools --> DQ[(download_queue)]
+  Tools --> PS
+  Registry[session-registry.ts] --> RS
+  Registry --> MQ
 ```
 
-**Configuration:**
-- All sessions share the same `TELEG_DB_PATH` (default)
-- Sessions with same `botId` share one polling lock
-- Sessions with different `botId` have independent polling
+### Logical schema
 
-### Scenario D: Mixed Shared/Isolated Deployments
+```mermaid
+erDiagram
+  BOT ||--o{ MESSAGE_QUEUE : scopes
+  BOT ||--o{ DOWNLOAD_QUEUE : scopes
+  BOT ||--o{ RELAY_SESSIONS : scopes
+  BOT ||--o{ PUBSUB : scopes
+  RELAY_SESSIONS ||--o{ MESSAGE_QUEUE : claims_by_session_name
+  RELAY_SESSIONS ||--o{ RELAY_HISTORY : from_or_to_session
 
+  MESSAGE_QUEUE {
+    integer id PK
+    integer bot_id
+    integer chat_id
+    integer message_id
+    integer from_user_id
+    text from_username
+    text text
+    text session_id
+    text session_name
+    text status "pending|processing|completed|failed"
+    text source "telegram|relay"
+    text source_session
+    integer created_at
+    integer started_at
+    integer completed_at
+    text error
+    text response
+  }
+
+  DOWNLOAD_QUEUE {
+    integer id PK
+    integer bot_id
+    integer chat_id
+    integer message_id
+    text url
+    text source "twitter|youtube|reddit|gallery|other"
+    text session_name
+    text status "pending|processing|completed|failed"
+    integer retry_count
+    text error
+    text result
+    integer created_at
+    integer started_at
+    integer completed_at
+  }
+
+  RELAY_SESSIONS {
+    integer id PK
+    integer bot_id
+    text session_name
+    text session_id
+    integer pid
+    integer port
+    text secret
+    text project_dir
+    text capabilities "JSON array"
+    text description
+    text role "active|drain"
+    integer is_primary
+    integer registered_at
+    integer last_heartbeat
+  }
+
+  RELAY_HISTORY {
+    integer id PK
+    text from_session
+    text to_session
+    integer chat_id
+    text command
+    integer success
+    text error
+    integer created_at
+  }
+
+  PUBSUB {
+    integer id PK
+    integer bot_id
+    text channel
+    text publisher
+    text payload
+    text target_session
+    text consumed_by
+    integer created_at
+    integer consumed_at
+  }
 ```
-┌─────────────────────┐  ┌─────────────────────┐
-│  Host 1             │  │  Host 2             │
-│  Bot 123456 (prod)  │  │  Bot 789012 (dev)   │
-│  Shared DB          │  │  Shared DB          │
-│  Multiple sessions   │  │  Multiple sessions   │
-└─────────────────────┘  └─────────────────────┘
+
+> `BOT` is a logical parent from global/project configuration, not a physical SQLite table. Relationships are enforced by query patterns and indexes rather than foreign-key constraints.
+
+### Tables and indexes
+
+| Table | Purpose | Important indexes / constraints |
+|---|---|---|
+| `message_queue` | Durable Telegram/relay work queue and processing history. | `idx_queue_status`, `idx_queue_session`, `idx_queue_chat`, `idx_queue_bot_id`, unique `idx_queue_dedup(bot_id, chat_id, message_id)`. |
+| `download_queue` | Durable queue for media/download jobs discovered from messages. | `idx_dl_status`, `idx_dl_session`, `idx_dl_created`, `idx_dl_url`, `idx_dl_bot_id`. |
+| `relay_sessions` | Live session registry mirrored from relay endpoints and heartbeats. | unique `idx_relay_name(bot_id, session_name)`, `idx_relay_pid`, `idx_relay_bot_id`. |
+| `relay_history` | Audit trail for inter-session command relay attempts. | `idx_relay_history_time(created_at)`. |
+| `pubsub` | Lightweight inter-session publish/subscribe queue. | `idx_pubsub_channel(channel, consumed_at)`, `idx_pubsub_target(target_session, consumed_at)`, `idx_pubsub_bot(bot_id, channel)`. |
+
+### Queue state machine
+
+```mermaid
+stateDiagram-v2
+  [*] --> pending: insert from Telegram/relay
+  pending --> processing: claimNextMessage / markMessageProcessing
+  processing --> completed: completeMessage(response)
+  processing --> failed: failMessage(error)
+  processing --> pending: recoverStaleMessages / resetProcessingForSession
+  failed --> [*]
+  completed --> [*]
 ```
 
-**Configuration:**
-- Set `TELEG_BOT_TOKEN` or `TELEG_BOT_ID` for each host
-- Set `TELEG_DB_PATH` for isolation if needed
+### Main database flows
 
-## Environment Variables
+| Flow | Read / Write Path |
+|---|---|
+| Incoming Telegram update | `poll-worker.ts` inserts or deduplicates into `message_queue` by `(bot_id, chat_id, message_id)`. |
+| Session claim | Queue drainers call `claimNextMessage` / `claimNextMessageForSession`, moving rows from `pending` to `processing`. |
+| Route assignment | Router assigns `session_name` and synthetic `session_id` like `__session__:name` for targeted delivery. |
+| Completion | Active turn completion updates `message_queue.status`, `completed_at`, `response`, or `error`. |
+| Relay registration | Session startup writes `relay_sessions` with PID, port, secret, capabilities, role, and heartbeat. |
+| Liveness reconciliation | `session-registry.ts` reads `relay_sessions`, validates relay/PID/heartbeat, evicts ghosts, and resets stuck queue rows. |
+| Pub-sub delegation | `teleg-publish` inserts into `pubsub`; sessions consume rows by channel or target session. |
+| Download tracking | URL/media jobs are tracked in `download_queue` with retry count, result, and error details. |
+
+## Workflow
+
+### 1. Setup workflow
+
+```mermaid
+sequenceDiagram
+  participant Dev as Developer
+  participant Pi as Pi Session
+  participant Config as teleg config
+  participant TG as Telegram API
+
+  Dev->>Pi: /teleg-setup
+  Pi->>Config: Save bot token / allowed users
+  Pi->>TG: getMe / pairing checks
+  TG-->>Pi: Bot identity
+  Pi->>Config: Store botId, botUsername, lastUpdateId
+```
+
+1. Install dependencies with `npm install`.
+2. Build with `npm run build`.
+3. Deploy with `./deploy.sh`.
+4. Run `/teleg-setup` inside Pi, or provide config/env variables.
+5. Send `/start` or `/help` to the Telegram bot from an allowed user.
+
+### 2. Session registration workflow
+
+```mermaid
+flowchart TD
+  Start[Pi session_start] --> Resolve[Resolve BotContext]
+  Resolve --> Detect[Detect project capabilities]
+  Detect --> Relay[Start local relay server]
+  Relay --> DB[Register relay_sessions row]
+  DB --> Caps[Write capability registry]
+  Caps --> Poll{Polling lock available?}
+  Poll -- yes --> Active[Become active poller / primary candidate]
+  Poll -- no --> Drain[Stay linked as queue-draining session]
+  Active --> Heartbeat[Heartbeat + liveness timer]
+  Drain --> Heartbeat
+```
+
+A session registers only when it has meaningful project context. The preferred declaration file is `INFO_REL.md`; fallback detection can use `AGENTS.md` or `README.md`.
+
+### 3. Incoming message workflow
+
+```mermaid
+flowchart TD
+  Msg[Telegram message] --> Auth{Allowed user?}
+  Auth -- no --> Reject[Ignore / reject]
+  Auth -- yes --> Command{Bridge command?}
+  Command -- yes --> Cmd[Run command handler]
+  Command -- no --> Persist[Persist to SQLite queue]
+  Persist --> Direct{Starts with @sessionName?}
+  Direct -- yes --> LiveTarget{Target live?}
+  LiveTarget -- yes --> Relay[Forward via HTTP relay]
+  LiveTarget -- no --> Fallback[Primary fallback]
+  Direct -- no --> Match{Capability match?}
+  Match -- yes --> CapLive{Matched session live?}
+  CapLive -- yes --> Relay
+  CapLive -- no --> Fallback
+  Match -- no --> Fallback
+  Fallback --> Primary[Assign to primary session]
+  Relay --> Turn[Create [telegram] Pi turn]
+  Primary --> Turn
+  Turn --> Reply[Send response / attachments to Telegram]
+```
+
+Routing order is intentionally deterministic:
+
+1. Telegram administrative and bridge commands.
+2. Explicit `@sessionName` route.
+3. Capability match from the active session registry.
+4. Primary session fallback.
+
+### 4. Response workflow
+
+```mermaid
+sequenceDiagram
+  participant Session as Pi Session
+  participant Tool as teleg tools
+  participant Queue as SQLite
+  participant TG as Telegram API
+  participant User as Telegram User
+
+  Session->>Tool: teleg-send_message / teleg-attach / final reply
+  Tool->>TG: sendMessage / sendPhoto / sendVideo / document upload
+  TG-->>User: Delivered response
+  Session->>Queue: Mark message completed or failed
+```
+
+If a Telegram user asks for a generated file, the handling agent should call `teleg-attach` with the local file path before returning its final text response.
+
+### 5. Reconciliation and recovery workflow
+
+```mermaid
+flowchart TD
+  Timer[Startup / timer / manual reconcile] --> Sessions[Read relay_sessions]
+  Sessions --> Checks[Run liveness checks]
+  Checks --> Classify{linked / stale / ghost}
+  Classify -- linked --> Keep[Keep routeable]
+  Classify -- stale --> Monitor[Keep but report stale]
+  Classify -- ghost --> Evict[Remove DB row, registry, relay file]
+  Evict --> Reset[Reset stuck processing rows]
+  Reset --> Elect[Elect new primary if needed]
+```
+
+Liveness checks include:
+
+- `pid_alive`
+- `relay_file`
+- `relay_pid_match`
+- `relay_http`
+- `heartbeat_fresh`
+- `db_row`
+
+## Routing and Capability Declaration
+
+Create `INFO_REL.md` in a project root to describe what a Pi session should handle:
+
+```markdown
+# INFO_REL
+
+## capabilities
+media-download, twitter, youtube, reddit, gallery
+
+## description
+Downloads and archives media from various online sources.
+```
+
+This repository declares:
+
+```markdown
+# INFO_REL
+
+## capabilities
+telegram-bridge, messaging, relay, routing
+
+## description
+Multi-session Telegram bridge extension for Pi. Handles polling, session routing, message relay, and capability-based smart message distribution between Pi sessions.
+```
+
+Capability matching uses:
+
+- Direct URL patterns for Twitter/X, YouTube, and Reddit.
+- Capability keywords such as `twitter`, `youtube`, `reddit`, `media`, `download`, or `video`.
+- Generic keyword matching against session descriptions.
+- Live-process checks before selecting a route.
+
+## Commands via Telegram
+
+| Command | Description |
+|---|---|
+| `/start` or `/help` | Show help and pairing information. |
+| `/status` | Show connection, sessions, relay state, queue, and bot info. |
+| `/chatid` | Show current chat/user IDs for group/channel setup. |
+| `/queue [session]` | Show queue information for a session or primary. |
+| `/health` | Test connection. |
+| `/healthfull` | Full diagnostic. |
+| `/compact` | Compact Pi memory. |
+| `/teleg-reconcile` | Reconcile sessions and evict ghosts. |
+| `/teleg-sessions` | List sessions with liveness state. |
+| `/teleg-set-primary <name>` | Set the primary session for the current bot. |
+| `/teleg-bots` | List configured bots. |
+| `/teleg-dc` or `/teleg-disconnect` | Disconnect this session. |
+| `/teleg-dc-all` or `/teleg-disconnect-all` | Disconnect all sessions without cleaning DB state. |
+| `/teleg-clean-db` | Reset processing queue and purge old entries. |
+| `/teleg-remove-sessions` | Remove dead session registry records. |
+| `stop` | Abort current turn. |
+
+## Pi Commands
+
+| Command | Description |
+|---|---|
+| `/teleg-setup` | Configure bot token and allowed user pairing. |
+| `/teleg-status` | Show teleg-bridge status. |
+| `/teleg-connect` | Start polling / connect bridge. |
+| `/teleg-disconnect` | Stop polling / disconnect bridge. |
+| `/teleg-reconnect` | Force reconnect. |
+
+## MCP Tools for Agents
+
+### Telegram I/O
+
+| Tool | Description |
+|---|---|
+| `teleg-send_message` | Send text to Telegram. |
+| `teleg-send_photo` | Send a local image file as a Telegram photo. |
+| `teleg-send_video` | Send a local video file as a Telegram video. |
+| `teleg-attach` | Queue one or more local files for the active Telegram reply. |
+| `get_me` | Get bot identity information. |
+
+### Queue and backlog operations
+
+| Tool | Description |
+|---|---|
+| `get_queue_count` | Get pending/processing queue depth. |
+| `get_queue_stats` | Get message and download queue stats. |
+| `get_queue_data` | Inspect recent queue rows, optionally by status. |
+| `get_queue_data_id` | Inspect a specific queue row. |
+| `set_queue_status` | Manually set queue row status. |
+| `teleg-clear_backlog` | Reset, purge, complete, fail, or delete queue rows. |
+
+### Session, relay, and bot operations
+
+| Tool | Description |
+|---|---|
+| `teleg-publish` | Publish a task to a capability channel or target session. |
+| `teleg-disconnect` | Disconnect this Pi session. |
+| `teleg-disconnect-all` | Disconnect all sessions connected to the bridge. |
+| `teleg-clean-db` | Reset processing rows and purge old completed/failed rows. |
+| `teleg-remove-sessions` | Remove dead or unwanted session registry records. |
+| `teleg-reconcile` | Check liveness and evict ghost sessions. |
+| `teleg-list_sessions` | List relay sessions with liveness state. |
+| `teleg-evict_session` | Evict a session and optionally reset its queue / kill PID. |
+| `teleg-list_bots` | List configured Telegram bots. |
+| `teleg-set_primary` | Set a primary session for a bot. |
+
+## Configuration
+
+### Environment Variables
 
 | Variable | Default | Purpose |
-|----------|---------|---------|
-| `TELEG_BOT_TOKEN` | — | Force token for process (overrides config) |
-| `TELEG_BOT_ID` | — | Select bot from global config |
-| `TELEG_DB_PATH` | `~/.pi/agent/teleg-bridge.db` | Shared SQLite DB |
-| `TELEG_LIVENESS_MS` | `300000` | Max heartbeat age (5 min) |
-| `TELEG_DRAIN_INTERVAL_MS` | `12000` | Idle queue drain interval |
-| `TELEG_CLAIM_OTHERS` | `0` | Allow claiming other sessions' pending |
+|---|---:|---|
+| `TELEG_BOT_TOKEN` | — | Force token for the current process. |
+| `TELEG_BOT_ID` | — | Select a bot from global config. |
+| `TELEG_DB_PATH` | `~/.pi/agent/teleg-bridge.db` | SQLite DB path shared by sessions. |
+| `TELEG_LIVENESS_MS` | `300000` | Max heartbeat age before a session is stale. |
+| `TELEG_DRAIN_INTERVAL_MS` | `12000` | Idle queue drain interval. |
+| `TELEG_CLAIM_OTHERS` | `0` | Allow a session to claim messages assigned to other sessions. |
 
-## Configuration Files
+### Group, Supergroup, and Channel Support
 
-### Global Config (`~/.pi/agent/teleg-bridge.json`)
+The bridge can process requests made outside private chats:
+
+| Chat type | Authorization model | Notes |
+|---|---|---|
+| Private chat | `from.id` must be in `allowedUserIds`, except first `/start` or `/help` pairing when no users are configured. | Replies go to the private chat. |
+| Group / supergroup | `from.id` must be in `allowedUserIds`. | The same configured user can request work from another chat; replies are sent back to that group thread/message. Bot privacy mode may limit which group messages Telegram delivers. |
+| Channel | `chat.id` must be in `allowedChatIds`. | Telegram channel posts usually do not expose an author user ID to bots, so channel authorization must be chat-based. The bot must be an admin or otherwise permitted to read/respond. |
+
+Use `/chatid` from an authorized group/supergroup user to discover the current chat ID. For channels, configure the channel ID manually in `allowedChatIds` because user identity is normally unavailable in channel posts.
+
+Important Telegram behavior:
+
+- In groups with BotFather privacy mode enabled, bots generally receive commands, replies to the bot, and mentions, not every message.
+- To receive normal group messages, disable bot privacy mode in BotFather or ask users to command/mention the bot.
+- Channel posts are authorized by `allowedChatIds`, not `allowedUserIds`, because Telegram does not reliably provide the posting admin identity to bots.
+
+### Global Config: `~/.pi/agent/teleg-bridge.json`
 
 ```json
 {
@@ -97,52 +521,92 @@
       "botToken": "TOKEN",
       "botUsername": "my_bot",
       "allowedUserIds": [987654321],
+      "allowedChatIds": [-1001234567890],
       "lastUpdateId": 0
     }
   }
 }
 ```
 
-### Project Config (`.pi/teleg.json`)
+### Project Config: `.pi/teleg.json`
 
 ```json
 {
   "botToken": "TOKEN",
-  "allowedUserIds": [987654321]
+  "allowedUserIds": [987654321],
+  "allowedChatIds": [-1001234567890]
 }
 ```
 
-## Anti-Patterns
+## State and Data Files
 
-### ⚠️ Same Bot, Split DB
+| File / Directory | Purpose |
+|---|---|
+| `~/.pi/agent/teleg-bridge.db` | Default shared SQLite database. |
+| `~/.pi/agent/teleg-bridge.json` | Global multi-bot configuration. |
+| `~/.pi/agent/teleg-capabilities.json` | Runtime capability registry. |
+| `~/.pi/agent/tmp/teleg-bridge/polling-{botId}.lock` | Per-bot polling lock. |
+| `~/.pi/agent/tmp/teleg-relay/{sessionName}.json` | Relay endpoint info for a session. |
+| `.pi/teleg.json` | Optional project-local bot config. |
+| `INFO_REL.md` | Project capability declaration. |
 
+## Deployment Scenarios
+
+### Same host, multiple Pi sessions, one bot
+
+```mermaid
+flowchart TD
+  Bot[Bot 123456] --> Poller[One active poller]
+  Poller --> DB[(Shared SQLite DB)]
+  DB --> A[Pi Session A]
+  DB --> B[Pi Session B]
+  DB --> C[Pi Session C]
+  A <--> Relay[Local relay files + HTTP]
+  B <--> Relay
+  C <--> Relay
 ```
-WRONG:  Session A (TELEG_DB_PATH=/path/a) + Session B (TELEG_DB_PATH=/path/b)
-        Both using same bot token → isolated queues, no message sharing
+
+All sessions must share the same `TELEG_DB_PATH`. Only one session polls Telegram; all linked sessions can process work routed or assigned to them.
+
+### Same host, multiple bots
+
+```mermaid
+flowchart TD
+  Bot1[Bot 123456] --> Lock1[polling-123456.lock]
+  Bot2[Bot 789012] --> Lock2[polling-789012.lock]
+  Lock1 --> DB[(Shared or isolated SQLite DB)]
+  Lock2 --> DB
+  DB --> Sessions[Pi Sessions]
 ```
 
-**Fix:** Use the same `TELEG_DB_PATH` for all sessions sharing a bot.
+Each bot has independent polling, lock, offset, queue scoping, and primary session selection.
 
-### ⚠️ Ghost Primary
+### Mixed shared / isolated deployments
 
+Use separate `TELEG_DB_PATH` values for intentionally isolated environments, such as dev and prod. Do **not** split the DB for sessions that are meant to share the same bot and queue.
+
+## Anti-patterns and Fixes
+
+### Same bot, split DB
+
+```text
+Wrong: Session A uses /path/a.db and Session B uses /path/b.db with the same bot token.
+Result: isolated queues, no shared routing, confusing primary ownership.
+Fix: set the same TELEG_DB_PATH for all sessions sharing a bot.
 ```
-WRONG:  Primary session killed → messages stuck in processing forever
+
+### Ghost primary
+
+```text
+Wrong: primary session is killed and stale rows remain processing forever.
+Fix: run /teleg-reconcile, /teleg-clean-db, or use teleg-evict_session.
 ```
 
-**Fix:** Run `/teleg-reconcile` or call `teleg-evict_session` to evict ghost and re-elect primary.
+### Missing INFO_REL.md
 
-## INFO_REL.md Format
-
-Create in your project root to declare capabilities:
-
-```markdown
-# INFO_REL
-
-## capabilities
-media-download, twitter, youtube, reddit, gallery
-
-## description
-Downloads and archives media from various online sources
+```text
+Wrong: project session has no clear capabilities, so routing falls back to primary.
+Fix: add INFO_REL.md with capabilities and a concise description.
 ```
 
 ## Installation
@@ -155,63 +619,30 @@ npm run build
 ./deploy.sh
 ```
 
-## Commands (via Telegram)
+## Development
 
-| Command | Description |
-|---------|-------------|
-| `/start` or `/help` | Show help |
-| `/status` | Show connection, sessions, queue (enhanced with per-bot info) |
-| `/health` | Test connection |
-| `/healthfull` | Full diagnostic |
-| `/compact` | Compact Pi memory |
-| `/teleg-reconcile` | Reconcile sessions, evict ghosts |
-| `/teleg-sessions` | List sessions with liveness |
-| `/teleg-set-primary <name>` | Set primary session |
-| `/teleg-bots` | List configured bots |
-
-## Pi Commands
-
-| Command | Description |
-|---------|-------------|
-| `/teleg-setup` | Configure bot token |
-| `/teleg-status` | Show status |
-| `/teleg-connect` | Start polling |
-| `/teleg-disconnect` | Stop polling |
-| `/teleg-reconnect` | Force reconnect |
-
-## MCP Tools (for agents)
-
-### Core Tools
-- `teleg-send_message` — Send text to Telegram
-- `teleg-send_photo` — Send photo to Telegram
-- `teleg-send_video` — Send video to Telegram
-- `get_me` — Get bot info
-- `teleg-attach` — Queue files to send with reply
-
-### Session Management (Phase 7)
-- `teleg-reconcile(bot_id?)` — Check sessions for liveness, evict ghosts
-- `teleg-list_sessions(bot_id?, include_ghosts?)` — List sessions with status
-- `teleg-evict_session(session_name, bot_id?, reset_queue?, force_kill_pid?)` — Evict a session
-- `teleg-list_bots()` — List configured bots
-- `teleg-set_primary(session_name, bot_id?)` — Set primary session
-- `teleg-clear_backlog` — Reset/purge queue
-
-## Architecture
-
+```bash
+npm run build      # compile TypeScript
+npm run dev        # watch compile
+npm run deploy     # deploy extension
+npm run deploy:watch
 ```
-Telegram ─→ teleg (polling + routing)
-                │
-         ┌──────┴──────┐
-         │             │
-    @sessionName   capability match
-         │             │
-         ▼             ▼
-    target session   best-fit session
-         │             │
-         └──────┬──────┘
-                ▼
-         sends response via teleg MCP tools
-```
+
+## Related Documentation
+
+- Interactive architecture page: [`README.html`](./README.html)
+- Phase plan: [`docs/PLAN_ACTION.md`](./docs/PLAN_ACTION.md)
+- Integration notes: [`docs/PHASE3_INTEGRATION.md`](./docs/PHASE3_INTEGRATION.md)
+- Group/channel support: [`docs/GROUP_CHANNEL_SUPPORT.md`](./docs/GROUP_CHANNEL_SUPPORT.md)
+- Graph report: [`graphify-out/GRAPH_REPORT.md`](./graphify-out/GRAPH_REPORT.md)
+
+## Recent Graphify Snapshot
+
+The project graph was refreshed after group/channel support changes:
+
+- Graph report: [`graphify-out/GRAPH_REPORT.md`](./graphify-out/GRAPH_REPORT.md)
+- Interactive graph: [`graphify-out/graph.html`](./graphify-out/graph.html)
+- Graph JSON: [`graphify-out/graph.json`](./graphify-out/graph.json)
 
 ## License
 

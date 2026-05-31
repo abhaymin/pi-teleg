@@ -1,0 +1,52 @@
+{
+  "/home/abhaym/Development/PTGD/teleg/src/relay.ts": {
+    "mtime": 1779953725.7568152,
+    "ast_hash": "b5afdcbc35e51bccda4c2638c615b8a5",
+    "semantic_hash": ""
+  },
+  "/home/abhaym/Development/PTGD/teleg/src/node-sqlite.d.ts": {
+    "mtime": 1779003428.1427581,
+    "ast_hash": "6c710b5151495f7e46c05ffa744f396a",
+    "semantic_hash": ""
+  },
+  "/home/abhaym/Development/PTGD/teleg/src/poll-worker.ts": {
+    "mtime": 1780033280.4737134,
+    "ast_hash": "e712ce1f1711b43942bb48df8b12ac34",
+    "semantic_hash": ""
+  },
+  "/home/abhaym/Development/PTGD/teleg/src/config.ts": {
+    "mtime": 1780033235.8829243,
+    "ast_hash": "1a8a154cbf2ba29c087617004e0c8f32",
+    "semantic_hash": ""
+  },
+  "/home/abhaym/Development/PTGD/teleg/src/polling-manager.ts": {
+    "mtime": 1780033286.987725,
+    "ast_hash": "f20abef3fb7821c3e430b4b33b1427fa",
+    "semantic_hash": ""
+  },
+  "/home/abhaym/Development/PTGD/teleg/src/session-registry.ts": {
+    "mtime": 1779807849.2846885,
+    "ast_hash": "324c734775c78b651d2035d0882c2209",
+    "semantic_hash": ""
+  },
+  "/home/abhaym/Development/PTGD/teleg/src/capabilities.ts": {
+    "mtime": 1779738613.233964,
+    "ast_hash": "03db4bbc5bd5e46be355687de300769a",
+    "semantic_hash": ""
+  },
+  "/home/abhaym/Development/PTGD/teleg/src/session-config.ts": {
+    "mtime": 1780033253.1107802,
+    "ast_hash": "3a56f44166c31768979084fcc8cae20f",
+    "semantic_hash": ""
+  },
+  "/home/abhaym/Development/PTGD/teleg/src/index.ts": {
+    "mtime": 1780033352.5763586,
+    "ast_hash": "94320d590e8b422c3bb3ea6ccc1f61ad",
+    "semantic_hash": ""
+  },
+  "/home/abhaym/Development/PTGD/teleg/src/db.ts": {
+    "mtime": 1779962574.3176827,
+    "ast_hash": "90e7ea86a091597e352886ed76c71e72",
+    "semantic_hash": ""
+  }
+}

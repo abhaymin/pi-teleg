@@ -63,7 +63,7 @@ export interface RelaySession {
   project_dir: string | null;
   capabilities: string | null; // JSON array
   description: string | null;
-  role: "active" | "passive";
+  role: "active" | "drain";
   is_primary: boolean; // True if this session holds the polling lock for this bot
   registered_at: number;
   last_heartbeat: number;
@@ -123,21 +123,23 @@ function runMigrations(database: DatabaseSync): void {
   let currentVersion = versionRow.user_version;
 
   if (currentVersion >= SCHEMA_VERSION) {
-    // Already up to date, just ensure tables exist (for fresh DBs)
+    // Already up to date, just ensure tables exist and repair legacy constraints.
     initSchema(database);
+    repairLegacyRelaySessionsSchema(database);
     return;
   }
-
-  console.log(`[db] Running migrations from v${currentVersion} to v${SCHEMA_VERSION}...`);
 
   // Migration from v0/v1 to v2: Add bot_id columns
   if (currentVersion < 2) {
     migrateToV2(database);
   }
 
+  initSchema(database);
+  repairLegacyRelaySessionsSchema(database);
+
   // Set the final version
   database.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
-  console.log(`[db] Migration complete, schema version now ${SCHEMA_VERSION}`);
+
 }
 
 function migrateToV2(database: DatabaseSync): void {
@@ -199,6 +201,10 @@ function migrateToV2(database: DatabaseSync): void {
     console.error("[db] Error creating idx_queue_dedup:", err);
   }
 
+  // Drop auto-index on old UNIQUE(session_name) constraint before creating new compound index
+  try {
+    database.exec(`DROP INDEX IF EXISTS sqlite_autoindex_relay_sessions_1`);
+  } catch { /* ignore */ }
   // Drop old relay_sessions unique constraint and create new scoped one
   try {
     database.exec(`DROP INDEX IF EXISTS idx_relay_name`);
@@ -220,7 +226,53 @@ function migrateToV2(database: DatabaseSync): void {
     database.exec(`CREATE INDEX IF NOT EXISTS idx_dl_bot_id ON download_queue(bot_id)`);
   } catch { /* ignore */ }
 
-  console.log("[db] v2 migration: bot_id columns added, indexes updated");
+
+}
+
+function repairLegacyRelaySessionsSchema(database: DatabaseSync): void {
+  const row = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'relay_sessions'").get() as { sql?: string } | undefined;
+  const createSql = row?.sql ?? "";
+  const hasLegacyNameConstraint = /session_name\s+TEXT\s+NOT\s+NULL\s+UNIQUE/i.test(createSql);
+  const hasLegacyRoleConstraint = /role\s+IN\s*\(\s*'active'\s*,\s*'passive'\s*\)/i.test(createSql);
+
+  if (!hasLegacyNameConstraint && !hasLegacyRoleConstraint) return;
+
+  const oldTable = `relay_sessions_legacy_${Date.now()}`;
+  database.exec(`
+    BEGIN IMMEDIATE;
+    ALTER TABLE relay_sessions RENAME TO ${oldTable};
+    CREATE TABLE relay_sessions (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      bot_id            INTEGER NOT NULL DEFAULT 0,
+      session_name      TEXT NOT NULL,
+      session_id        TEXT NOT NULL,
+      pid               INTEGER NOT NULL,
+      port              INTEGER NOT NULL,
+      secret            TEXT NOT NULL,
+      project_dir       TEXT,
+      capabilities      TEXT,
+      description       TEXT,
+      role              TEXT NOT NULL DEFAULT 'drain' CHECK (role IN ('active', 'drain')),
+      is_primary        INTEGER NOT NULL DEFAULT 0,
+      registered_at     INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000),
+      last_heartbeat    INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000)
+    );
+    INSERT OR IGNORE INTO relay_sessions (id, bot_id, session_name, session_id, pid, port, secret, project_dir, capabilities, description, role, is_primary, registered_at, last_heartbeat)
+      SELECT id, bot_id, session_name, session_id, pid, port, secret, project_dir, capabilities, description,
+        CASE role WHEN 'passive' THEN 'drain' ELSE role END,
+        is_primary, registered_at, last_heartbeat
+      FROM (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY bot_id, session_name ORDER BY last_heartbeat DESC, id DESC) AS relay_row_number
+        FROM ${oldTable}
+      )
+      WHERE relay_row_number = 1
+      ORDER BY last_heartbeat DESC;
+    DROP TABLE ${oldTable};
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_relay_name ON relay_sessions(bot_id, session_name);
+    CREATE INDEX IF NOT EXISTS idx_relay_pid ON relay_sessions(pid);
+    CREATE INDEX IF NOT EXISTS idx_relay_bot_id ON relay_sessions(bot_id);
+    COMMIT;
+  `);
 }
 
 function initSchema(database: DatabaseSync): void {
@@ -285,7 +337,7 @@ function initSchema(database: DatabaseSync): void {
       project_dir       TEXT,
       capabilities      TEXT,
       description       TEXT,
-      role              TEXT NOT NULL DEFAULT 'passive' CHECK (role IN ('active', 'passive')),
+      role              TEXT NOT NULL DEFAULT 'drain' CHECK (role IN ('active', 'drain')),
       is_primary        INTEGER NOT NULL DEFAULT 0,
       registered_at     INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000),
       last_heartbeat    INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000)
@@ -307,6 +359,23 @@ function initSchema(database: DatabaseSync): void {
     );
 
     CREATE INDEX IF NOT EXISTS idx_relay_history_time ON relay_history(created_at);
+
+    -- PUB-SUB: inter-session messages
+    CREATE TABLE IF NOT EXISTS pubsub (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      bot_id            INTEGER NOT NULL DEFAULT 0,
+      channel           TEXT NOT NULL,
+      publisher         TEXT NOT NULL,
+      payload           TEXT NOT NULL DEFAULT '',
+      target_session    TEXT,
+      consumed_by       TEXT,
+      created_at        INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000),
+      consumed_at       INTEGER
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_pubsub_channel ON pubsub(channel, consumed_at);
+    CREATE INDEX IF NOT EXISTS idx_pubsub_target ON pubsub(target_session, consumed_at);
+    CREATE INDEX IF NOT EXISTS idx_pubsub_bot ON pubsub(bot_id, channel);
   `);
 }
 
@@ -388,10 +457,8 @@ export function claimNextMessage(
     sql = `
       SELECT * FROM message_queue
       WHERE bot_id = ? AND status = 'pending'
-        AND (session_name = ? OR session_id = 'unassigned')
-      ORDER BY
-        CASE WHEN session_id = 'unassigned' THEN 0 ELSE 1 END,
-        created_at ASC
+        AND (session_name = ? OR session_id = ? OR session_name = ?)
+      ORDER BY created_at ASC
       LIMIT 1
     `;
   } else {
@@ -410,8 +477,9 @@ export function claimNextMessage(
     `;
   }
 
+  const normalizedName = normalizeSessionName(sessionName);
   const args: (string | number)[] = onlyForSession 
-    ? [botId, sessionName] 
+    ? [botId, normalizedName, `__session__:${normalizedName}`, `__session__:${normalizedName}`] 
     : [botId, sessionId, sessionName];
   const row = d.prepare(sql).get(...args) as unknown as QueuedMessage | undefined;
 
@@ -445,11 +513,12 @@ export function claimNextMessageForSession(botId: number, sessionName: string): 
  * @param botId - Scope to messages for this bot
  */
 export function getPendingCountForSession(botId: number, sessionName: string): number {
+  const normalizedName = normalizeSessionName(sessionName);
   const row = getDb().prepare(`
     SELECT COUNT(*) as count FROM message_queue
     WHERE bot_id = ? AND status = 'pending'
-      AND (session_name = ? OR session_id = ?)
-  `).get(botId, sessionName, `__session__:${sessionName}`) as { count: number };
+      AND (session_name = ? OR session_id = ? OR session_name = ?)
+  `).get(botId, normalizedName, `__session__:${normalizedName}`, `__session__:${normalizedName}`) as { count: number };
   return row.count;
 }
 
@@ -459,12 +528,13 @@ export function getPendingCountForSession(botId: number, sessionName: string): n
  * @param botId - Scope to messages for this bot
  */
 export function resetProcessingForSession(botId: number, sessionName: string): number {
+  const normalizedName = normalizeSessionName(sessionName);
   const result = getDb().prepare(`
     UPDATE message_queue
     SET status = 'pending', session_id = 'unassigned', session_name = 'unknown', started_at = NULL
     WHERE bot_id = ? AND status = 'processing'
-      AND (session_name = ? OR session_id = ?)
-  `).run(botId, sessionName, `__session__:${sessionName}`);
+      AND (session_name = ? OR session_id = ? OR session_name = ?)
+  `).run(botId, normalizedName, `__session__:${normalizedName}`, `__session__:${normalizedName}`);
   return result.changes;
 }
 
@@ -488,6 +558,72 @@ export function failMessage(id: number, error: string): void {
     SET status = 'failed', completed_at = ?, error = ?
     WHERE id = ?
   `).run(Date.now(), error, id);
+}
+
+export function normalizeSessionName(sessionName: string): string {
+  return sessionName.startsWith("__session__:") ? sessionName.slice("__session__:".length) : sessionName;
+}
+
+export function assignMessageToSession(id: number, sessionName: string): number {
+  const normalizedName = normalizeSessionName(sessionName);
+  const result = getDb().prepare(`
+    UPDATE message_queue
+    SET session_name = ?, session_id = ?
+    WHERE id = ? AND status = 'pending'
+  `).run(normalizedName, `__session__:${normalizedName}`, id);
+  return result.changes;
+}
+
+export function assignTelegramMessageToSession(botId: number, chatId: number, messageId: number, sessionName: string): number {
+  const normalizedName = normalizeSessionName(sessionName);
+  const result = getDb().prepare(`
+    UPDATE message_queue
+    SET session_name = ?, session_id = ?
+    WHERE bot_id = ? AND chat_id = ? AND message_id = ? AND status = 'pending'
+  `).run(normalizedName, `__session__:${normalizedName}`, botId, chatId, messageId);
+  return result.changes;
+}
+
+export function markMessageProcessing(id: number, sessionId: string, sessionName: string): number {
+  const normalizedName = normalizeSessionName(sessionName);
+  const result = getDb().prepare(`
+    UPDATE message_queue
+    SET status = 'processing', session_id = ?, session_name = ?, started_at = ?
+    WHERE id = ? AND status = 'pending'
+  `).run(sessionId, normalizedName, Date.now(), id);
+  return result.changes;
+}
+
+export function getQueueStatsForSession(botId: number, sessionName: string): QueueStats {
+  const normalizedName = normalizeSessionName(sessionName);
+  const rows = getDb().prepare(`
+    SELECT status, COUNT(*) as count FROM message_queue
+    WHERE bot_id = ? AND (session_name = ? OR session_id = ? OR session_name = ?)
+    GROUP BY status
+  `).all(botId, normalizedName, `__session__:${normalizedName}`, `__session__:${normalizedName}`) as Array<{ status: string; count: number }>;
+
+  const stats: QueueStats = { pending: 0, processing: 0, completed: 0, failed: 0, total: 0 };
+  for (const row of rows) {
+    const key = row.status as keyof QueueStats;
+    if (key in stats) stats[key] = row.count;
+    stats.total += row.count;
+  }
+  return stats;
+}
+
+export function normalizeLegacyBotIds(botId: number): number {
+  if (!botId) return 0;
+  const result = getDb().prepare(`
+    UPDATE message_queue
+    SET bot_id = ?
+    WHERE bot_id = 0 AND status IN ('pending', 'processing')
+  `).run(botId);
+  const dlResult = getDb().prepare(`
+    UPDATE download_queue
+    SET bot_id = ?
+    WHERE bot_id = 0 AND status IN ('pending', 'processing')
+  `).run(botId);
+  return result.changes + dlResult.changes;
 }
 
 /**
@@ -654,9 +790,10 @@ export function registerRelaySession(params: {
   project_dir?: string | null;
   capabilities?: string | null;
   description?: string | null;
-  role?: "active" | "passive";
+  role?: "active" | "drain";
 }): void {
-  getDb().prepare(`
+  try {
+    getDb().prepare(`
     INSERT INTO relay_sessions (bot_id, session_name, session_id, pid, port, secret, project_dir, capabilities, description, role, registered_at, last_heartbeat)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(bot_id, session_name) DO UPDATE SET
@@ -679,10 +816,48 @@ export function registerRelaySession(params: {
     params.project_dir || null,
     params.capabilities || null,
     params.description || null,
-    params.role || "passive",
+    params.role || "drain",
     Date.now(),
     Date.now(),
   );
+  } catch (err) {
+    // Fallback for DBs that still have the old auto-index (session_name UNIQUE) — drop it and retry
+    if (err instanceof Error && err.message.includes("UNIQUE constraint failed: relay_sessions.session_name")) {
+      try {
+        getDb().exec(`DROP INDEX IF EXISTS sqlite_autoindex_relay_sessions_1`);
+        getDb().exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_relay_name ON relay_sessions(bot_id, session_name)`);
+      } catch { /* ignore if index already exists */ }
+      getDb().prepare(`
+    INSERT INTO relay_sessions (bot_id, session_name, session_id, pid, port, secret, project_dir, capabilities, description, role, registered_at, last_heartbeat)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(bot_id, session_name) DO UPDATE SET
+      session_id = excluded.session_id,
+      pid = excluded.pid,
+      port = excluded.port,
+      secret = excluded.secret,
+      project_dir = excluded.project_dir,
+      capabilities = excluded.capabilities,
+      description = excluded.description,
+      role = excluded.role,
+      last_heartbeat = excluded.last_heartbeat
+  `).run(
+        params.bot_id,
+        params.session_name,
+        params.session_id,
+        params.pid,
+        params.port,
+        params.secret,
+        params.project_dir || null,
+        params.capabilities || null,
+        params.description || null,
+        params.role || "drain",
+        Date.now(),
+        Date.now(),
+      );
+    } else {
+      throw err;
+    }
+  }
 }
 
 /**
@@ -810,7 +985,7 @@ export function updateRelayCapabilities(botId: number, sessionName: string, capa
  * @param botId - Scope to this bot
  * @param sessionName - The session to update
  */
-export function updateRelayRole(botId: number, sessionName: string, role: "active" | "passive"): void {
+export function updateRelayRole(botId: number, sessionName: string, role: "active" | "drain"): void {
   getDb().prepare(`
     UPDATE relay_sessions SET role = ? WHERE bot_id = ? AND session_name = ?
   `).run(role, botId, sessionName);
@@ -1173,4 +1348,65 @@ function mergeLocalSessionNames(): number {
     } catch { /* best effort */ }
   }
   return merged;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// PUB-SUB: Inter-session messaging
+// ═══════════════════════════════════════════════════════════════════════
+
+export interface PubSubMessage {
+  id: number;
+  bot_id: number;
+  channel: string;
+  publisher: string;
+  payload: string;
+  target_session: string | null;
+  consumed_by: string | null;
+  created_at: number;
+  consumed_at: number | null;
+}
+
+/** Publish a message to a channel */
+export function publish(botId: number, channel: string, publisher: string, payload: string, targetSession?: string): number {
+  const db = getDb();
+  const result = db.prepare(
+    "INSERT INTO pubsub (bot_id, channel, publisher, payload, target_session) VALUES (?, ?, ?, ?, ?)"
+  ).run(botId, channel, publisher, payload, targetSession || null);
+  return Number(result.lastInsertRowid);
+}
+
+/** Subscribe: consume all unconsumed messages for a channel (or targeted at this session) */
+export function subscribe(botId: number, sessionName: string, channels: string[]): PubSubMessage[] {
+  const db = getDb();
+  const placeholders = channels.map(() => "?").join(",");
+  // Get unconsumed messages for our channels OR targeted at us
+  const rows = db.prepare(
+    `SELECT * FROM pubsub WHERE bot_id = ? AND consumed_at IS NULL AND (
+      channel IN (${placeholders}) AND (target_session IS NULL OR target_session = ?)
+    ) ORDER BY id ASC`
+  ).all(botId, ...channels, sessionName) as unknown as PubSubMessage[];
+  // Mark as consumed
+  if (rows.length > 0) {
+    const ids = rows.map(r => r.id);
+    db.prepare(
+      `UPDATE pubsub SET consumed_by = ?, consumed_at = ? WHERE id IN (${ids.map(() => "?").join(",")})`
+    ).run(sessionName, Date.now(), ...ids);
+  }
+  return rows;
+}
+
+/** Scan: like subscribe but doesn't consume — just peek */
+export function pubsubScan(botId: number, channels: string[]): PubSubMessage[] {
+  const db = getDb();
+  const placeholders = channels.map(() => "?").join(",");
+  return db.prepare(
+    `SELECT * FROM pubsub WHERE bot_id = ? AND consumed_at IS NULL AND channel IN (${placeholders}) ORDER BY id ASC`
+  ).all(botId, ...channels) as unknown as PubSubMessage[];
+}
+
+/** Clean up old consumed messages */
+export function pubsubPurge(olderThanMs: number = 86400000): number {
+  const db = getDb();
+  const cutoff = Date.now() - olderThanMs;
+  return db.prepare("DELETE FROM pubsub WHERE consumed_at IS NOT NULL AND consumed_at < ?").run(cutoff).changes;
 }

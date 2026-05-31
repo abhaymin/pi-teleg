@@ -37,6 +37,7 @@ export interface TelegramConfig {
   botUsername?: string;
   botId?: number;
   allowedUserIds?: number[];
+  allowedChatIds?: number[];
   lastUpdateId?: number;
   archiveRoot?: string;
 }
@@ -63,21 +64,56 @@ export interface SessionRegistry {
   primaryByBot?: Record<string, string>;
 }
 
+interface BotEntryConfig {
+  botToken?: string;
+  botUsername?: string;
+  botId?: number;
+  allowedUserIds?: number[];
+  allowedChatIds?: number[];
+  lastUpdateId?: number;
+}
+
+interface GlobalConfigV2 {
+  version: 2;
+  defaultBotId?: number;
+  bots?: Record<string, BotEntryConfig>;
+  archiveRoot?: string;
+}
+
 // ============================================================================
 // Config I/O
 // ============================================================================
+
+function flattenV2Config(parsed: GlobalConfigV2): TelegramConfig {
+  const defaultBotId = parsed.defaultBotId;
+  const botEntry = defaultBotId ? parsed.bots?.[String(defaultBotId)] : undefined;
+  if (!botEntry) return { archiveRoot: parsed.archiveRoot };
+  return {
+    botToken: botEntry.botToken,
+    botUsername: botEntry.botUsername,
+    botId: botEntry.botId ?? defaultBotId,
+    allowedUserIds: botEntry.allowedUserIds || [],
+    allowedChatIds: botEntry.allowedChatIds || [],
+    lastUpdateId: botEntry.lastUpdateId || 0,
+    archiveRoot: parsed.archiveRoot,
+  };
+}
 
 export async function readConfig(): Promise<TelegramConfig> {
   const CONFIG_FILE = join(CONFIG_DIR, "teleg-bridge.json");
   try {
     const content = await readFile(CONFIG_FILE, "utf8");
-    const parsed = JSON.parse(content) as TelegramConfig & { allowedUserId?: number };
-    // Migrate old allowedUserId (singular) to allowedUserIds (plural array)
-    if (parsed.allowedUserId && (!parsed.allowedUserIds || parsed.allowedUserIds.length === 0)) {
-      parsed.allowedUserIds = [parsed.allowedUserId];
+    const parsed = JSON.parse(content) as (TelegramConfig & { allowedUserId?: number }) | GlobalConfigV2;
+    if ((parsed as GlobalConfigV2).version === 2 && (parsed as GlobalConfigV2).bots) {
+      return flattenV2Config(parsed as GlobalConfigV2);
     }
-    delete (parsed as Record<string, unknown>).allowedUserId;
-    return parsed;
+    const legacy = parsed as TelegramConfig & { allowedUserId?: number };
+    // Migrate old allowedUserId (singular) to allowedUserIds (plural array)
+    if (legacy.allowedUserId && (!legacy.allowedUserIds || legacy.allowedUserIds.length === 0)) {
+      legacy.allowedUserIds = [legacy.allowedUserId];
+    }
+    delete (legacy as Record<string, unknown>).allowedUserId;
+    return legacy;
   } catch {
     return {};
   }
@@ -86,6 +122,35 @@ export async function readConfig(): Promise<TelegramConfig> {
 export async function writeConfig(cfg: TelegramConfig): Promise<void> {
   const CONFIG_FILE = join(CONFIG_DIR, "teleg-bridge.json");
   await mkdir(CONFIG_DIR, { recursive: true });
+  try {
+    const existing = JSON.parse(await readFile(CONFIG_FILE, "utf8")) as GlobalConfigV2;
+    if (existing.version === 2 && existing.bots && cfg.botToken && cfg.botId) {
+      const key = String(cfg.botId);
+      const current = existing.bots[key] || {};
+      const next: GlobalConfigV2 = {
+        ...existing,
+        version: 2,
+        defaultBotId: cfg.botId,
+        bots: {
+          ...existing.bots,
+          [key]: {
+            ...current,
+            botToken: cfg.botToken,
+            botUsername: cfg.botUsername ?? current.botUsername,
+            botId: cfg.botId,
+            allowedUserIds: cfg.allowedUserIds ?? current.allowedUserIds ?? [],
+            allowedChatIds: cfg.allowedChatIds ?? current.allowedChatIds ?? [],
+            lastUpdateId: cfg.lastUpdateId ?? current.lastUpdateId ?? 0,
+          },
+        },
+        archiveRoot: cfg.archiveRoot ?? existing.archiveRoot,
+      };
+      await writeFile(CONFIG_FILE, JSON.stringify(next, null, "\t") + "\n", "utf8");
+      return;
+    }
+  } catch {
+    // Fall through to legacy flat write.
+  }
   await writeFile(CONFIG_FILE, JSON.stringify(cfg, null, "\t") + "\n", "utf8");
 }
 
@@ -122,6 +187,13 @@ export function isAllowedUser(config: TelegramConfig, userId: number): boolean {
     return false;
   }
   return config.allowedUserIds.includes(userId);
+}
+
+export function isAllowedChat(config: TelegramConfig, chatId: number): boolean {
+  if (!config.allowedChatIds || config.allowedChatIds.length === 0) {
+    return false;
+  }
+  return config.allowedChatIds.includes(chatId);
 }
 
 // ============================================================================

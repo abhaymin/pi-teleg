@@ -233,6 +233,34 @@ export function startRelayServer(
             return;
           }
           
+          // Shutdown signal — other sessions tell us to disconnect
+          if (req.url === "/shutdown" && req.method === "POST") {
+            let body = "";
+            req.on("data", (chunk: Buffer) => (body += chunk.toString()));
+            req.on("end", async () => {
+              try {
+                const { secret: incomingSecret } = JSON.parse(body);
+                if (incomingSecret !== secret) {
+                  res.writeHead(401, { "Content-Type": "application/json" });
+                  res.end(JSON.stringify({ error: "Unauthorized" }));
+                  return;
+                }
+                if (onShutdown) {
+                  onShutdown();
+                  res.writeHead(200, { "Content-Type": "application/json" });
+                  res.end(JSON.stringify({ ok: true, sessionName }));
+                } else {
+                  res.writeHead(404, { "Content-Type": "application/json" });
+                  res.end(JSON.stringify({ error: "No shutdown handler" }));
+                }
+              } catch (err) {
+                res.writeHead(400, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ error: String(err) }));
+              }
+            });
+            return;
+          }
+
           // CORS preflight
           if (req.method === "OPTIONS") {
             res.writeHead(204, {
@@ -248,7 +276,7 @@ export function startRelayServer(
           res.end(JSON.stringify({ error: "Not found" }));
         });
         
-        console.log(`[teleg-relay] Relay server running at http://127.0.0.1:${portToTry} for session "${sessionName}"`);
+
         resolve(relayInfo);
       });
     }
@@ -364,6 +392,13 @@ let onComplete: CompleteHandler | null = null;
 
 export function setCompleteHandler(handler: CompleteHandler): void {
   onComplete = handler;
+}
+
+type ShutdownHandler = () => void;
+let onShutdown: ShutdownHandler | null = null;
+
+export function setShutdownHandler(handler: ShutdownHandler): void {
+  onShutdown = handler;
 }
 
 /**

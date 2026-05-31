@@ -30,12 +30,12 @@ import {
   stopRelayServer,
   setCommandHandler,
   setCompleteHandler,
-  forwardToSession,
+  setShutdownHandler,
   cleanStaleRelayFiles,
   cleanRelayFilesByPid,
 } from "./relay.js";
 import * as Db from "./db.js";
-import { resolveBotContext, detectSplitDb, type BotContext } from "./config.js";
+import { resolveBotContext, detectSplitDb, updateAllowedUsers, type BotContext } from "./config.js";
 import {
   reconcileSessions,
   getSessionLivenessSummary,
@@ -48,6 +48,7 @@ import {
   writeSessionRegistry,
   getSessionId,
   isAllowedUser,
+  isAllowedChat,
   getArchiveRoot,
   type TelegramConfig,
   type SessionInfo,
@@ -68,6 +69,7 @@ import { getPollingManager, type PollState } from "./polling-manager.js";
 // ============================================================================
 
 const DRAIN_INTERVAL_MS = parseInt(process.env.TELEG_DRAIN_INTERVAL_MS || "12000", 10);
+const CLAIM_OTHERS = process.env.TELEG_CLAIM_OTHERS === "1";
 const TELEGRAM_PREFIX = "[telegram]";
 const MAX_MESSAGE_LENGTH = 4096;
 const MAX_ATTACHMENTS_PER_TURN = 10;
@@ -100,6 +102,8 @@ interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
   edited_message?: TelegramMessage;
+  channel_post?: TelegramMessage;
+  edited_channel_post?: TelegramMessage;
 }
 
 interface TelegramApiResponse<T> {
@@ -138,6 +142,7 @@ interface SessionState {
   activeTurn: ActiveTelegramTurn | undefined;
   typingInterval: ReturnType<typeof setInterval> | undefined;
   drainTimer: ReturnType<typeof setInterval> | undefined;
+  livenessTimer: ReturnType<typeof setInterval> | undefined;
   setupInProgress: boolean;
 }
 
@@ -162,7 +167,7 @@ Telegram bridge extension is active.
 
 ## Session Identity & Capabilities
 - This is session "{sessionName}" running in {projectDir}.
-- This session has registered its capabilities with the teleg bridge based on project documentation.
+- This session has registered its capabilities with the teleg bridge based on INFO_REL.md.
 - To declare what this session handles, create an INFO_REL.md in the project root with:
   # INFO_REL
   ## capabilities
@@ -171,7 +176,17 @@ Telegram bridge extension is active.
   What this session does
 - Other sessions with matching capabilities will get relevant messages relayed to them automatically.
 - Messages addressed to a specific session (e.g., "@sessionName ...") are routed directly.
-- If you receive a relayed message from Telegram, process the request and send results back using teleg-send_message, teleg-send_photo, teleg-send_video, or teleg-attach tools.`;
+- If you receive a relayed message from Telegram, process the request and send results back using teleg-send_message, teleg-send_photo, teleg-send_video, or teleg-attach tools.
+
+## Sub-Agent & Multi-Session Routing
+- This extension supports multi-session routing. Multiple pi sessions can connect to the same bot.
+- Each session reads its INFO_REL.md to declare capabilities. Messages are auto-routed based on content.
+- To delegate work to another session from Telegram, use @sessionName prefix (e.g., "@data-scrapper download this video").
+- To delegate work programmatically, use teleg-send_message to notify the user and forward messages via the relay.
+- All connected sessions are active. Each session independently drains its queue based on capabilities.
+- Kill-switches: /teleg-dc disconnects this session, /teleg-dc-all disconnects all sessions without cleaning DB state.
+- Cleanup switches are separate: /teleg-clean-db resets queue state; /teleg-remove-sessions removes stale session registry records.
+- teleg-disconnect, teleg-disconnect-all, teleg-clean-db, and teleg-remove-sessions MCP tools provide the same from any pi session.`;
 
 // ============================================================================
 // Pending Forward Queue (relay commands awaiting agent processing)
@@ -325,6 +340,7 @@ function createSessionState(sessionId: string): SessionState {
     activeTurn: undefined,
     typingInterval: undefined,
     drainTimer: undefined,
+    livenessTimer: undefined,
     setupInProgress: false,
   };
 }
@@ -339,14 +355,86 @@ export default function (pi: ExtensionAPI): void {
   const sessionName = cwd.split("/").filter(Boolean).pop() || "default";
   let state: SessionState = createSessionState(sessionId);
 
+  function normalizeConfigFromBotContext(botContext: BotContext): void {
+    state.config = {
+      ...state.config,
+      botToken: botContext.botToken,
+      botUsername: botContext.botUsername,
+      botId: botContext.botId,
+      allowedUserIds: botContext.allowedUserIds || [],
+      allowedChatIds: botContext.allowedChatIds || [],
+      lastUpdateId: botContext.lastUpdateId,
+    };
+  }
+
+  function currentBotId(): number | undefined {
+    const botId = state.botContext?.botId ?? state.config.botId;
+    return botId && botId > 0 ? botId : undefined;
+  }
+
+  function currentBotToken(): string | undefined {
+    return state.botContext?.botToken || state.config.botToken;
+  }
+
+  function currentAllowedUserIds(): number[] {
+    return state.botContext?.allowedUserIds || state.config.allowedUserIds || [];
+  }
+
+  function currentAllowedChatIds(): number[] {
+    return state.botContext?.allowedChatIds || state.config.allowedChatIds || [];
+  }
+
+  function getUpdateMessage(update: TelegramUpdate): TelegramMessage | undefined {
+    return update.message || update.edited_message || update.channel_post || update.edited_channel_post;
+  }
+
+  function normalizeTelegramCommand(text: string): string {
+    return text.replace(/^\/([a-z0-9_-]+)@[^\s]+/i, "/$1");
+  }
+
+  function isAuthorizedTelegramMessage(message: TelegramMessage): boolean {
+    const text = normalizeTelegramCommand((message.text || message.caption || "").toLowerCase());
+    const allowInitialPrivatePairing =
+      currentAllowedUserIds().length === 0 &&
+      message.chat.type === "private" &&
+      (text === "/start" || text === "/help");
+
+    if (allowInitialPrivatePairing) return true;
+    if (message.from && !message.from.is_bot && isAllowedUser(state.config, message.from.id)) return true;
+    return isAllowedChat(state.config, message.chat.id);
+  }
+
+  function currentDbPath(): string {
+    return state.botContext?.dbPath ?? join(homedir(), ".pi", "agent", "teleg-bridge.db");
+  }
+
+  function currentPollingManager(): ReturnType<typeof getPollingManager> | null {
+    const botId = currentBotId();
+    return botId ? getPollingManager(botId) : null;
+  }
+
+  async function refreshBotContext(): Promise<void> {
+    state.botContext = await resolveBotContext(cwd);
+    normalizeConfigFromBotContext(state.botContext);
+    const pm = getPollingManager(state.botContext.botId);
+    pm.setConfig(state.botContext.botToken, state.botContext.lastUpdateId);
+    pm.setBotInfo({ username: state.botContext.botUsername, displayName: state.botContext.botUsername });
+  }
+
   // ─── Status UI ────────────────────────────────────────────────────────
 
   function updateStatus(ctx: ExtensionContext, error?: string): void {
     const theme = ctx.ui.theme;
     const label = `${theme.fg("accent", "teleg")}${theme.fg("muted", ":" + sessionName)}`;
 
-    const pm = getPollingManager(state.botContext?.botId ?? 0);
-    const pollState = pm.getState();
+    const pm = currentPollingManager();
+    const pollState = pm?.getState() ?? {
+      consecutiveErrors: 0,
+      reconnectDelay: 1000,
+      lastSuccessfulPoll: Date.now(),
+      isHealthy: true,
+      lastHealthCheck: Date.now(),
+    };
     const healthIndicator = pollState.isHealthy ? "✓" : "✗";
     const errorIndicator = pollState.consecutiveErrors > 0
       ? ` [${pollState.consecutiveErrors} errs]`
@@ -356,30 +444,30 @@ export default function (pi: ExtensionAPI): void {
       ctx.ui.setStatus("teleg-bridge", `${label} ${theme.fg("error", "error")} ${theme.fg("muted", error)}${errorIndicator}`);
       return;
     }
-    if (!state.config.botToken) {
+    if (!currentBotToken() || !pm) {
       ctx.ui.setStatus("teleg-bridge", `${label} ${theme.fg("muted", "not configured")}`);
       return;
     }
-    if (!pm.isActive()) {
-      if (pm.isHeldByOther()) {
-        ctx.ui.setStatus("teleg-bridge", `${label} ${theme.fg("muted", "passive")}`);
-      } else {
-        ctx.ui.setStatus("teleg-bridge", `${label} ${theme.fg("warning", "reconnecting...")}`);
-      }
+    if (!pm.isActive() && !pm.isHeldByOther()) {
+      ctx.ui.setStatus("teleg-bridge", `${label} ${theme.fg("warning", "reconnecting...")}`);
       return;
     }
-    if (!state.config.allowedUserIds || state.config.allowedUserIds.length === 0) {
-      ctx.ui.setStatus("teleg-bridge", `${label} ${theme.fg("warning", "awaiting pairing")}`);
-      return;
-    }
-
+    // All sessions are active — show queue depth whether polling or drain-only
     const queueDepth = pm.getQueueDepth();
+    const selfQueue = Db.getPendingCountForSession(pm.botId, sessionName);
     const activeIndicator = state.activeTurn
       ? theme.fg("accent", "●")
       : theme.fg("success", healthIndicator);
     const queued = queueDepth > 0 ? ` +${queueDepth}` : "";
+    const selfQ = selfQueue > 0 ? ` [${selfQueue}]` : "";
+    ctx.ui.setStatus("teleg-bridge", `${label} ${activeIndicator}${queued}${selfQ}${errorIndicator}`);
+    return;
+    if (currentAllowedUserIds().length === 0) {
+      ctx.ui.setStatus("teleg-bridge", `${label} ${theme.fg("warning", "awaiting pairing")}`);
+      return;
+    }
 
-    ctx.ui.setStatus("teleg-bridge", `${label} ${activeIndicator}${queued}${errorIndicator}`);
+    // (status set above for all cases)
   }
 
   // ─── Session lifecycle ────────────────────────────────────────────────
@@ -475,44 +563,75 @@ export default function (pi: ExtensionAPI): void {
 
   // ─── Message handling ─────────────────────────────────────────────────
 
-  async function handleAuthorizedTelegramMessage(message: TelegramMessage, ctx: ExtensionContext): Promise<void> {
+  function assignIncomingToSession(message: TelegramMessage, targetSessionName: string, dbId?: number): void {
+    if (typeof dbId === "number") {
+      Db.assignMessageToSession(dbId, targetSessionName);
+      return;
+    }
+    const botId = currentBotId();
+    if (!botId) return;
+    Db.assignTelegramMessageToSession(botId, message.chat.id, message.message_id, targetSessionName);
+  }
+
+  function markIncomingProcessing(dbId: number | undefined): void {
+    if (typeof dbId !== "number") return;
+    Db.markMessageProcessing(dbId, sessionId, sessionName);
+  }
+
+  function completeIncoming(dbId: number | undefined): void {
+    if (typeof dbId !== "number") return;
+    Db.completeMessage(dbId);
+  }
+
+  async function handleAuthorizedTelegramMessage(message: TelegramMessage, ctx: ExtensionContext, dbId?: number): Promise<void> {
     const rawText = message.text || message.caption || "";
     const sessionTagMatch = rawText.match(/^@(\S+)\s*/);
     const cleanText = sessionTagMatch ? rawText.replace(sessionTagMatch[0], "") : rawText;
     const targetSessionName = sessionTagMatch ? sessionTagMatch[1] : null;
 
-    // @sessionName prefix → forward via relay
+    // @sessionName prefix → queue the message for that session.
+    // Queue-based delivery gives the target session reliable queue management,
+    // service activeness, retries/recovery, and status visibility.
     if (targetSessionName && targetSessionName !== sessionName) {
-      try {
-        Db.getDb().prepare(
-          "UPDATE message_queue SET session_name = ?, session_id = ? WHERE chat_id = ? AND message_id = ? AND status = 'pending'"
-        ).run(targetSessionName, targetSessionName, message.chat.id, message.message_id);
-      } catch {}
+      assignIncomingToSession(message, targetSessionName, dbId);
+      if (state.config.botToken) {
+        const pending = Db.getPendingCountForSession(currentBotId() || 0, targetSessionName);
+        await sendReply(state.config.botToken, String(message.chat.id), message.message_id,
+          `📥 Queued for @${targetSessionName} (${pending} pending)`);
+      }
+      return;
+    }
 
-      const forwardResult = await forwardToSession(
-        targetSessionName,
-        cleanText,
-        { chatId: message.chat.id, messageId: message.message_id, sourceSession: sessionName },
-      );
-      if (forwardResult.ok) {
-        if (forwardResult.response && state.config.botToken) {
-          await sendReply(state.config.botToken, String(message.chat.id), message.message_id, forwardResult.response);
+    // No @mention → auto-route based on capabilities
+    if (!targetSessionName) {
+      const botId = state.botContext?.botId;
+      if (botId) {
+        const capReg = await readCapabilitiesRegistry();
+        // Only consider alive sessions that are NOT this session
+        const aliveEntries = capReg.entries.filter(e => {
+          if (e.sessionName === sessionName) return false;
+          try { process.kill(e.pid, 0); return true; } catch { return false; }
+        });
+        const match = matchMessageToCapability(cleanText, aliveEntries);
+        if (match) {
+          assignIncomingToSession(message, match.sessionName, dbId);
+          if (state.config.botToken) {
+            const pending = Db.getPendingCountForSession(botId, match.sessionName);
+            await sendReply(state.config.botToken, String(message.chat.id), message.message_id,
+              `📥 Queued for @${match.sessionName} (${match.capabilities.join(", ")}; ${pending} pending)`);
+          }
+          return;
         }
-        return;
-      } else {
-        if (state.config.botToken) {
-          await sendReply(state.config.botToken, String(message.chat.id), message.message_id, `⚠️ Could not reach @${targetSessionName}: ${forwardResult.error}`);
-        }
-        return;
       }
     }
 
-    const lower = cleanText.toLowerCase();
+    const lower = normalizeTelegramCommand(cleanText.toLowerCase());
+    if (lower === "stop" || lower.startsWith("/")) completeIncoming(dbId);
 
     if (lower === "stop" || lower === "/stop") {
       if (state.activeTurn) {
         const turnDbId = state.activeTurn.dbId;
-        state.activeTurn = undefined;
+        deactivateTurn();
         completeTurn(turnDbId);
         updateStatus(ctx);
         if (state.config.botToken) {
@@ -526,13 +645,115 @@ export default function (pi: ExtensionAPI): void {
       return;
     }
 
-    if (lower === "/help" || lower === "/start") {
-      if (state.config.botToken) {
-        await sendReply(state.config.botToken, String(message.chat.id), message.message_id, `Teleg-Bridge Active! (this session: ${sessionName})\n\nSend any message to forward to pi.\nPrefix with @sessionName to route to a specific session.\nInclude Twitter/X URLs for automatic media download.\n\nCommands:\n/status - All sessions, relay state & queue\n/queue [session] - Queue for session (or primary)\n/compact - Compact memory\n/health - Test connection\n/healthfull - Full health diagnostic\nstop - Abort current turn`);
+    // ─── Kill-switch commands ────────────────────────────────────────
+
+    if (lower === "/teleg-dc" || lower === "/teleg-disconnect") {
+      // Kill THIS session only
+      if (state.activeTurn) {
+        completeTurn(state.activeTurn.dbId);
+        deactivateTurn();
       }
-      if (!state.config.allowedUserIds || state.config.allowedUserIds.length === 0) {
-        state.config.allowedUserIds = [message.from!.id];
-        await writeConfig(state.config);
+      if (state.drainTimer) { clearInterval(state.drainTimer); state.drainTimer = undefined; }
+      if (state.livenessTimer) { clearInterval(state.livenessTimer); state.livenessTimer = undefined; }
+      const pm = currentPollingManager();
+      if (pm && pm.isActive()) await pm.stop();
+      stopRelayServer();
+      stopTyping();
+      await unregisterSessionCapabilities(sessionId);
+      await unregisterSession();
+      const botId = currentBotId();
+      if (botId) Db.unregisterRelaySession(botId, sessionName);
+      const botToken = currentBotToken();
+      if (botToken) {
+        await sendReply(botToken, String(message.chat.id), message.message_id, `🔌 Disconnected session: <b>${sessionName}</b>`);
+      }
+      updateStatus(ctx);
+      return;
+    }
+
+    if (lower === "/teleg-dc-all" || lower === "/teleg-disconnect-all") {
+      // Kill ALL sessions only. Do NOT clean queue DB or remove registry records here.
+      if (state.activeTurn) {
+        completeTurn(state.activeTurn.dbId);
+        deactivateTurn();
+      }
+      if (state.drainTimer) { clearInterval(state.drainTimer); state.drainTimer = undefined; }
+      if (state.livenessTimer) { clearInterval(state.livenessTimer); state.livenessTimer = undefined; }
+      const pm = currentPollingManager();
+      if (pm && pm.isActive()) await pm.stop();
+      const registry = await readSessionRegistry();
+      for (const s of registry.sessions) {
+        if (s.sessionId === sessionId) continue;
+        try { process.kill(s.pid, 9); } catch { /* already dead */ }
+        cleanRelayFilesByPid(s.pid);
+      }
+      stopRelayServer();
+      stopTyping();
+      await unregisterSessionCapabilities(sessionId);
+      await unregisterSession();
+      const botToken = currentBotToken();
+      if (botToken) {
+        await sendReply(botToken, String(message.chat.id), message.message_id, `🔌 Disconnected ALL sessions (${registry.sessions.length} signalled). DB unchanged.`);
+      }
+      updateStatus(ctx);
+      return;
+    }
+
+    if (lower === "/teleg-clean-db") {
+      const reset = Db.resetAllProcessing();
+      const purged = Db.purgeOldMessages(500);
+      const botToken = currentBotToken();
+      if (botToken) {
+        await sendReply(botToken, String(message.chat.id), message.message_id, `🧹 DB cleaned: ${reset} processing reset, ${purged} old messages purged.`);
+      }
+      return;
+    }
+
+    if (lower === "/teleg-remove-sessions") {
+      const botId = currentBotId();
+      const registry = await readSessionRegistry();
+      const removed: string[] = [];
+      for (const s of registry.sessions) {
+        try { process.kill(s.pid, 0); } catch {
+          removed.push(s.sessionName);
+          cleanRelayFilesByPid(s.pid);
+          if (botId) Db.unregisterRelaySession(botId, s.sessionName);
+        }
+      }
+      registry.sessions = registry.sessions.filter(s => !removed.includes(s.sessionName));
+      await writeSessionRegistry(registry);
+      const botToken = currentBotToken();
+      if (botToken) {
+        await sendReply(botToken, String(message.chat.id), message.message_id, `🗑 Removed ${removed.length} dead session(s): ${removed.join(", ") || "none"}`);
+      }
+      updateStatus(ctx);
+      return;
+    }
+
+    if (lower === "/help" || lower === "/start") {
+      const botToken = currentBotToken();
+      if (botToken) {
+        await sendReply(botToken, String(message.chat.id), message.message_id, `Teleg-Bridge Active! (this session: ${sessionName})\n\nSend any message to forward to pi.\nPrefix with @sessionName to route to a specific session.\nInclude Twitter/X URLs for automatic media download.\n\nCommands:\n/status - All sessions, relay state & queue\n/chatid - Show current chat/user IDs for group/channel setup\n/queue [session] - Queue for session (or primary)\n/teleg-dc - Disconnect THIS session\n/teleg-dc-all - Disconnect ALL sessions, DB unchanged\n/teleg-clean-db - Reset processing queue + purge old entries\n/teleg-remove-sessions - Remove dead session registry records\n/compact - Compact memory\n/health - Test connection\n/healthfull - Full health diagnostic\nstop - Abort current turn`);
+      }
+      if (currentAllowedUserIds().length === 0) {
+        const ids = [message.from!.id];
+        state.config.allowedUserIds = ids;
+        if (state.botContext) state.botContext.allowedUserIds = ids;
+        const botId = currentBotId();
+        if (botId) await updateAllowedUsers(botId, ids);
+        else await writeConfig(state.config);
+      }
+      return;
+    }
+
+    if (lower === "/chatid") {
+      const botToken = currentBotToken();
+      if (botToken) {
+        await sendReply(botToken, String(message.chat.id), message.message_id, [
+          `<b>Chat</b>: ${message.chat.id}`,
+          `<b>Type</b>: ${message.chat.type}`,
+          message.from ? `<b>User</b>: ${message.from.id}${message.from.username ? ` (@${message.from.username})` : ""}` : `<b>User</b>: unavailable (channel/anonymous post)`,
+        ].join("\n"));
       }
       return;
     }
@@ -548,20 +769,22 @@ export default function (pi: ExtensionAPI): void {
     }
 
     if (lower === "/health") {
-      const pm = getPollingManager(state.botContext?.botId ?? 0);
-      const health = pm.getState();
-      if (state.config.botToken) {
-        await sendReply(state.config.botToken, String(message.chat.id), message.message_id,
-          health.isHealthy ? "✅ Bot connection OK" : "⚠️ Connection issues detected. Auto-reconnecting...");
+      const pm = currentPollingManager();
+      const health = pm?.getState();
+      const botToken = currentBotToken();
+      if (botToken) {
+        await sendReply(botToken, String(message.chat.id), message.message_id,
+          health?.isHealthy !== false ? "✅ Bot connection OK" : "⚠️ Connection issues detected. Auto-reconnecting...");
       }
       return;
     }
 
     if (lower === "/healthfull") {
-      const pm = getPollingManager(state.botContext?.botId ?? 0);
-      const health = pm.getState();
-      if (state.config.botToken) {
-        await sendReply(state.config.botToken, String(message.chat.id), message.message_id, [
+      const pm = currentPollingManager();
+      const health = pm?.getState();
+      const botToken = currentBotToken();
+      if (botToken && health) {
+        await sendReply(botToken, String(message.chat.id), message.message_id, [
           `last successful poll: ${new Date(health.lastSuccessfulPoll).toISOString()}`,
           `last health check: ${new Date(health.lastHealthCheck).toISOString()}`,
           `is healthy: ${health.isHealthy}`,
@@ -679,7 +902,23 @@ export default function (pi: ExtensionAPI): void {
       return;
     }
 
-    // Regular message — send to agent
+    // Regular message — queue if this session is already processing, otherwise send to the agent immediately.
+    if (!ctx.isIdle() || state.activeTurn) {
+      assignIncomingToSession(message, sessionName, dbId);
+      if (state.config.botToken) {
+        const botId = currentBotId();
+        const pending = botId ? Db.getPendingCountForSession(botId, sessionName) : 0;
+        await sendReply(
+          state.config.botToken,
+          String(message.chat.id),
+          message.message_id,
+          `📥 Queued for @${sessionName}${pending > 0 ? ` (${pending} pending)` : ""}`
+        );
+      }
+      return;
+    }
+
+    markIncomingProcessing(dbId);
     const turn: PendingTelegramTurn = {
       sessionId,
       sessionName,
@@ -688,9 +927,10 @@ export default function (pi: ExtensionAPI): void {
       queuedAttachments: [],
       content: [{ type: "text", text: `${TELEGRAM_PREFIX} ${rawText}` }],
       historyText: rawText || "(no text)",
+      dbId,
     };
 
-    state.activeTurn = turn as ActiveTelegramTurn;
+    activateTurn(turn as ActiveTelegramTurn);
     updateStatus(ctx);
     pi.sendUserMessage(turn.content);
   }
@@ -698,17 +938,24 @@ export default function (pi: ExtensionAPI): void {
   // ─── Command handlers ─────────────────────────────────────────────────
 
   async function handleStatusCommand(message: TelegramMessage, ctx: ExtensionContext): Promise<void> {
-    if (!state.config.botToken) return;
+    const botToken = currentBotToken();
+    if (!botToken) return;
 
-    const pm = getPollingManager(state.botContext?.botId ?? 0);
-    const pollState = pm.getState();
-    const botInfo = pm.getBotInfo();
-    const botId = state.botContext?.botId;
+    const pm = currentPollingManager();
+    const pollState = pm?.getState() ?? {
+      consecutiveErrors: 0,
+      reconnectDelay: 1000,
+      lastSuccessfulPoll: Date.now(),
+      isHealthy: true,
+      lastHealthCheck: Date.now(),
+    };
+    const botInfo = pm?.getBotInfo();
+    const botId = currentBotId();
     const { listConfiguredBots } = await import("./config.js");
     const allBots = await listConfiguredBots();
 
-    const pollingStatus = pm.isActive() ? "✅ active"
-      : pm.isHeldByOther() ? "🔁 passive"
+    const pollingStatus = pm?.isActive() ? "✅ polling"
+      : pm?.isHeldByOther() ? "✅ active (shared bot)"
       : "⏹ stopped";
 
     let pollerInfo = "";
@@ -720,7 +967,7 @@ export default function (pi: ExtensionAPI): void {
     const lines: string[] = [
       `<b>═══ Teleg Bridge Status ═══</b>`,
       ``,
-      `🤖 <b>Bot:</b> ${botInfo.username ? `@${botInfo.username}` : "not configured"}${botId ? ` [id:${botId}]` : ""}`,
+      `🤖 <b>Bot:</b> ${botInfo?.username ? `@${botInfo.username}` : state.config.botUsername || "not configured"}${botId ? ` [id:${botId}]` : ""}`,
       `📡 <b>Polling:</b> ${pollingStatus}${pollerInfo}`,
       `💚 <b>Health:</b> ${pollState.isHealthy ? "OK" : `DEGRADED (${pollState.consecutiveErrors} errs)`}`,
     ];
@@ -756,10 +1003,11 @@ export default function (pi: ExtensionAPI): void {
     const registry = await readSessionRegistry();
     for (const s of registry.sessions) {
       const isSelf = s.sessionId === sessionId;
-      const pm2 = getPollingManager(state.botContext?.botId ?? 0);
-      const hasActiveTurn = pm2.hasActiveTurnFor(s.sessionId);
-      const role = s.sessionId === sessionId ? (pm2.isActive() ? "active" : "passive") : "relay";
       const relayInfo = botId ? Db.getRelaySession(botId, s.sessionName) : null;
+      const q = botId ? Db.getQueueStatsForSession(botId, s.sessionName) : { pending: 0, processing: 0, completed: 0, failed: 0, total: 0 };
+      const hasActiveTurn = q.processing > 0;
+      const role = relayInfo?.role === "active" || relayInfo?.is_primary ? "poller" : "drain";
+      const queueTag = q.pending > 0 || q.processing > 0 ? ` (${q.pending} queued, ${q.processing} active)` : "";
       const relayAlive = relayInfo !== null;
       const isPrimary = relayInfo?.is_primary ?? false;
       const caps = relayInfo?.capabilities ? JSON.parse(relayInfo.capabilities).join(", ") : "—";
@@ -774,15 +1022,17 @@ export default function (pi: ExtensionAPI): void {
 
       lines.push(``);
       lines.push(`  ${statusIcon} <b>${s.sessionName}</b>${primaryTag}${activeTag}${selfTag}`);
-      lines.push(`    role: ${role} | caps: ${capList}`);
+      lines.push(`    role: ${role}${queueTag} | caps: ${capList}`);
+      lines.push(`    queue: ${q.pending} pending · ${q.processing} active · ${q.completed} done · ${q.failed} failed`);
       lines.push(`    pid: ${s.pid}`);
     }
 
-    await sendReply(state.config.botToken, String(message.chat.id), message.message_id, lines.join("\n"));
+    await sendReply(botToken, String(message.chat.id), message.message_id, lines.join("\n"));
   }
 
   async function handleQueueCommand(message: TelegramMessage, cleanText: string): Promise<void> {
-    if (!state.config.botToken) return;
+    const botToken = currentBotToken();
+    if (!botToken) return;
 
     const parts = cleanText.trim().split(/\s+/);
     const targetName = parts.length > 1 ? parts[1] : sessionName;
@@ -791,24 +1041,26 @@ export default function (pi: ExtensionAPI): void {
     const targetSession = registry.sessions.find(s => s.sessionName === targetName);
 
     if (!targetSession && targetName !== sessionName) {
-      await sendReply(state.config.botToken, String(message.chat.id), message.message_id,
+      await sendReply(botToken, String(message.chat.id), message.message_id,
         `❌ Session "${targetName}" not found. Active: ${registry.sessions.map(s => s.sessionName).join(", ")}`);
       return;
     }
 
+    const botId = currentBotId() || 0;
     const d = Db.getDb();
-    const stats = d.prepare(
-      `SELECT status, COUNT(*) as c FROM message_queue WHERE session_name = ? GROUP BY status`
-    ).all(targetName) as Array<{ status: string; c: number }>;
+    const normalizedTarget = Db.normalizeSessionName(targetName);
+    const queueStats = Db.getQueueStatsForSession(botId, normalizedTarget);
 
-    const pending = stats.find(s => s.status === "pending")?.c || 0;
-    const processing = stats.find(s => s.status === "processing")?.c || 0;
-    const completed = stats.find(s => s.status === "completed")?.c || 0;
-    const failed = stats.find(s => s.status === "failed")?.c || 0;
+    const pending = queueStats.pending;
+    const processing = queueStats.processing;
+    const completed = queueStats.completed;
+    const failed = queueStats.failed;
 
     const recent = d.prepare(
-      `SELECT id, text, status, created_at, completed_at, error FROM message_queue WHERE session_name = ? ORDER BY id DESC LIMIT 10`
-    ).all(targetName) as Array<{ id: number; text: string; status: string; created_at: number; completed_at: number | null; error: string | null }>;
+      `SELECT id, text, status, created_at, completed_at, error FROM message_queue
+       WHERE bot_id = ? AND (session_name = ? OR session_id = ? OR session_name = ?)
+       ORDER BY id DESC LIMIT 10`
+    ).all(botId, normalizedTarget, `__session__:${normalizedTarget}`, `__session__:${normalizedTarget}`) as Array<{ id: number; text: string; status: string; created_at: number; completed_at: number | null; error: string | null }>;
 
     const lines: string[] = [
       `<b>📋 Queue: ${targetName}</b>`,
@@ -828,18 +1080,20 @@ export default function (pi: ExtensionAPI): void {
 
     if (recent.length === 0) lines.push("  (empty)");
 
-    await sendReply(state.config.botToken, String(message.chat.id), message.message_id, lines.join("\n"));
+    await sendReply(botToken, String(message.chat.id), message.message_id, lines.join("\n"));
   }
 
   // ─── Turn completion ─────────────────────────────────────────────────
 
   function completeTurn(dbId?: number): void {
-    const pm = getPollingManager(state.botContext?.botId ?? 0);
+    const pm = currentPollingManager();
+    if (!pm) return;
     pm.completeTurn(sessionId, dbId);
   }
 
   function claimNextTurn(): { turn: PendingTelegramTurn; update: TelegramUpdate; dbId: number } | null {
-    const pm = getPollingManager(state.botContext?.botId ?? 0);
+    const pm = currentPollingManager();
+    if (!pm) return null;
     const result = pm.claimNextTurn(sessionId, sessionName);
     if (!result) return null;
     // Cast to match our internal PendingTelegramTurn which uses Array<{type: "text" | string}> for content
@@ -847,10 +1101,73 @@ export default function (pi: ExtensionAPI): void {
   }
 
   function claimNextTurnForSession(): { turn: PendingTelegramTurn; update: TelegramUpdate; dbId: number } | null {
-    const pm = getPollingManager(state.botContext?.botId ?? 0);
+    const pm = currentPollingManager();
+    if (!pm) return null;
     const result = pm.claimNextTurnForSession(sessionName);
     if (!result) return null;
     return result as { turn: PendingTelegramTurn; update: TelegramUpdate; dbId: number };
+  }
+
+  // ─── Typing indicator ──────────────────────────────────────────────
+
+  function startTyping(chatId: number): void {
+    if (state.typingInterval) return;
+    const botToken = currentBotToken();
+    if (!botToken) return;
+    const send = async () => {
+      try {
+        await fetch(`https://api.telegram.org/bot${botToken}/sendChatAction`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ chat_id: chatId, action: "typing" }),
+        });
+      } catch {}
+    };
+    void send();
+    state.typingInterval = setInterval(() => void send(), 4000);
+  }
+
+  function stopTyping(): void {
+    if (!state.typingInterval) return;
+    clearInterval(state.typingInterval);
+    state.typingInterval = undefined;
+  }
+
+  // ─── Turn activation helper ──────────────────────────────────────
+
+  function activateTurn(turn: ActiveTelegramTurn): void {
+    state.activeTurn = turn;
+    startTyping(turn.chatId);
+  }
+
+  function deactivateTurn(): void {
+    stopTyping();
+    state.activeTurn = undefined;
+  }
+
+  async function monitorDeadSessions(): Promise<{ removed: string[] }>{
+    const botId = state.botContext?.botId;
+    if (!botId) return { removed: [] };
+    const registry = await readSessionRegistry();
+    const removed: string[] = [];
+    for (const s of registry.sessions) {
+      if (s.sessionId === sessionId) continue;
+      try { process.kill(s.pid, 0); } catch {
+        // Dead session — clean up immediately
+        removed.push(s.sessionName);
+        cleanRelayFilesByPid(s.pid);
+        Db.unregisterRelaySession(botId, s.sessionName);
+        // Reset any processing messages owned by the dead session
+        Db.getDb().prepare(
+          "UPDATE message_queue SET status = 'pending', session_id = 'unassigned', session_name = 'unknown', started_at = NULL WHERE session_name = ? AND status = 'processing'"
+        ).run(s.sessionName);
+      }
+    }
+    if (removed.length > 0) {
+      registry.sessions = registry.sessions.filter(s => !removed.includes(s.sessionName));
+      await writeSessionRegistry(registry);
+    }
+    return { removed };
   }
 
   // ─── Drain one (used in agent_end) ───────────────────────────────────
@@ -868,7 +1185,7 @@ export default function (pi: ExtensionAPI): void {
         content: [{ type: "text", text: `${TELEGRAM_PREFIX} ${next.text}` }],
         historyText: next.text,
       };
-      state.activeTurn = turn as ActiveTelegramTurn;
+      activateTurn(turn as ActiveTelegramTurn);
       pi.sendUserMessage(turn.content, { deliverAs: "steer" });
       return true;
     }
@@ -876,20 +1193,59 @@ export default function (pi: ExtensionAPI): void {
     // 2. Our own session's pending messages
     const queued = claimNextTurnForSession();
     if (queued) {
-      state.activeTurn = queued.turn as ActiveTelegramTurn;
+      activateTurn(queued.turn as ActiveTelegramTurn);
       pi.sendUserMessage(queued.turn.content, { deliverAs: "steer" });
       return true;
     }
 
-    // 3. Unassigned messages (cross-session help)
-    const queueMsg = claimNextTurn();
-    if (queueMsg) {
-      state.activeTurn = queueMsg.turn as ActiveTelegramTurn;
-      pi.sendUserMessage(queueMsg.turn.content, { deliverAs: "steer" });
-      return true;
+    // 3. Optional unassigned messages (cross-session help)
+    if (CLAIM_OTHERS) {
+      const queueMsg = claimNextTurn();
+      if (queueMsg) {
+        activateTurn(queueMsg.turn as ActiveTelegramTurn);
+        pi.sendUserMessage(queueMsg.turn.content, { deliverAs: "steer" });
+        return true;
+      }
     }
 
     return false;
+  }
+
+  async function saveVerifiedBotConfig(token: string, botInfo: TelegramUser): Promise<void> {
+    const newConfig: TelegramConfig = {
+      ...state.config,
+      botToken: token.trim(),
+      botUsername: botInfo.username,
+      botId: botInfo.id,
+      allowedUserIds: currentAllowedUserIds(),
+    };
+    await writeConfig(newConfig);
+    state.config = newConfig;
+    await refreshBotContext().catch(() => {
+      state.config = newConfig;
+      const pm = getPollingManager(botInfo.id);
+      pm.setConfig(newConfig.botToken ?? "", newConfig.lastUpdateId ?? 0);
+      pm.setBotInfo({ username: botInfo.username ?? null, displayName: botInfo.username ?? botInfo.first_name });
+    });
+  }
+
+  async function startCurrentPolling(ctx: ExtensionContext, message = "Reconnecting to Telegram..."): Promise<void> {
+    const pm = currentPollingManager();
+    const token = currentBotToken();
+    if (!pm || !token) {
+      ctx.ui.notify("No Telegram bot token configured. Run /teleg-setup first.", "error");
+      updateStatus(ctx);
+      return;
+    }
+    pm.setConfig(token, state.config.lastUpdateId ?? state.botContext?.lastUpdateId ?? 0);
+    const started = await pm.start(sessionName, currentDbPath());
+    const botId = currentBotId();
+    if (botId) {
+      Db.updateRelayRole(botId, sessionName, started ? "active" : "drain");
+      if (started) Db.setPrimary(botId, sessionName);
+    }
+    updateStatus(ctx);
+    ctx.ui.notify(message, "info");
   }
 
   // ─── Commands ──────────────────────────────────────────────────────────
@@ -909,26 +1265,10 @@ export default function (pi: ExtensionAPI): void {
           return;
         }
 
-        const newConfig: TelegramConfig = {
-          ...state.config,
-          botToken: token.trim(),
-          botUsername: botInfo.username,
-          botId: botInfo.id,
-          allowedUserIds: state.config.allowedUserIds || [],
-        };
-
-        await writeConfig(newConfig);
-        state.config = newConfig;
-
+        await saveVerifiedBotConfig(token, botInfo);
         ctx.ui.notify(`Teleg-bridge connected: @${botInfo.username}`, "info");
         ctx.ui.notify("Send /start to your bot in Telegram to pair.", "info");
-
-        // Wire config into polling manager
-        const pm = getPollingManager(newConfig.botId ?? 0);
-        pm.setConfig(newConfig.botToken ?? "", newConfig.lastUpdateId ?? 0);
-        pm.setBotInfo({ username: botInfo.username ?? null, displayName: botInfo.username ?? botInfo.first_name });
-        await pm.start(sessionName, state.botContext?.dbPath ?? join(homedir(), ".pi", "agent", "teleg-bridge.db"));
-        updateStatus(ctx);
+        await startCurrentPolling(ctx, "Polling started.");
       } finally {
         state.setupInProgress = false;
       }
@@ -938,12 +1278,12 @@ export default function (pi: ExtensionAPI): void {
   pi.registerCommand("teleg-status", {
     description: "Show teleg-bridge status",
     handler: async (_args, ctx) => {
-      const pm = getPollingManager(state.botContext?.botId ?? 0);
-      const health = pm.getState();
-      const botInfo = pm.getBotInfo();
+      const pm = currentPollingManager();
+      const health = pm?.getState();
+      const botInfo = pm?.getBotInfo();
       const registry = await readSessionRegistry();
       ctx.ui.notify(
-        `bot: ${botInfo.username || "?"} | polling: ${pm.isActive() ? "running" : "stopped"} | sessions: ${registry.sessions.length} | health: ${health.isHealthy ? "OK" : "DEGRADED"}`,
+        `bot: ${botInfo?.username || state.config.botUsername || "?"} | polling: ${pm?.isActive() ? "running" : "stopped"} | sessions: ${registry.sessions.length} | health: ${health?.isHealthy !== false ? "OK" : "DEGRADED"}`,
         "info"
       );
     },
@@ -952,33 +1292,16 @@ export default function (pi: ExtensionAPI): void {
   pi.registerCommand("teleg-connect", {
     description: "Start teleg-bridge polling",
     handler: async (_args, ctx) => {
-      if (!state.config.botToken) {
-        await ctx.ui.input("Telegram bot token", "123456:ABCDEF...").then(async (token) => {
-          if (!token) return;
-          const botInfo = await verifyToken(token);
-          if (!botInfo) { ctx.ui.notify("Invalid Telegram bot token", "error"); return; }
-          const newConfig: TelegramConfig = {
-            ...state.config,
-            botToken: token.trim(),
-            botUsername: botInfo.username,
-            botId: botInfo.id,
-            allowedUserIds: state.config.allowedUserIds || [],
-          };
-          await writeConfig(newConfig);
-          state.config = newConfig;
-          ctx.ui.notify(`Teleg-bridge connected: @${botInfo.username}`, "info");
-          ctx.ui.notify("Send /start to your bot in Telegram to pair.", "info");
-          const pm2 = getPollingManager(newConfig.botId ?? 0);
-          pm2.setConfig(newConfig.botToken ?? "", newConfig.lastUpdateId ?? 0);
-          pm2.setBotInfo({ username: botInfo.username ?? null, displayName: botInfo.username ?? botInfo.first_name });
-          await pm2.start(sessionName, state.botContext?.dbPath ?? join(homedir(), ".pi", "agent", "teleg-bridge.db"));
-          updateStatus(ctx);
-        });
-        return;
+      if (!currentBotToken()) {
+        const token = await ctx.ui.input("Telegram bot token", "123456:ABCDEF...");
+        if (!token) return;
+        const botInfo = await verifyToken(token);
+        if (!botInfo) { ctx.ui.notify("Invalid Telegram bot token", "error"); return; }
+        await saveVerifiedBotConfig(token, botInfo);
+        ctx.ui.notify(`Teleg-bridge connected: @${botInfo.username}`, "info");
+        ctx.ui.notify("Send /start to your bot in Telegram to pair.", "info");
       }
-      const pm = getPollingManager(state.botContext?.botId ?? 0);
-      await pm.start(sessionName, state.botContext?.dbPath ?? join(homedir(), ".pi", "agent", "teleg-bridge.db"));
-      updateStatus(ctx);
+      await startCurrentPolling(ctx, "Polling started.");
     },
   });
 
@@ -990,8 +1313,8 @@ export default function (pi: ExtensionAPI): void {
         ctx.ui.notify("Cannot stop - other sessions still connected", "info");
         return;
       }
-      const pm = getPollingManager(state.botContext?.botId ?? 0);
-      await pm.stop();
+      const pm = currentPollingManager();
+      if (pm) await pm.stop();
       updateStatus(ctx);
     },
   });
@@ -999,11 +1322,26 @@ export default function (pi: ExtensionAPI): void {
   pi.registerCommand("teleg-reconnect", {
     description: "Force reconnection to Telegram",
     handler: async (_args, ctx) => {
-      const pm = getPollingManager(state.botContext?.botId ?? 0);
+      if (!currentBotToken()) {
+        const token = await ctx.ui.input("Telegram bot token", "123456:ABCDEF...");
+        if (!token) return;
+        const botInfo = await verifyToken(token);
+        if (!botInfo) {
+          ctx.ui.notify("Invalid Telegram bot token", "error");
+          return;
+        }
+        await saveVerifiedBotConfig(token, botInfo);
+        ctx.ui.notify(`Teleg-bridge connected: @${botInfo.username}`, "info");
+        ctx.ui.notify("Send /start to your bot in Telegram to pair.", "info");
+      }
+      const pm = currentPollingManager();
+      if (!pm || !currentBotToken()) {
+        ctx.ui.notify("No Telegram bot token configured. Run /teleg-setup first.", "error");
+        updateStatus(ctx);
+        return;
+      }
       await pm.stop();
-      await pm.start(sessionName, state.botContext?.dbPath ?? join(homedir(), ".pi", "agent", "teleg-bridge.db"));
-      updateStatus(ctx);
-      ctx.ui.notify("Reconnecting to Telegram...", "info");
+      await startCurrentPolling(ctx, "Reconnecting to Telegram...");
     },
   });
 
@@ -1020,11 +1358,12 @@ export default function (pi: ExtensionAPI): void {
     async execute(_toolCallId, params) {
       const targetChatId = params.chat_id
         ? parseInt(params.chat_id)
-        : state.config.allowedUserIds?.[0];
-      if (!targetChatId || !state.config.botToken) {
+        : currentAllowedUserIds()[0];
+      const botToken = currentBotToken();
+      if (!targetChatId || !botToken) {
         throw new Error("No chat ID available. Send /start to pair first.");
       }
-      const result = await sendReply(state.config.botToken, String(targetChatId), 0, params.text);
+      const result = await sendReply(botToken, String(targetChatId), 0, params.text);
       return { content: [{ type: "text", text: result ? `Sent message ${result}` : "Message sent" }], details: {} };
     },
   });
@@ -1041,14 +1380,15 @@ export default function (pi: ExtensionAPI): void {
     async execute(_toolCallId, params) {
       const targetChatId = params.chat_id
         ? parseInt(params.chat_id)
-        : state.config.allowedUserIds?.[0];
-      if (!targetChatId || !state.config.botToken) {
+        : currentAllowedUserIds()[0];
+      const botToken = currentBotToken();
+      if (!targetChatId || !botToken) {
         throw new Error("No chat ID available. Send /start to pair first.");
       }
       const stats = await stat(params.file_path);
       if (!stats.isFile()) throw new Error(`Not a file: ${params.file_path}`);
       const fileName = params.file_path.split("/").pop() || "photo.jpg";
-      const success = await sendFile(state.config.botToken, String(targetChatId), 0, params.file_path, fileName, true, params.caption);
+      const success = await sendFile(botToken, String(targetChatId), 0, params.file_path, fileName, true, params.caption);
       if (!success) throw new Error("Failed to send photo");
       return { content: [{ type: "text", text: "Photo sent" }], details: {} };
     },
@@ -1066,14 +1406,15 @@ export default function (pi: ExtensionAPI): void {
     async execute(_toolCallId, params) {
       const targetChatId = params.chat_id
         ? parseInt(params.chat_id)
-        : state.config.allowedUserIds?.[0];
-      if (!targetChatId || !state.config.botToken) {
+        : currentAllowedUserIds()[0];
+      const botToken = currentBotToken();
+      if (!targetChatId || !botToken) {
         throw new Error("No chat ID available. Send /start to pair first.");
       }
       const stats = await stat(params.file_path);
       if (!stats.isFile()) throw new Error(`Not a file: ${params.file_path}`);
       const fileName = params.file_path.split("/").pop() || "video.mp4";
-      const success = await sendFile(state.config.botToken, String(targetChatId), 0, params.file_path, fileName, false, params.caption);
+      const success = await sendFile(botToken, String(targetChatId), 0, params.file_path, fileName, false, params.caption);
       if (!success) throw new Error("Failed to send video");
       return { content: [{ type: "text", text: "Video sent" }], details: {} };
     },
@@ -1085,8 +1426,8 @@ export default function (pi: ExtensionAPI): void {
     description: "Get information about the bot",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params) {
-      const pm = getPollingManager(state.botContext?.botId ?? 0);
-      const botInfo = pm.getBotInfo();
+      const pm = currentPollingManager();
+      const botInfo = pm?.getBotInfo() ?? { botId: currentBotId() ?? 0, username: state.config.botUsername ?? null, displayName: state.config.botUsername ?? "" };
       return { content: [{ type: "text", text: JSON.stringify(botInfo) }], details: {} };
     },
   });
@@ -1097,8 +1438,8 @@ export default function (pi: ExtensionAPI): void {
     description: "Get the number of pending and processing messages in the queue",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params) {
-      const pm = getPollingManager(state.botContext?.botId ?? 0);
-      const depth = pm.getQueueDepth();
+      const pm = currentPollingManager();
+      const depth = pm?.getQueueDepth() ?? 0;
       return { content: [{ type: "text", text: `Queue depth: ${depth}` }], details: { count: depth } };
     },
   });
@@ -1254,6 +1595,121 @@ export default function (pi: ExtensionAPI): void {
     },
   });
 
+  // ─── PUB-SUB Tool ──────────────────────────────────────────────────
+
+  pi.registerTool({
+    name: "teleg-publish",
+    label: "Publish to Session Channel",
+    description: "Publish a message to a PUB-SUB channel for another session to pick up. Use to delegate tasks between pi sessions without Telegram.",
+    parameters: Type.Object({
+      channel: Type.String({ description: "Channel name (e.g., a capability like 'download', 'scrape', 'analyze')" }),
+      payload: Type.String({ description: "Message payload / task description" }),
+      target_session: Type.Optional(Type.String({ description: "Target session name (omit for broadcast to any capable session)" })),
+    }),
+    async execute(_toolCallId, params) {
+      const botId = state.botContext?.botId;
+      if (!botId) throw new Error("No bot ID available");
+      const id = Db.publish(botId, params.channel, sessionName, params.payload, params.target_session);
+      return { content: [{ type: "text", text: `Published to #${params.channel} (id:${id}${params.target_session ? ` → @${params.target_session}` : " (broadcast)"})` }], details: { id, channel: params.channel } };
+    },
+  });
+
+  // ─── Kill-Switch Tools ──────────────────────────────────────────────
+
+  pi.registerTool({
+    name: "teleg-disconnect",
+    label: "Disconnect Session",
+    description: "Disconnect THIS pi session from the Telegram bridge. Stops polling and unregisters this session. Other sessions and queued DB data are unaffected.",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params) {
+      if (state.activeTurn) {
+        completeTurn(state.activeTurn.dbId);
+        deactivateTurn();
+      }
+      if (state.drainTimer) { clearInterval(state.drainTimer); state.drainTimer = undefined; }
+      if (state.livenessTimer) { clearInterval(state.livenessTimer); state.livenessTimer = undefined; }
+      const pm = currentPollingManager();
+      if (pm && pm.isActive()) await pm.stop();
+      stopRelayServer();
+      stopTyping();
+      await unregisterSessionCapabilities(sessionId);
+      await unregisterSession();
+      const botId = currentBotId();
+      if (botId) Db.unregisterRelaySession(botId, sessionName);
+      return { content: [{ type: "text", text: `Disconnected session: ${sessionName}` }], details: { session_name: sessionName } };
+    },
+  });
+
+  pi.registerTool({
+    name: "teleg-disconnect-all",
+    label: "Disconnect All Sessions",
+    description: "Disconnect ALL pi sessions connected to the Telegram bridge. Terminates session PIDs but does NOT clean queue DB or remove registry records.",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params) {
+      if (state.activeTurn) {
+        completeTurn(state.activeTurn.dbId);
+        deactivateTurn();
+      }
+      if (state.drainTimer) { clearInterval(state.drainTimer); state.drainTimer = undefined; }
+      if (state.livenessTimer) { clearInterval(state.livenessTimer); state.livenessTimer = undefined; }
+      const pm = currentPollingManager();
+      if (pm && pm.isActive()) await pm.stop();
+      const registry = await readSessionRegistry();
+      const killed: string[] = [];
+      for (const s of registry.sessions) {
+        killed.push(s.sessionName);
+        if (s.sessionId === sessionId) continue;
+        try { process.kill(s.pid, 9); } catch { /* already dead */ }
+        cleanRelayFilesByPid(s.pid);
+      }
+      stopRelayServer();
+      stopTyping();
+      await unregisterSessionCapabilities(sessionId);
+      await unregisterSession();
+      return { content: [{ type: "text", text: `Disconnected ${killed.length} sessions without DB cleanup: ${killed.join(", ")}` }], details: { killed, db_cleaned: false } };
+    },
+  });
+
+  pi.registerTool({
+    name: "teleg-clean-db",
+    label: "Clean Teleg DB",
+    description: "Clean queue DB state separately from disconnect. Resets processing messages to pending and purges old completed/failed entries.",
+    parameters: Type.Object({
+      keep_count: Type.Optional(Type.Number({ description: "How many completed/failed messages to keep (default 500)" })),
+    }),
+    async execute(_toolCallId, params) {
+      const reset = Db.resetAllProcessing();
+      const purged = Db.purgeOldMessages(params.keep_count ?? 500);
+      return { content: [{ type: "text", text: `DB cleaned: ${reset} processing reset, ${purged} old messages purged.` }], details: { reset, purged } };
+    },
+  });
+
+  pi.registerTool({
+    name: "teleg-remove-sessions",
+    label: "Remove Dead Sessions",
+    description: "Remove dead session registry records and relay DB entries separately from disconnect.",
+    parameters: Type.Object({
+      all: Type.Optional(Type.Boolean({ description: "Remove all sessions except this one, even if PIDs are alive" })),
+    }),
+    async execute(_toolCallId, params) {
+      const botId = currentBotId();
+      const registry = await readSessionRegistry();
+      const removed: string[] = [];
+      registry.sessions = registry.sessions.filter(s => {
+        if (s.sessionId === sessionId) return true;
+        let alive = true;
+        try { process.kill(s.pid, 0); } catch { alive = false; }
+        if (!params.all && alive) return true;
+        removed.push(s.sessionName);
+        cleanRelayFilesByPid(s.pid);
+        if (botId) Db.unregisterRelaySession(botId, s.sessionName);
+        return false;
+      });
+      await writeSessionRegistry(registry);
+      return { content: [{ type: "text", text: `Removed ${removed.length} session(s): ${removed.join(", ") || "none"}` }], details: { removed } };
+    },
+  });
+
   // ─── Session Management Tools (Phase 7) ───────────────────────────────
 
   pi.registerTool({
@@ -1385,18 +1841,12 @@ export default function (pi: ExtensionAPI): void {
     // Run SQLite startup recovery
     const recovery = Db.runStartupRecovery();
     if (recovery.recoveredMessages > 0 || recovery.cleanedSessions > 0 || (recovery.mergedFromLocal ?? 0) > 0) {
-      console.log(`[teleg:${sessionName}] DB recovery: ${recovery.recoveredMessages} messages recovered, ${recovery.cleanedSessions} stale sessions cleaned, ${recovery.mergedFromLocal ?? 0} session names merged from local DBs`);
+
     }
 
     // Phase 1: Resolve bot context
     try {
       state.botContext = await resolveBotContext(cwd);
-      console.log(`[teleg:${sessionName}] Bot context resolved: @${state.botContext.botUsername} (id=${state.botContext.botId})`);
-
-      // Wire bot context into polling manager
-      const pm = getPollingManager(state.botContext.botId);
-      pm.setConfig(state.botContext.botToken, state.botContext.lastUpdateId);
-      pm.setBotInfo({ username: state.botContext.botUsername, displayName: state.botContext.botUsername });
 
       // Check for split DB warning
       const splitDbWarning = await detectSplitDb(state.botContext.botId, state.botContext.dbPath);
@@ -1407,33 +1857,38 @@ export default function (pi: ExtensionAPI): void {
     }
 
     state.config = await readConfig();
+    if (state.botContext) normalizeConfigFromBotContext(state.botContext);
 
-    const botId = state.botContext?.botId;
+    const botId = currentBotId();
+    const botToken = currentBotToken();
+    if (botId) Db.normalizeLegacyBotIds(botId);
+    if (botId && botToken) {
+      const pm = getPollingManager(botId);
+      pm.setConfig(botToken, state.botContext?.lastUpdateId ?? state.config.lastUpdateId ?? 0);
+      pm.setBotInfo({ username: state.config.botUsername ?? null, displayName: state.config.botUsername ?? "" });
+    }
 
     await registerSession();
 
     // Phase 5: Reconcile on startup
     if (botId) {
       const report = await reconcileSessions(botId);
-      if (report.evictedSessions.length > 0) console.log(`[teleg:${sessionName}] Evicted ghost sessions: ${report.evictedSessions.join(", ")}`);
-      if (report.newPrimary) console.log(`[teleg:${sessionName}] Primary elected: ${report.newPrimary}`);
+
+
     }
 
     // Announce presence ONCE per session
     const registry1 = await readSessionRegistry();
     const sessInfo = registry1.sessions.find(s => s.sessionId === sessionId);
     if (sessInfo && !sessInfo.announcedPresence) {
-      const chatId = state.config.allowedUserIds?.[0];
-      if (chatId && state.config.botToken) {
-        const pm = getPollingManager(botId ?? 0);
-        const isActivePoller = pm.isActive() || !pm.isHeldByOther();
-        const icon = isActivePoller ? "✅" : "🔁";
-        const role = isActivePoller ? "active" : "passive";
+      const chatId = currentAllowedUserIds()[0];
+      const announceToken = currentBotToken();
+      if (chatId && announceToken && botId) {
         try {
-          await fetch(`https://api.telegram.org/bot${state.config.botToken}/sendMessage`, {
+          await fetch(`https://api.telegram.org/bot${announceToken}/sendMessage`, {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ chat_id: chatId, text: `${icon} <b>${sessionName}</b> connected (${role})`, parse_mode: "HTML" }),
+            body: JSON.stringify({ chat_id: chatId, text: `✅ <b>${sessionName}</b> connected`, parse_mode: "HTML" }),
           });
         } catch { /* Network unavailable — skip */ }
       }
@@ -1443,9 +1898,14 @@ export default function (pi: ExtensionAPI): void {
 
     // Register session capabilities
     await cleanStaleCapabilities();
+    const { capabilities: detectedCaps, description: detectedDesc } = detectProjectCapabilities(cwd);
     await registerSessionCapabilities(sessionId, sessionName, process.pid, cwd).catch(
       (err: unknown) => console.error(`[teleg:${sessionName}] Failed to register capabilities:`, err)
     );
+    // Also store capabilities in SQLite relay_sessions for cross-session routing
+    if (botId && detectedCaps.length > 0) {
+      Db.updateRelayCapabilities(botId, sessionName, JSON.stringify(detectedCaps), detectedDesc || "");
+    }
 
     // Start relay server
     await startRelayServer(sessionName, 9798, botId).catch(console.error);
@@ -1462,24 +1922,13 @@ export default function (pi: ExtensionAPI): void {
         text,
         sourceSession: meta.sourceSession || "unknown",
       });
-      const turn: PendingTelegramTurn = {
-        sessionId,
-        sessionName,
-        chatId: meta.chatId,
-        replyToMessageId: meta.messageId,
-        queuedAttachments: [],
-        content: [{ type: "text", text: `${TELEGRAM_PREFIX} ${text}` }],
-        historyText: text,
-      };
-      state.activeTurn = turn as ActiveTelegramTurn;
-      try {
-        pi.sendUserMessage(turn.content, { deliverAs: "steer" });
-      } catch {
-        state.activeTurn = undefined;
-        completeTurn();
-        claimNextTurn();
+
+      if (state.activeTurn) {
+        return `[${sessionName}] Queued...`;
       }
-      return `[${sessionName}] Processing...`;
+
+      const started = await drainOne();
+      return started ? `[${sessionName}] Processing...` : `[${sessionName}] Queued...`;
     });
 
     setCompleteHandler((id, sourceSession) => {
@@ -1493,19 +1942,37 @@ export default function (pi: ExtensionAPI): void {
       }
     });
 
-    if (state.config.botToken) {
-      const pm = getPollingManager(botId ?? 0);
-      await pm.start(sessionName, state.botContext?.dbPath ?? join(homedir(), ".pi", "agent", "teleg-bridge.db"));
+    // Handle shutdown signal from other sessions (PUB-SUB /teleg-dc-all)
+    setShutdownHandler(() => {
+      console.log(`[teleg:${sessionName}] Received shutdown signal`);
+      if (state.drainTimer) { clearInterval(state.drainTimer); state.drainTimer = undefined; }
+      if (state.livenessTimer) { clearInterval(state.livenessTimer); state.livenessTimer = undefined; }
+      stopTyping();
+      deactivateTurn();
+      stopRelayServer();
+      void unregisterSessionCapabilities(sessionId);
+      void unregisterSession();
+    });
+
+    if (botToken && botId) {
+      const pm = getPollingManager(botId);
+      const pollingStarted = await pm.start(sessionName, currentDbPath());
+      Db.updateRelayRole(botId, sessionName, pollingStarted ? "active" : "drain");
+      if (pollingStarted) Db.setPrimary(botId, sessionName);
     }
 
     // Wire up polling message handler
-    const pm = getPollingManager(botId ?? 0);
-    pm.onMessage(async (update, dbId) => {
-      const message = update.message || update.edited_message;
+    const pm = botId ? getPollingManager(botId) : null;
+    pm?.onMessage(async (update, dbId) => {
+      const message = getUpdateMessage(update);
       if (!message) return;
+      if (!isAuthorizedTelegramMessage(message)) {
+        Db.completeMessage(dbId, "ignored: unauthorized telegram user/chat");
+        return;
+      }
       const activeSessionId = state.activeTurn?.sessionId;
       if (activeSessionId && activeSessionId !== sessionId && activeSessionId !== "unassigned") return;
-      await handleAuthorizedTelegramMessage(message, ctx);
+      await handleAuthorizedTelegramMessage(message, ctx, dbId);
     });
 
     // Periodic tasks: heartbeat, reconcile, polling restart
@@ -1514,37 +1981,135 @@ export default function (pi: ExtensionAPI): void {
       if (botId) {
         await reconcileSessions(botId).catch((err) => console.error(`[teleg:${sessionName}] Reconcile failed:`, err));
       }
-      const pm2 = getPollingManager(botId ?? 0);
-      if (!pm2.isActive() && state.config.botToken) {
+      if (!botId) return;
+      const pm2 = getPollingManager(botId);
+      if (!pm2.isActive() && currentBotToken()) {
         if (!pm2.isHeldByOther()) {
-          console.log(`[teleg:${sessionName}] Polling inactive, auto-restarting...`);
-          await pm2.start(sessionName, state.botContext?.dbPath ?? join(homedir(), ".pi", "agent", "teleg-bridge.db")).catch((err) =>
-            console.error(`[teleg:${sessionName}] Auto-restart failed:`, err)
-          );
+
+          const restarted = await pm2.start(sessionName, currentDbPath()).catch((err) => {
+            console.error(`[teleg:${sessionName}] Auto-restart failed:`, err);
+            return false;
+          });
+          Db.updateRelayRole(botId, sessionName, restarted ? "active" : "drain");
+          if (restarted) Db.setPrimary(botId, sessionName);
         }
       }
     }, 30000);
 
     // Phase 6: Active idle drain timer
+    // Each session independently polls for:
+    //   1. Messages explicitly tagged for this session (session_name match)
+    //   2. Unassigned messages that match this session's capabilities
+    //   3. Any remaining unassigned messages (cross-session help)
     state.drainTimer = setInterval(async () => {
       if (state.activeTurn) return;
       if (!botId) return;
       try {
+        // Priority 0: Check PUB-SUB for inter-session tasks
+        if (detectedCaps.length > 0) {
+          const pubsubMsgs = Db.subscribe(botId, sessionName, detectedCaps);
+          for (const msg of pubsubMsgs) {
+            // Route PUB-SUB message as a turn
+            const turn: PendingTelegramTurn = {
+              sessionId,
+              sessionName,
+              chatId: 0,
+              replyToMessageId: 0,
+              queuedAttachments: [],
+              content: [{ type: "text", text: `[telegram] [pubsub:${msg.channel}] ${msg.payload}` }],
+              historyText: msg.payload,
+            };
+            activateTurn(turn as ActiveTelegramTurn);
+            pi.sendUserMessage(turn.content, { deliverAs: "steer" });
+            return;
+          }
+        }
+
+        // Priority 1: Messages explicitly tagged for this session
         const queued = claimNextTurnForSession();
         if (queued) {
-          state.activeTurn = queued.turn as ActiveTelegramTurn;
+          activateTurn(queued.turn as ActiveTelegramTurn);
           pi.sendUserMessage(queued.turn.content, { deliverAs: "steer" });
           return;
         }
-        const queueMsg = claimNextTurn();
-        if (queueMsg) {
-          state.activeTurn = queueMsg.turn as ActiveTelegramTurn;
-          pi.sendUserMessage(queueMsg.turn.content, { deliverAs: "steer" });
+
+        // Priority 2: Unassigned messages matching our capabilities
+        const capReg = await readCapabilitiesRegistry();
+        const myCaps = capReg.entries.find(e => e.sessionId === sessionId);
+        if (myCaps && myCaps.capabilities.length > 0) {
+          const unassignedRows = Db.getDb().prepare(
+            "SELECT * FROM message_queue WHERE bot_id = ? AND status = 'pending' AND (session_name = 'unknown' OR session_name IS NULL) ORDER BY id ASC LIMIT 25"
+          ).all(botId) as unknown as Db.QueuedMessage[];
+          for (const unassigned of unassignedRows) {
+            const text = unassigned.text || "";
+            const match = matchMessageToCapability(text, [myCaps]);
+            if (match) {
+              // Claim it
+              Db.getDb().prepare(
+                "UPDATE message_queue SET status = 'processing', session_id = ?, session_name = ?, started_at = ? WHERE id = ? AND status = 'pending'"
+              ).run(sessionId, sessionName, Date.now(), unassigned.id);
+              const turn: PendingTelegramTurn = {
+                sessionId,
+                sessionName,
+                chatId: unassigned.chat_id,
+                replyToMessageId: unassigned.message_id,
+                queuedAttachments: [],
+                content: [{ type: "text", text: `[telegram] ${text}` }],
+                historyText: text,
+                dbId: unassigned.id,
+              };
+              activateTurn(turn as ActiveTelegramTurn);
+              pi.sendUserMessage(turn.content, { deliverAs: "steer" });
+              return;
+            }
+          }
+        }
+
+        // Priority 3: Optional cross-session help for truly unowned messages.
+        // Disabled by default so a bridge/session cannot steal data-scrapper work.
+        if (CLAIM_OTHERS) {
+          const queueMsg = claimNextTurn();
+          if (queueMsg) {
+            activateTurn(queueMsg.turn as ActiveTelegramTurn);
+            pi.sendUserMessage(queueMsg.turn.content, { deliverAs: "steer" });
+          }
         }
       } catch (err) {
         console.error(`[teleg:${sessionName}] Drain error:`, err);
       }
     }, DRAIN_INTERVAL_MS);
+
+    // ─── Immediate startup queue drain ─────────────────────────────────
+    // Don't wait for the first drain interval — check queue immediately
+    if (botId && !state.activeTurn) {
+      try {
+        const queued = claimNextTurnForSession();
+        if (queued) {
+          activateTurn(queued.turn as ActiveTelegramTurn);
+          pi.sendUserMessage(queued.turn.content, { deliverAs: "steer" });
+        }
+      } catch (err) {
+        console.error(`[teleg:${sessionName}] Startup drain error:`, err);
+      }
+    }
+
+    // ─── Liveness monitor (fast dead-session detection) ────────────────
+    // Check every 5s for crashed sessions and clean up immediately
+    state.livenessTimer = setInterval(async () => {
+      const { removed } = await monitorDeadSessions();
+      if (removed.length > 0) {
+        console.log(`[teleg:${sessionName}] Removed dead sessions: ${removed.join(", ")}`);
+        // After removing dead sessions, try to claim their orphaned messages
+        if (!state.activeTurn && botId && CLAIM_OTHERS) {
+          const queued = claimNextTurn();
+          if (queued) {
+            activateTurn(queued.turn as ActiveTelegramTurn);
+            pi.sendUserMessage(queued.turn.content, { deliverAs: "steer" });
+          }
+        }
+        updateStatus(ctx);
+      }
+    }, 5000);
 
     updateStatus(ctx);
   });
@@ -1553,7 +2118,8 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("session_shutdown", async (_event, _ctx) => {
     if (state.drainTimer) { clearInterval(state.drainTimer); state.drainTimer = undefined; }
-    state.activeTurn = undefined;
+    if (state.livenessTimer) { clearInterval(state.livenessTimer); state.livenessTimer = undefined; }
+    deactivateTurn();
     pendingForwards.length = 0;
     completeTurn();
     stopRelayServer();
@@ -1561,17 +2127,14 @@ export default function (pi: ExtensionAPI): void {
     const registry2 = await readSessionRegistry();
     const dying = registry2.sessions.find(s => s.sessionId === sessionId);
     if (dying && dying.announcedPresence) {
-      const chatId = state.config.allowedUserIds?.[0];
-      if (chatId && state.config.botToken) {
-        const pm = getPollingManager(state.botContext?.botId ?? 0);
-        const isActivePoller = pm.isActive() || !pm.isHeldByOther();
-        const icon = isActivePoller ? "⚠️" : "🔁";
-        const role = isActivePoller ? "active" : "passive";
+      const chatId = currentAllowedUserIds()[0];
+      const botToken = currentBotToken();
+      if (chatId && botToken) {
         try {
-          await fetch(`https://api.telegram.org/bot${state.config.botToken}/sendMessage`, {
+          await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ chat_id: chatId, text: `${icon} <b>${sessionName}</b> disconnected (${role})`, parse_mode: "HTML" }),
+            body: JSON.stringify({ chat_id: chatId, text: `⚠️ <b>${sessionName}</b> disconnected`, parse_mode: "HTML" }),
           });
         } catch { /* Network unavailable — skip */ }
       }
@@ -1580,13 +2143,13 @@ export default function (pi: ExtensionAPI): void {
     await unregisterSessionCapabilities(sessionId);
     await unregisterSession();
 
-    const botId = state.botContext?.botId;
+    const botId = currentBotId();
     if (botId) Db.unregisterRelaySession(botId, sessionName);
 
     const registry = await readSessionRegistry();
     if (registry.sessions.length === 0) {
-      const pm = getPollingManager(botId ?? 0);
-      await pm.stop();
+      const pm = currentPollingManager();
+      if (pm) await pm.stop();
     }
   });
 
@@ -1607,15 +2170,15 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("agent_start", async (_event, ctx) => {
     if (!state.activeTurn) {
-      const queued = claimNextTurn();
-      if (queued) state.activeTurn = queued.turn as ActiveTelegramTurn;
+      const queued = claimNextTurnForSession() || (CLAIM_OTHERS ? claimNextTurn() : null);
+      if (queued) activateTurn(queued.turn as ActiveTelegramTurn);
     }
     updateStatus(ctx);
   });
 
   pi.on("agent_end", async (event, ctx) => {
     const turn = state.activeTurn;
-    state.activeTurn = undefined;
+    deactivateTurn();
     completeTurn(turn?.dbId);
     updateStatus(ctx);
 
@@ -1681,7 +2244,7 @@ export default function (pi: ExtensionAPI): void {
     if (await drainOne()) {
       // Message sent to agent, will trigger another agent_end
     } else {
-      state.activeTurn = undefined;
+      deactivateTurn();
       updateStatus(ctx);
     }
   });

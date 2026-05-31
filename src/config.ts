@@ -32,6 +32,7 @@ export interface BotEntry {
   botUsername?: string;
   botId?: number;
   allowedUserIds: number[];
+  allowedChatIds?: number[];
   lastUpdateId: number;
 }
 
@@ -44,6 +45,7 @@ export interface GlobalConfigV2 {
 export interface ProjectConfig {
   botToken?: string;
   allowedUserIds?: number[];
+  allowedChatIds?: number[];
   dbPath?: string;
 }
 
@@ -52,6 +54,7 @@ export interface BotContext {
   botToken: string;
   botUsername: string;
   allowedUserIds: number[];
+  allowedChatIds: number[];
   dbPath: string;          // Path to shared SQLite DB
   lastUpdateId: number;
   projectDir: string;      // Where we resolved from
@@ -64,6 +67,7 @@ interface TelegramConfigV1 {
   botUsername?: string;
   botId?: number;
   allowedUserIds?: number[];
+  allowedChatIds?: number[];
   allowedUserId?: number; // old singular form
   lastUpdateId?: number;
   archiveRoot?: string;
@@ -117,7 +121,12 @@ async function getMeFromToken(token: string): Promise<{ botId: number; botUserna
 async function readGlobalConfig(): Promise<GlobalConfigV2 | null> {
   try {
     const content = await readFile(CONFIG_FILE, "utf8");
-    return JSON.parse(content) as GlobalConfigV2;
+    const parsed = JSON.parse(content);
+    // Handle legacy v1 format (flat botToken at root)
+    if ("botToken" in parsed && !("bots" in parsed)) {
+      return null; // Legacy v1 — handled separately in resolveFromToken
+    }
+    return parsed as GlobalConfigV2;
   } catch {
     return null;
   }
@@ -152,16 +161,36 @@ function readProjectConfig(projectDir: string): ProjectConfig {
 // Legacy migration
 // ============================================================================
 
+// Background migration to v2 (no need to block on getMe)
+async function migrateToV2(legacy: TelegramConfigV1): Promise<void> {
+  const me = await getMeFromToken(legacy.botToken!);
+  const botId = legacy.botId!;
+  const newConfig: GlobalConfigV2 = {
+    version: CURRENT_VERSION,
+    defaultBotId: botId,
+    bots: {
+      [botId]: {
+        botToken: legacy.botToken!,
+        botUsername: me?.botUsername ?? legacy.botUsername ?? "unknown",
+        botId,
+        allowedUserIds: legacy.allowedUserIds || [],
+        allowedChatIds: legacy.allowedChatIds || [],
+        lastUpdateId: legacy.lastUpdateId || 0,
+      },
+    },
+  };
+  await writeGlobalConfig(newConfig);
+}
+
 /**
  * Migrate legacy v1 config (flat botToken at root) to v2 (bots object).
  * Uses getMe to discover the botId for the legacy token.
  */
-async function migrateLegacyConfig(token: string): Promise<GlobalConfigV2 | null> {
-  console.log("[config] Detected legacy config format, migrating to v2...");
+async function migrateLegacyConfig(token: string): Promise<BotContext> {
+
   const me = await getMeFromToken(token);
   if (!me) {
-    console.error("[config] Cannot migrate: getMe failed for legacy token");
-    return null;
+    throw new Error(`Cannot migrate legacy config: getMe failed for token`);
   }
 
   const legacyConfig: TelegramConfigV1 = {
@@ -169,6 +198,7 @@ async function migrateLegacyConfig(token: string): Promise<GlobalConfigV2 | null
     botUsername: me.botUsername,
     botId: me.botId,
     allowedUserIds: [],
+    allowedChatIds: [],
     lastUpdateId: 0,
   };
 
@@ -187,14 +217,15 @@ async function migrateLegacyConfig(token: string): Promise<GlobalConfigV2 | null
         botUsername: legacyConfig.botUsername,
         botId: legacyConfig.botId,
         allowedUserIds: legacyConfig.allowedUserIds || [],
+        allowedChatIds: legacyConfig.allowedChatIds || [],
         lastUpdateId: legacyConfig.lastUpdateId || 0,
       },
     },
   };
 
   await writeGlobalConfig(newConfig);
-  console.log(`[config] Migration complete: botId=${me.botId}, botUsername=@${me.botUsername}`);
-  return newConfig;
+
+  return buildBotContext(newConfig.bots[String(me.botId)], process.cwd(), false);
 }
 
 // ============================================================================
@@ -239,11 +270,32 @@ export async function resolveBotContext(projectDir: string): Promise<BotContext>
     return resolveFromToken(projectCfg.botToken, projectDir, "project");
   }
 
-  // 4. Fall back to global config
+  // 4. Fall back to global config (try v2 first, then legacy v1)
   const globalCfg = await readGlobalConfig();
   if (globalCfg && globalCfg.defaultBotId) {
     const context = await resolveFromBotId(globalCfg.defaultBotId, projectDir);
     if (context) return context;
+  }
+  // Try legacy v1 config (flat format with botToken at root)
+  try {
+    const legacyContent = readFileSync(CONFIG_FILE, "utf8");
+    const legacy = JSON.parse(legacyContent) as TelegramConfigV1;
+    if (legacy.botToken && legacy.botId) {
+      // Use legacy config directly — we already have botId and token
+      const entry: BotEntry = {
+        botToken: legacy.botToken,
+        botUsername: legacy.botUsername,
+        botId: legacy.botId,
+        allowedUserIds: legacy.allowedUserIds || [],
+        allowedChatIds: legacy.allowedChatIds || [],
+        lastUpdateId: legacy.lastUpdateId || 0,
+      };
+      // Migrate to v2 in background
+      migrateToV2(legacy).catch(() => {});
+      return buildBotContext(entry, projectDir, false);
+    }
+  } catch {
+    // No legacy config either
   }
 
   throw new Error("No valid bot configuration found. Set TELEG_BOT_TOKEN, TELEG_BOT_ID, or configure .pi/teleg.json");
@@ -267,7 +319,7 @@ async function resolveFromToken(
 
   if (!botEntry) {
     // Register this bot in global config
-    console.log(`[config] Registering new bot @${me.botUsername} (id=${me.botId}) in global config`);
+
     const newCfg: GlobalConfigV2 = globalCfg || {
       version: CURRENT_VERSION,
       defaultBotId: me.botId,
@@ -287,6 +339,7 @@ async function resolveFromToken(
       botUsername: me.botUsername,
       botId: me.botId,
       allowedUserIds: [],
+      allowedChatIds: [],
       lastUpdateId: 0,
     };
     await writeGlobalConfig(newCfg);
@@ -301,7 +354,25 @@ async function resolveFromToken(
  */
 async function resolveFromBotId(botId: number, projectDir: string): Promise<BotContext | null> {
   const globalCfg = await readGlobalConfig();
-  if (!globalCfg) return null;
+  if (!globalCfg) {
+    // Try legacy v1 config
+    try {
+      const legacyContent = readFileSync(CONFIG_FILE, "utf8");
+      const legacy = JSON.parse(legacyContent) as TelegramConfigV1;
+      if (legacy.botToken && legacy.botId === botId) {
+        const entry: BotEntry = {
+          botToken: legacy.botToken,
+          botUsername: legacy.botUsername,
+          botId: legacy.botId,
+          allowedUserIds: legacy.allowedUserIds || [],
+          allowedChatIds: legacy.allowedChatIds || [],
+          lastUpdateId: legacy.lastUpdateId || 0,
+        };
+        return buildBotContext(entry, projectDir, false);
+      }
+    } catch { /* no legacy config */ }
+    return null;
+  }
 
   const botEntry = globalCfg.bots[String(botId)];
   if (!botEntry) return null;
@@ -321,6 +392,7 @@ function buildBotContext(entry: BotEntry, projectDir: string, isFromEnv: boolean
     botToken: entry.botToken,
     botUsername: entry.botUsername || "unknown",
     allowedUserIds: entry.allowedUserIds || [],
+    allowedChatIds: entry.allowedChatIds || [],
     dbPath,
     lastUpdateId: entry.lastUpdateId || 0,
     projectDir,

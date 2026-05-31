@@ -252,21 +252,73 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: "get_queue_data",
+    description: "Get queue messages data",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "number", description: "Max messages to return (default 20)" },
+        status: { type: "string", description: "Filter by status: pending, processing, completed, failed" },
+      },
+    },
+  },
+  {
+    name: "get_queue_data_id",
+    description: "Get a specific queue message by its ID",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "number", description: "Queue message ID" },
+      },
+      required: ["id"],
+    },
+  },
+  {
+    name: "set_queue_status",
+    description: "Update the status of a queue message",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "number", description: "Queue message ID" },
+        status: {
+          type: "string",
+          enum: ["pending", "processing", "completed", "failed"],
+          description: "New status for the message",
+        },
+        error: { type: "string", description: "Error message if status is 'failed'" },
+      },
+      required: ["id", "status"],
+    },
+  },
+  {
     name: "teleg-clear_backlog",
-    description: "Clear/reset the message backlog queue. Use 'reset' to unstick stale processing messages, 'purge' to delete old completed/failed entries, or 'complete' to manually mark a message done.",
+    description: "Clear/reset the message backlog queue. Use 'reset' to unstick stale processing messages, 'purge' to delete old completed/failed entries, 'complete' to manually mark a message done, or 'delete' to remove pending messages.",
     inputSchema: {
       type: "object",
       properties: {
         action: {
           type: "string",
-          enum: ["reset", "purge", "complete", "fail"],
-          description: "Action: 'reset' = unstick stuck processing→pending, 'purge' = delete old completed/failed entries, 'complete' = mark a message completed, 'fail' = mark a message failed",
+          enum: ["reset", "purge", "complete", "fail", "delete"],
+          description: "Action: 'reset' = unstick stuck processing→pending, 'purge' = delete old completed/failed entries, 'complete' = mark a message completed, 'fail' = mark a message failed, 'delete' = delete pending messages",
         },
         id: { type: "number", description: "Message ID (required for complete/fail actions)" },
         keep_count: { type: "number", description: "How many completed/failed entries to keep on purge (default 500)" },
         bot_id: { type: "number", description: "Bot ID to scope the operation (optional)" },
       },
       required: ["action"],
+    },
+  },
+  {
+    name: "teleg-publish",
+    description: "Publish a message to a PUB-SUB channel for another session to pick up. Use to delegate tasks between pi sessions without Telegram.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        channel: { type: "string", description: "Channel name (e.g., a capability like 'download', 'scrape', 'analyze')" },
+        payload: { type: "string", description: "Message payload / task description" },
+        target_session: { type: "string", description: "Target session name (omit for broadcast to any capable session)" },
+      },
+      required: ["channel", "payload"],
     },
   },
   // ─── Phase 7: Session Management Tools ─────────────────────────────────
@@ -322,6 +374,44 @@ const TOOL_DEFINITIONS = [
         bot_id: { type: "number", description: "Bot ID (optional)" },
       },
       required: ["session_name"],
+    },
+  },
+  // ─── Kill-Switch Tools ──────────────────────────────────────────────
+  {
+    name: "teleg-disconnect",
+    description: "Disconnect THIS pi session from the Telegram bridge. Stops polling and unregisters this session. Other sessions and queued DB data are unaffected.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+    },
+  },
+  {
+    name: "teleg-disconnect-all",
+    description: "Disconnect ALL pi sessions connected to the Telegram bridge. Terminates session PIDs but does NOT clean queue DB or remove registry records.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+    },
+  },
+  {
+    name: "teleg-clean-db",
+    description: "Clean queue DB state separately from disconnect. Resets processing messages to pending and purges old completed/failed messages.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        keep_count: { type: "number", description: "How many completed/failed messages to keep (default 500)" },
+      },
+    },
+  },
+  {
+    name: "teleg-remove-sessions",
+    description: "Remove session records separately from disconnect. By default removes dead sessions only; pass all=true to remove all relay session rows for a bot.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        bot_id: { type: "number", description: "Bot ID to scope (optional, defaults to first bot)" },
+        all: { type: "boolean", description: "Remove all sessions for the bot, even if alive" },
+      },
     },
   },
 ];
@@ -432,6 +522,56 @@ async function handleRequest(req) {
         sendResponse(id, { messages: getQueueStats(), downloads: getDownloadStats() });
         return;
       }
+      if (name === "get_queue_data") {
+        const db = new DatabaseSync(DB_PATH, { readonly: true });
+        try {
+          const limit = args.limit ?? 20;
+          let rows;
+          if (args.status) {
+            rows = db.prepare("SELECT * FROM message_queue WHERE status = ? ORDER BY created_at DESC LIMIT ?").all(args.status, limit);
+          } else {
+            rows = db.prepare("SELECT * FROM message_queue ORDER BY created_at DESC LIMIT ?").all(limit);
+          }
+          sendResponse(id, { rows });
+        } finally {
+          db.close();
+        }
+        return;
+      }
+      if (name === "get_queue_data_id") {
+        const db = new DatabaseSync(DB_PATH, { readonly: true });
+        try {
+          const row = db.prepare("SELECT * FROM message_queue WHERE id = ?").get(args.id);
+          sendResponse(id, { row: row ?? null });
+        } finally {
+          db.close();
+        }
+        return;
+      }
+      if (name === "set_queue_status") {
+        const db = new DatabaseSync(DB_PATH);
+        try {
+          const now = Date.now();
+          let query = `UPDATE message_queue SET status = ?`;
+          const sqlArgs = [args.status];
+          if (args.status === "completed") {
+            query += `, completed_at = ?`;
+            sqlArgs.push(now);
+          } else if (args.status === "failed" && args.error) {
+            query += `, error = ?`;
+            sqlArgs.push(args.error);
+          } else if (args.status === "pending") {
+            query += `, started_at = NULL, session_id = 'unassigned', session_name = 'unknown'`;
+          }
+          query += ` WHERE id = ?`;
+          sqlArgs.push(args.id);
+          const result = db.prepare(query).run(...sqlArgs);
+          sendResponse(id, { changes: result.changes, status: args.status });
+        } finally {
+          db.close();
+        }
+        return;
+      }
       if (name === "teleg-attach") {
         pendingAttachments = args.paths ?? [];
         sendResponse(id, { queued: pendingAttachments.length });
@@ -458,6 +598,13 @@ async function handleRequest(req) {
             if (!args.id) throw new Error("id required for fail action");
             db.prepare("UPDATE message_queue SET status = 'failed', completed_at = ?, error = ? WHERE id = ?").run(Date.now(), "Manually marked as failed", args.id);
             count = 1;
+          } else if (action === "delete") {
+            if (args.id) {
+              db.prepare("DELETE FROM message_queue WHERE id = ?").run(args.id);
+              count = 1;
+            } else {
+              count = db.prepare("DELETE FROM message_queue WHERE status = 'pending'").run().changes;
+            }
           }
         } finally {
           db.close();
@@ -466,6 +613,21 @@ async function handleRequest(req) {
         return;
       }
       
+      if (name === "teleg-publish") {
+        const db = new DatabaseSync(DB_PATH);
+        try {
+          const cfg = loadConfig();
+          const botId = args.bot_id ?? cfg?.defaultBotId ?? 0;
+          const result = db.prepare(
+            "INSERT INTO pubsub (bot_id, channel, publisher, payload, target_session) VALUES (?, ?, ?, ?, ?)"
+          ).run(botId, args.channel, "mcp-server", args.payload, args.target_session || null);
+          sendResponse(id, { id: result.lastInsertRowid, channel: args.channel, target_session: args.target_session ?? null });
+        } finally {
+          db.close();
+        }
+        return;
+      }
+
       // ─── Phase 7: Session Management Tools ─────────────────────────────
       
       if (name === "teleg-reconcile") {
@@ -565,6 +727,87 @@ async function handleRequest(req) {
         } catch {
           db.exec("ROLLBACK");
           throw new Error("Failed to set primary session");
+        } finally {
+          db.close();
+        }
+        return;
+      }
+
+      // ─── Kill-Switch Tools ────────────────────────────────────────────
+      
+      if (name === "teleg-disconnect") {
+        // Kill-switch: disconnect THIS session (the MCP caller's session)
+        // Since MCP runs standalone, we kill the primary session for the bot
+        const db = new DatabaseSync(DB_PATH);
+        try {
+          const cfg = loadConfig();
+          const botId = cfg?.defaultBotId || 0;
+          const session = db.prepare("SELECT session_name, pid FROM relay_sessions WHERE bot_id = ? AND is_primary = 1 LIMIT 1").get(botId);
+          const killed = session?.session_name ?? null;
+          if (session) {
+            try { process.kill(session.pid, 9); } catch { /* already dead */ }
+          }
+          sendResponse(id, { disconnected: killed, bot_id: botId, db_cleaned: false, removed: false });
+        } finally {
+          db.close();
+        }
+        return;
+      }
+      
+      if (name === "teleg-disconnect-all") {
+        // Kill-switch: disconnect ALL sessions
+        const db = new DatabaseSync(DB_PATH);
+        try {
+          const cfg = loadConfig();
+          const botId = cfg?.defaultBotId || 0;
+          const sessions = db.prepare("SELECT session_name, pid FROM relay_sessions WHERE bot_id = ?").all(botId);
+          const killed = sessions.map(s => s.session_name);
+          for (const s of sessions) {
+            try { process.kill(s.pid, 9); } catch { /* already dead */ }
+          }
+          sendResponse(id, { killed, bot_id: botId, total: killed.length, db_cleaned: false, removed: false });
+        } finally {
+          db.close();
+        }
+        return;
+      }
+
+      if (name === "teleg-clean-db") {
+        const db = new DatabaseSync(DB_PATH);
+        try {
+          const reset = db.prepare("UPDATE message_queue SET status = 'pending', session_id = 'unassigned', session_name = 'unknown', started_at = NULL WHERE status = 'processing'").run().changes;
+          const keep = args.keep_count ?? 500;
+          let purged = 0;
+          const row = db.prepare("SELECT id FROM message_queue WHERE status IN ('completed','failed') ORDER BY id DESC LIMIT 1 OFFSET ?").get(keep);
+          if (row) {
+            purged = db.prepare("DELETE FROM message_queue WHERE status IN ('completed','failed') AND id < ?").run(row.id).changes;
+          }
+          sendResponse(id, { reset, purged });
+        } finally {
+          db.close();
+        }
+        return;
+      }
+
+      if (name === "teleg-remove-sessions") {
+        const db = new DatabaseSync(DB_PATH);
+        try {
+          const botId = args.bot_id 
+            ? Number(args.bot_id) 
+            : (() => {
+                const cfg = loadConfig();
+                return cfg?.defaultBotId || 0;
+              })();
+          const sessions = db.prepare("SELECT session_name, pid FROM relay_sessions WHERE bot_id = ?").all(botId);
+          const removed = [];
+          for (const s of sessions) {
+            let alive = true;
+            try { process.kill(s.pid, 0); } catch { alive = false; }
+            if (!args.all && alive) continue;
+            removed.push(s.session_name);
+            db.prepare("DELETE FROM relay_sessions WHERE bot_id = ? AND session_name = ?").run(botId, s.session_name);
+          }
+          sendResponse(id, { removed, bot_id: botId, total: removed.length });
         } finally {
           db.close();
         }

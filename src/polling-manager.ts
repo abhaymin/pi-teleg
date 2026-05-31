@@ -173,13 +173,13 @@ class PollingManager {
   async start(sessionName: string, dbPath: string): Promise<boolean> {
     if (this.isPolling) return true;
     if (!this.config.botToken) {
-      console.error(`[polling:${this.botId}] No bot token configured`);
+      if (this.botId) console.error(`[polling:${this.botId}] No bot token configured`);
       return false;
     }
 
     // Acquire lock
     if (!(await this.acquireLock(sessionName))) {
-      console.log(`[polling:${this.botId}] Lock held by another process`);
+
       return false;
     }
 
@@ -208,7 +208,7 @@ class PollingManager {
     });
 
     this.worker.on("exit", (code) => {
-      console.log(`[polling:${this.botId}] Worker exited with code ${code}`);
+
       this.isPolling = false;
     });
 
@@ -395,11 +395,11 @@ class PollingManager {
   private async handleWorkerMessage(msg: WorkerMessage): Promise<void> {
     switch (msg.type) {
       case "started":
-        console.log(`[polling:${this.botId}] Polling started`);
+
         break;
 
       case "stopped":
-        console.log(`[polling:${this.botId}] Polling stopped`);
+
         this.isPolling = false;
         break;
 
@@ -442,8 +442,10 @@ class PollingManager {
 // ============================================================================
 
 const managers = new Map<number, PollingManager>();
+const NOOP_MANAGER = new PollingManager(0);
 
 export function getPollingManager(botId: number): PollingManager {
+  if (!botId) return NOOP_MANAGER;
   let manager = managers.get(botId);
   if (!manager) {
     manager = new PollingManager(botId);
@@ -491,6 +493,8 @@ interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
   edited_message?: TelegramMessage;
+  channel_post?: TelegramMessage;
+  edited_channel_post?: TelegramMessage;
 }
 
 interface TurnQueueItem {

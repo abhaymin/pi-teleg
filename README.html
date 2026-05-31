@@ -1,0 +1,570 @@
+<!doctype html>
+<html lang="en" data-theme="pastel">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>teleg-bridge · Interactive Architecture</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #fff9f2;
+      --bg-2: #f7fbff;
+      --surface: rgba(255, 255, 255, 0.74);
+      --surface-strong: rgba(255, 255, 255, 0.92);
+      --text: #263044;
+      --muted: #68758c;
+      --line: rgba(96, 115, 140, 0.18);
+      --shadow: 0 24px 70px rgba(81, 79, 117, 0.16);
+      --pink: #ffc8dd;
+      --rose: #ffafcc;
+      --lavender: #cdb4db;
+      --blue: #bde0fe;
+      --cyan: #a2d2ff;
+      --mint: #c8f7dc;
+      --peach: #ffd6a5;
+      --butter: #fdffb6;
+      --good: #3aa981;
+      --warn: #bf7a1a;
+      --bad: #c05a7a;
+      --radius: 24px;
+      --font: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+
+    html[data-theme="night"] {
+      color-scheme: dark;
+      --bg: #171629;
+      --bg-2: #121727;
+      --surface: rgba(35, 35, 57, 0.72);
+      --surface-strong: rgba(35, 35, 57, 0.94);
+      --text: #f4efff;
+      --muted: #c8c2db;
+      --line: rgba(221, 214, 254, 0.18);
+      --shadow: 0 24px 80px rgba(0, 0, 0, 0.32);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: var(--font);
+      color: var(--text);
+      line-height: 1.62;
+      background:
+        radial-gradient(circle at 10% 10%, color-mix(in srgb, var(--pink) 58%, transparent), transparent 28rem),
+        radial-gradient(circle at 90% 4%, color-mix(in srgb, var(--blue) 68%, transparent), transparent 30rem),
+        radial-gradient(circle at 70% 90%, color-mix(in srgb, var(--mint) 62%, transparent), transparent 28rem),
+        linear-gradient(135deg, var(--bg), var(--bg-2));
+      overflow-x: hidden;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: 0.38;
+      background-image:
+        linear-gradient(rgba(120, 119, 198, 0.12) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(120, 119, 198, 0.12) 1px, transparent 1px);
+      background-size: 42px 42px;
+      mask-image: radial-gradient(circle at 50% 20%, #000, transparent 70%);
+    }
+
+    a { color: #5b7cd6; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code, pre { font-family: var(--mono); }
+    code { color: #6b5dd3; }
+
+    .shell { width: min(1180px, calc(100% - 36px)); margin: 0 auto; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+
+    .skip-link {
+      position: fixed; left: 16px; top: 16px; z-index: 999; transform: translateY(-150%);
+      background: var(--surface-strong); color: var(--text); padding: 10px 14px; border-radius: 999px; border: 1px solid var(--line);
+    }
+    .skip-link:focus { transform: translateY(0); }
+
+    header.hero { padding: 74px 0 36px; position: relative; }
+    .topbar {
+      display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 28px;
+    }
+    .brand-pill, .chip, .toggle, .copy-btn, .tab-btn, .schema-card button, .state-pill {
+      border: 1px solid var(--line);
+      background: var(--surface);
+      color: var(--text);
+      backdrop-filter: blur(18px);
+      box-shadow: 0 10px 30px rgba(112, 99, 150, 0.08);
+    }
+    .brand-pill { display: inline-flex; align-items: center; gap: 10px; padding: 9px 13px; border-radius: 999px; color: var(--muted); font-weight: 700; }
+    .spark { width: 11px; height: 11px; border-radius: 999px; background: linear-gradient(135deg, var(--rose), var(--cyan)); box-shadow: 0 0 0 7px color-mix(in srgb, var(--rose) 28%, transparent); }
+    .top-actions { display: flex; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
+    .toggle, .copy-btn, .tab-btn, .schema-card button, .state-pill { min-height: 44px; border-radius: 999px; padding: 10px 14px; cursor: pointer; font-weight: 800; transition: transform .18s ease, background .18s ease, border-color .18s ease; }
+    .toggle:hover, .copy-btn:hover, .tab-btn:hover, .schema-card button:hover, .state-pill:hover { transform: translateY(-1px); }
+    .toggle:focus-visible, .copy-btn:focus-visible, .tab-btn:focus-visible, .schema-card button:focus-visible, .state-pill:focus-visible, input:focus-visible { outline: 3px solid color-mix(in srgb, var(--cyan) 70%, white); outline-offset: 3px; }
+
+    h1 { margin: 0; font-size: clamp(2.65rem, 7vw, 6rem); line-height: .94; letter-spacing: -0.07em; max-width: 980px; }
+    h1 span { background: linear-gradient(110deg, #7c6ee6 0%, #f57fb2 45%, #42a7d9 80%); -webkit-background-clip: text; background-clip: text; color: transparent; }
+    .lede { max-width: 850px; color: var(--muted); font-size: clamp(1.05rem, 2vw, 1.32rem); margin: 22px 0 0; }
+
+    .hero-grid { display: grid; grid-template-columns: 1.35fr .65fr; gap: 22px; align-items: end; margin-top: 28px; }
+    .quick-card { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); padding: 22px; box-shadow: var(--shadow); backdrop-filter: blur(18px); }
+    .quick-card p { margin: 0; color: var(--muted); }
+    .chip-row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
+    .chip { display: inline-flex; align-items: center; gap: 8px; border-radius: 999px; padding: 8px 11px; color: var(--muted); font-size: .92rem; }
+    .chip b { color: var(--text); }
+
+    @media (max-width: 900px) { .hero-grid { grid-template-columns: 1fr; } .topbar { align-items: flex-start; flex-direction: column; } }
+
+    nav.toc {
+      position: sticky; top: 0; z-index: 30; background: color-mix(in srgb, var(--bg) 70%, transparent); backdrop-filter: blur(20px); border-block: 1px solid var(--line);
+    }
+    nav.toc .shell { display: flex; gap: 9px; overflow-x: auto; padding: 12px 0; }
+    nav.toc a { white-space: nowrap; color: var(--muted); border-radius: 999px; padding: 8px 11px; font-weight: 800; font-size: .92rem; }
+    nav.toc a:hover, nav.toc a.active { color: var(--text); background: var(--surface); text-decoration: none; }
+
+    main { padding: 28px 0 76px; }
+    section { scroll-margin-top: 78px; margin: 24px 0; }
+    .card {
+      border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); backdrop-filter: blur(20px); padding: clamp(20px, 3vw, 34px);
+      opacity: 0; transform: translateY(18px); transition: opacity .55s ease, transform .55s ease;
+    }
+    .card.visible { opacity: 1; transform: none; }
+    h2 { margin: 0 0 12px; font-size: clamp(1.65rem, 3vw, 2.55rem); letter-spacing: -0.045em; }
+    h3 { margin: 24px 0 10px; font-size: 1.18rem; }
+    p { color: var(--muted); }
+
+    .grid { display: grid; gap: 16px; }
+    .cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    @media (max-width: 860px) { .cols-2, .cols-3 { grid-template-columns: 1fr; } }
+
+    .mini { border: 1px solid var(--line); border-radius: 20px; padding: 18px; background: color-mix(in srgb, var(--surface-strong) 82%, var(--blue)); transition: transform .18s ease, box-shadow .18s ease; }
+    .mini:hover { transform: translateY(-3px); box-shadow: 0 18px 42px rgba(101, 96, 140, .12); }
+    .mini strong { display: block; margin-bottom: 6px; }
+    .mini p { margin: 0; font-size: .95rem; }
+
+    .diagram { margin-top: 18px; overflow-x: auto; padding: 18px; border: 1px solid var(--line); border-radius: 22px; background: color-mix(in srgb, var(--surface-strong) 78%, var(--butter)); }
+    .flow { min-width: 960px; display: grid; grid-template-columns: repeat(9, 1fr); gap: 10px; align-items: center; }
+    .node, .dbnode {
+      min-height: 94px; display: grid; place-items: center; text-align: center; border-radius: 20px; padding: 14px; font-weight: 900; border: 1px solid var(--line); background: linear-gradient(135deg, color-mix(in srgb, var(--blue) 64%, white), color-mix(in srgb, var(--lavender) 45%, white)); color: #30405d;
+    }
+    html[data-theme="night"] .node, html[data-theme="night"] .dbnode { color: #f4efff; background: linear-gradient(135deg, rgba(124, 110, 230, .24), rgba(88, 166, 215, .18)); }
+    .node small, .dbnode small { display: block; color: var(--muted); font-weight: 650; margin-top: 5px; }
+    .arrow { display: grid; place-items: center; color: #7c6ee6; font-size: 1.65rem; font-weight: 900; }
+
+    .tabs { display: flex; flex-wrap: wrap; gap: 10px; margin: 18px 0; }
+    .tab-btn[aria-selected="true"] { background: linear-gradient(135deg, var(--pink), var(--blue)); border-color: transparent; color: #263044; }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; animation: fadeIn .24s ease both; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+    .timeline { display: grid; gap: 14px; counter-reset: step; }
+    .step { counter-increment: step; display: grid; grid-template-columns: 48px 1fr; gap: 14px; padding: 17px; border: 1px solid var(--line); border-radius: 20px; background: color-mix(in srgb, var(--surface-strong) 80%, var(--mint)); }
+    .step::before { content: counter(step); width: 40px; height: 40px; display: grid; place-items: center; border-radius: 16px; background: linear-gradient(135deg, var(--rose), var(--cyan)); color: #263044; font-weight: 950; }
+    .step h3 { margin: 0 0 4px; }
+    .step p { margin: 0; }
+
+    table { width: 100%; border-collapse: collapse; overflow: hidden; border-radius: 18px; background: var(--surface-strong); }
+    th, td { padding: 13px 14px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: color-mix(in srgb, var(--lavender) 42%, var(--surface-strong)); color: var(--text); }
+    td { color: var(--muted); }
+    tr:last-child td { border-bottom: 0; }
+
+    .schema-grid { display: grid; grid-template-columns: repeat(5, minmax(230px, 1fr)); gap: 14px; min-width: 1210px; }
+    .schema-card { border: 1px solid var(--line); border-radius: 22px; background: var(--surface-strong); overflow: hidden; box-shadow: 0 14px 34px rgba(88, 76, 120, .08); }
+    .schema-card button { width: 100%; border: 0; border-radius: 0; min-height: 54px; text-align: left; padding: 14px 16px; background: linear-gradient(135deg, color-mix(in srgb, var(--pink) 55%, white), color-mix(in srgb, var(--blue) 55%, white)); color: #263044; }
+    .schema-card ul { list-style: none; margin: 0; padding: 12px 16px 16px; color: var(--muted); font-size: .92rem; }
+    .schema-card li { padding: 5px 0; border-bottom: 1px solid var(--line); }
+    .schema-card li:last-child { border-bottom: 0; }
+    .schema-card.collapsed ul { display: none; }
+    .pk { color: var(--good); font-weight: 900; }
+    .fk { color: #5b7cd6; font-weight: 900; }
+
+    .state-machine { display: grid; grid-template-columns: repeat(5, minmax(150px, 1fr)); gap: 10px; min-width: 850px; align-items: center; }
+    .state-pill[aria-pressed="true"] { background: linear-gradient(135deg, var(--mint), var(--butter)); color: #263044; }
+    .state-detail { margin-top: 14px; padding: 16px; border-radius: 18px; border: 1px solid var(--line); background: var(--surface-strong); color: var(--muted); }
+
+    .codebox { position: relative; }
+    pre { margin: 0; white-space: pre-wrap; overflow: auto; border: 1px solid var(--line); border-radius: 18px; padding: 18px; background: color-mix(in srgb, var(--surface-strong) 86%, #f1f5ff); color: var(--text); }
+    .copy-btn { position: absolute; top: 10px; right: 10px; min-height: 36px; padding: 7px 10px; font-size: .84rem; }
+
+    .search-row { display: flex; gap: 10px; margin: 14px 0; flex-wrap: wrap; }
+    input[type="search"] { flex: 1; min-width: 240px; min-height: 46px; border-radius: 999px; border: 1px solid var(--line); background: var(--surface-strong); color: var(--text); padding: 0 16px; font: inherit; }
+
+    footer { border-top: 1px solid var(--line); padding: 28px 0; color: var(--muted); background: color-mix(in srgb, var(--surface) 55%, transparent); }
+
+    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; scroll-behavior: auto !important; } }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="hero">
+    <div class="shell">
+      <div class="topbar">
+        <div class="brand-pill"><span class="spark" aria-hidden="true"></span> Pi extension · Telegram bridge · SQLite coordination</div>
+        <div class="top-actions">
+          <button class="toggle" id="themeToggle" type="button" aria-label="Toggle color theme">Night mode</button>
+          <a class="toggle" href="README.md">Markdown README</a>
+        </div>
+      </div>
+
+      <h1><span>teleg-bridge</span><br />Interactive Architecture</h1>
+      <p class="lede">A pastel, interactive map of the Telegram bridge for Pi: message intent, runtime workflow, routing logic, SQLite schema, commands, and operational capabilities.</p>
+
+      <div class="hero-grid">
+        <div class="quick-card">
+          <strong>Primary intent</strong>
+          <p>Turn private chats, groups, supergroups, and configured channels into a remote control plane for multiple Pi sessions, while using SQLite to coordinate queue ownership, session liveness, bot scoping, and recovery.</p>
+          <div class="chip-row">
+            <span class="chip"><b>1</b> poller per bot</span>
+            <span class="chip"><b>N</b> active sessions</span>
+            <span class="chip"><b>5</b> SQLite tables</span>
+            <span class="chip"><b>INFO_REL</b> routing</span>
+          </div>
+        </div>
+        <div class="quick-card">
+          <strong>Try the page</strong>
+          <p>Switch diagram tabs, collapse schema tables, search commands, click queue states, copy snippets, and toggle pastel night mode.</p>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <nav class="toc" aria-label="Page sections">
+    <div class="shell">
+      <a href="#intent">Intent</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#sqlite">SQLite DB</a>
+      <a href="#workflow">Workflow</a>
+      <a href="#routing">Routing</a>
+      <a href="#capabilities">Capabilities</a>
+      <a href="#commands">Commands</a>
+      <a href="#configuration">Configuration</a>
+      <a href="#operations">Operations</a>
+    </div>
+  </nav>
+
+  <main id="main" class="shell">
+    <section id="intent" class="card">
+      <h2>Intent</h2>
+      <p><strong>teleg-bridge</strong> connects Telegram chats to Pi agent sessions. It receives Telegram messages, persists work in SQLite, routes each message to the best live session, and sends text, photos, videos, or generated files back to Telegram.</p>
+      <div class="grid cols-3">
+        <div class="mini"><strong>Remote control plane</strong><p>Message Pi from Telegram and receive the final answer or attached artifacts.</p></div>
+        <div class="mini"><strong>Capability routing</strong><p>Use <code>@sessionName</code>, <code>INFO_REL.md</code>, URL patterns, and primary fallback.</p></div>
+        <div class="mini"><strong>Recoverable queue</strong><p>SQLite preserves pending, processing, completed, and failed work across crashes.</p></div>
+      </div>
+    </section>
+
+    <section id="architecture" class="card">
+      <h2>Architecture diagrams</h2>
+      <p>Use the tabs to switch between the system overview, routing flow, and database responsibility flow.</p>
+      <div class="tabs" role="tablist" aria-label="Architecture diagrams">
+        <button class="tab-btn" role="tab" aria-selected="true" aria-controls="panel-system" id="tab-system" data-tab="system">System</button>
+        <button class="tab-btn" role="tab" aria-selected="false" aria-controls="panel-routing" id="tab-routing" data-tab="routing-diagram">Routing</button>
+        <button class="tab-btn" role="tab" aria-selected="false" aria-controls="panel-dbflow" id="tab-dbflow" data-tab="dbflow">SQLite flow</button>
+      </div>
+
+      <div id="panel-system" class="tab-panel active" role="tabpanel" aria-labelledby="tab-system" data-panel="system">
+        <div class="diagram" role="img" aria-label="System architecture diagram">
+          <div class="flow">
+            <div class="node">Telegram User<small>chat / files</small></div><div class="arrow">→</div>
+            <div class="node">Bot API<small>getUpdates</small></div><div class="arrow">→</div>
+            <div class="node">PollingManager<small>per-bot lock</small></div><div class="arrow">→</div>
+            <div class="node">SQLite Queue<small>bot-scoped</small></div><div class="arrow">→</div>
+            <div class="node">Pi Session<small>[telegram] turn</small></div>
+          </div>
+        </div>
+      </div>
+
+      <div id="panel-routing" class="tab-panel" role="tabpanel" aria-labelledby="tab-routing" data-panel="routing-diagram">
+        <div class="diagram"><div class="flow">
+          <div class="node">Message<small>authorized user</small></div><div class="arrow">→</div>
+          <div class="node">Command?<small>status / health / ops</small></div><div class="arrow">→</div>
+          <div class="node">@session?<small>direct route</small></div><div class="arrow">→</div>
+          <div class="node">Capability?<small>INFO_REL + URL</small></div><div class="arrow">→</div>
+          <div class="node">Primary<small>safe fallback</small></div>
+        </div></div>
+      </div>
+
+      <div id="panel-dbflow" class="tab-panel" role="tabpanel" aria-labelledby="tab-dbflow" data-panel="dbflow">
+        <div class="diagram"><div class="flow">
+          <div class="dbnode">Poll Worker<small>insert/dedupe</small></div><div class="arrow">→</div>
+          <div class="dbnode">message_queue<small>pending work</small></div><div class="arrow">↔</div>
+          <div class="dbnode">Router / Drainer<small>assign + claim</small></div><div class="arrow">↔</div>
+          <div class="dbnode">relay_sessions<small>liveness</small></div><div class="arrow">↔</div>
+          <div class="dbnode">MCP tools<small>ops + stats</small></div>
+        </div></div>
+      </div>
+
+      <h3>Runtime components</h3>
+      <table>
+        <thead><tr><th>Component</th><th>Path</th><th>Responsibility</th></tr></thead>
+        <tbody>
+          <tr><td>Extension entrypoint</td><td><code>src/index.ts</code></td><td>Commands, tools, session lifecycle, routing, queue draining.</td></tr>
+          <tr><td>Configuration</td><td><code>src/config.ts</code></td><td>Bot context, global/project config, DB path, split-DB checks.</td></tr>
+          <tr><td>SQLite persistence</td><td><code>src/db.ts</code></td><td>Queue, relay sessions, downloads, pub-sub, migrations.</td></tr>
+          <tr><td>Polling manager</td><td><code>src/polling-manager.ts</code></td><td>Worker lifecycle and per-bot lock management.</td></tr>
+          <tr><td>Relay</td><td><code>src/relay.ts</code></td><td>Authenticated local HTTP forwarding between sessions.</td></tr>
+          <tr><td>Session registry</td><td><code>src/session-registry.ts</code></td><td>Liveness checks, reconciliation, ghost eviction, primary election.</td></tr>
+          <tr><td>Capabilities</td><td><code>src/capabilities.ts</code></td><td>Capability detection and message matching.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="sqlite" class="card">
+      <h2>SQLite database architecture</h2>
+      <p>SQLite is the shared coordination layer. It is local-first, durable, and safe for multiple Pi sessions through WAL mode and bot-scoped queries.</p>
+
+      <div class="grid cols-3">
+        <div class="mini"><strong>Path</strong><p>Default: <code>~/.pi/agent/teleg-bridge.db</code>. Override with <code>TELEG_DB_PATH</code>.</p></div>
+        <div class="mini"><strong>Runtime pragmas</strong><p><code>journal_mode=WAL</code>, <code>busy_timeout=5000</code>, <code>synchronous=NORMAL</code>.</p></div>
+        <div class="mini"><strong>Scope</strong><p><code>bot_id</code> scopes messages, sessions, downloads, and pub-sub rows.</p></div>
+      </div>
+
+      <h3>Logical schema</h3>
+      <p>Click any table header to collapse or expand its fields.</p>
+      <div class="diagram" role="img" aria-label="SQLite logical schema">
+        <div class="schema-grid">
+          <article class="schema-card"><button type="button">message_queue</button><ul><li><span class="pk">PK</span> id</li><li><span class="fk">bot_id</span></li><li>chat_id, message_id</li><li>from_user_id, from_username</li><li>text</li><li>session_id, session_name</li><li>status: pending / processing / completed / failed</li><li>source: telegram / relay</li><li>timestamps, error, response</li></ul></article>
+          <article class="schema-card"><button type="button">relay_sessions</button><ul><li><span class="pk">PK</span> id</li><li><span class="fk">bot_id</span></li><li>session_name, session_id</li><li>pid, port, secret</li><li>project_dir</li><li>capabilities JSON</li><li>role: active / drain</li><li>is_primary</li><li>registered_at, last_heartbeat</li></ul></article>
+          <article class="schema-card"><button type="button">download_queue</button><ul><li><span class="pk">PK</span> id</li><li><span class="fk">bot_id</span></li><li>chat_id, message_id</li><li>url</li><li>source: twitter / youtube / reddit / gallery / other</li><li>session_name</li><li>status, retry_count</li><li>error, result, timestamps</li></ul></article>
+          <article class="schema-card"><button type="button">relay_history</button><ul><li><span class="pk">PK</span> id</li><li>from_session</li><li>to_session</li><li>chat_id</li><li>command</li><li>success</li><li>error</li><li>created_at</li></ul></article>
+          <article class="schema-card"><button type="button">pubsub</button><ul><li><span class="pk">PK</span> id</li><li><span class="fk">bot_id</span></li><li>channel</li><li>publisher</li><li>payload</li><li>target_session</li><li>consumed_by</li><li>created_at, consumed_at</li></ul></article>
+        </div>
+      </div>
+
+      <h3>Indexes and constraints</h3>
+      <table>
+        <thead><tr><th>Table</th><th>Indexes / constraints</th></tr></thead>
+        <tbody>
+          <tr><td><code>message_queue</code></td><td><code>idx_queue_status</code>, <code>idx_queue_session</code>, <code>idx_queue_chat</code>, <code>idx_queue_bot_id</code>, unique <code>idx_queue_dedup(bot_id, chat_id, message_id)</code>.</td></tr>
+          <tr><td><code>relay_sessions</code></td><td>unique <code>idx_relay_name(bot_id, session_name)</code>, <code>idx_relay_pid</code>, <code>idx_relay_bot_id</code>.</td></tr>
+          <tr><td><code>download_queue</code></td><td><code>idx_dl_status</code>, <code>idx_dl_session</code>, <code>idx_dl_created</code>, <code>idx_dl_url</code>, <code>idx_dl_bot_id</code>.</td></tr>
+          <tr><td><code>relay_history</code></td><td><code>idx_relay_history_time(created_at)</code>.</td></tr>
+          <tr><td><code>pubsub</code></td><td><code>idx_pubsub_channel(channel, consumed_at)</code>, <code>idx_pubsub_target(target_session, consumed_at)</code>, <code>idx_pubsub_bot(bot_id, channel)</code>.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Queue state machine</h3>
+      <div class="diagram">
+        <div class="state-machine" role="group" aria-label="Queue states">
+          <button class="state-pill" type="button" aria-pressed="true" data-state="pending">pending</button>
+          <div class="arrow">→</div>
+          <button class="state-pill" type="button" aria-pressed="false" data-state="processing">processing</button>
+          <div class="arrow">→</div>
+          <button class="state-pill" type="button" aria-pressed="false" data-state="completed">completed / failed</button>
+        </div>
+        <div id="stateDetail" class="state-detail">Rows start as <strong>pending</strong> when inserted from Telegram or relay. A session can then claim the row for processing.</div>
+      </div>
+    </section>
+
+    <section id="workflow" class="card">
+      <h2>Workflow</h2>
+      <div class="timeline">
+        <div class="step"><div><h3>Setup</h3><p>Install, build, deploy, then configure the bot with <code>/teleg-setup</code>, config files, or environment variables.</p></div></div>
+        <div class="step"><div><h3>Session registration</h3><p>Resolve <code>BotContext</code>, detect capabilities from <code>INFO_REL.md</code>, start relay server, register in SQLite, and heartbeat.</p></div></div>
+        <div class="step"><div><h3>Polling</h3><p>One session per bot acquires <code>polling-{botId}.lock</code>; other linked sessions remain available for routed work.</p></div></div>
+        <div class="step"><div><h3>Routing</h3><p>Commands are handled first, then direct route, capability route, and primary fallback.</p></div></div>
+        <div class="step"><div><h3>Response</h3><p>The selected session completes the <code>[telegram]</code> turn and the bridge sends replies or attachments.</p></div></div>
+        <div class="step"><div><h3>Reconciliation</h3><p>Reconcile sessions, evict ghosts, reset stuck queue rows, and elect a primary.</p></div></div>
+      </div>
+    </section>
+
+    <section id="routing" class="card">
+      <h2>Routing and capabilities</h2>
+      <p>Sessions declare capabilities in <code>INFO_REL.md</code>. The router checks direct targets and capability matches only if sessions are live.</p>
+      <div class="codebox"><button class="copy-btn" type="button">Copy</button><pre><code># INFO_REL
+
+## capabilities
+telegram-bridge, messaging, relay, routing
+
+## description
+Multi-session Telegram bridge extension for Pi. Handles polling, session routing, message relay, and capability-based smart message distribution between Pi sessions.</code></pre></div>
+      <div class="chip-row">
+        <span class="chip"><b>1</b> Telegram commands</span>
+        <span class="chip"><b>2</b> @sessionName</span>
+        <span class="chip"><b>3</b> capability match</span>
+        <span class="chip"><b>4</b> primary fallback</span>
+      </div>
+    </section>
+
+    <section id="capabilities" class="card">
+      <h2>Capability listing</h2>
+      <div class="grid cols-2">
+        <div class="mini"><strong>Telegram I/O</strong><p>Polling private chats, groups, supergroups, and configured channels; authorized intake, chunked replies, media sends, attachments, typing indicator.</p></div>
+        <div class="mini"><strong>Multi-session routing</strong><p>Direct routing, capability matching, primary fallback, cross-session HTTP relay.</p></div>
+        <div class="mini"><strong>SQLite persistence</strong><p>Message queue, download queue, relay registry, relay history, and pub-sub delegation.</p></div>
+        <div class="mini"><strong>Reliability</strong><p>WAL mode, per-bot locks, stale message recovery, liveness checks, ghost eviction.</p></div>
+        <div class="mini"><strong>Configuration</strong><p>Global multi-bot config, project config, environment overrides, split-DB warnings.</p></div>
+        <div class="mini"><strong>Agent tooling</strong><p>MCP tools for messaging, file attachment, queue inspection, reconciliation, and session operations.</p></div>
+      </div>
+    </section>
+
+    <section id="commands" class="card">
+      <h2>Commands and MCP tools</h2>
+      <p>Search commands and tools by name or purpose.</p>
+      <div class="search-row"><label class="sr-only" for="commandSearch">Search commands and tools</label><input id="commandSearch" type="search" placeholder="Search: status, reconcile, attach, queue..." /></div>
+      <table id="commandTable">
+        <thead><tr><th>Name</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>/status</code></td><td>Telegram</td><td>Show connection, sessions, relay state, queue, and bot info.</td></tr>
+          <tr><td><code>/chatid</code></td><td>Telegram</td><td>Show current chat/user IDs for group and channel setup.</td></tr>
+          <tr><td><code>/queue [session]</code></td><td>Telegram</td><td>Inspect queue state for a session or primary.</td></tr>
+          <tr><td><code>/teleg-reconcile</code></td><td>Telegram</td><td>Reconcile sessions and evict ghosts.</td></tr>
+          <tr><td><code>/teleg-sessions</code></td><td>Telegram</td><td>List sessions with liveness state.</td></tr>
+          <tr><td><code>/teleg-set-primary &lt;name&gt;</code></td><td>Telegram</td><td>Set primary session.</td></tr>
+          <tr><td><code>/teleg-clean-db</code></td><td>Telegram</td><td>Reset processing queue and purge old rows.</td></tr>
+          <tr><td><code>/teleg-setup</code></td><td>Pi command</td><td>Configure bot token and pairing.</td></tr>
+          <tr><td><code>teleg-send_message</code></td><td>MCP tool</td><td>Send text to Telegram.</td></tr>
+          <tr><td><code>teleg-send_photo</code></td><td>MCP tool</td><td>Send a local image as a Telegram photo.</td></tr>
+          <tr><td><code>teleg-send_video</code></td><td>MCP tool</td><td>Send a local video as a Telegram video.</td></tr>
+          <tr><td><code>teleg-attach</code></td><td>MCP tool</td><td>Queue local files for the active Telegram reply.</td></tr>
+          <tr><td><code>get_queue_stats</code></td><td>MCP tool</td><td>Inspect queue and download stats.</td></tr>
+          <tr><td><code>teleg-list_sessions</code></td><td>MCP tool</td><td>List relay sessions with liveness.</td></tr>
+          <tr><td><code>teleg-evict_session</code></td><td>MCP tool</td><td>Evict a session and optionally reset its queue or kill PID.</td></tr>
+          <tr><td><code>teleg-list_bots</code></td><td>MCP tool</td><td>List configured bots.</td></tr>
+          <tr><td><code>teleg-publish</code></td><td>MCP tool</td><td>Publish work to a capability channel or target session.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="configuration" class="card">
+      <h2>Configuration</h2>
+      <div class="grid cols-2">
+        <div>
+          <h3>Environment variables</h3>
+          <table><tbody>
+            <tr><td><code>TELEG_BOT_TOKEN</code></td><td>Force token for this process.</td></tr>
+            <tr><td><code>TELEG_BOT_ID</code></td><td>Select bot from global config.</td></tr>
+            <tr><td><code>TELEG_DB_PATH</code></td><td>Shared SQLite DB path.</td></tr>
+            <tr><td><code>TELEG_LIVENESS_MS</code></td><td>Heartbeat freshness threshold.</td></tr>
+            <tr><td><code>TELEG_DRAIN_INTERVAL_MS</code></td><td>Idle drain interval.</td></tr>
+            <tr><td><code>TELEG_CLAIM_OTHERS</code></td><td>Allow claiming other sessions' pending work.</td></tr>
+          </tbody></table>
+          <h3>Group and channel authorization</h3>
+          <table><tbody>
+            <tr><td>Private</td><td><code>from.id</code> must be in <code>allowedUserIds</code>, except first pairing.</td></tr>
+            <tr><td>Group / supergroup</td><td>The configured user can request from that chat; replies go back to that group message.</td></tr>
+            <tr><td>Channel</td><td>Channel posts normally have no user ID, so <code>chat.id</code> must be in <code>allowedChatIds</code>.</td></tr>
+          </tbody></table>
+          <p>In groups, BotFather privacy mode controls whether the bot receives all messages or only commands, replies, and mentions. Group commands like <code>/status@YourBot</code> are normalized to <code>/status</code>.</p>
+        </div>
+        <div>
+          <h3>Config templates</h3>
+          <div class="codebox"><button class="copy-btn" type="button">Copy</button><pre><code>{
+  "version": 2,
+  "defaultBotId": 123456789,
+  "bots": {
+    "123456789": {
+      "botToken": "TOKEN",
+      "botUsername": "my_bot",
+      "allowedUserIds": [987654321],
+      "allowedChatIds": [-1001234567890],
+      "lastUpdateId": 0
+    }
+  }
+}</code></pre></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="operations" class="card">
+      <h2>Operational guardrails</h2>
+      <div class="grid cols-3">
+        <div class="mini"><strong>Do not split DBs for one bot</strong><p>Sessions sharing a bot should share the same <code>TELEG_DB_PATH</code>.</p></div>
+        <div class="mini"><strong>Evict ghost sessions</strong><p>Use <code>/teleg-reconcile</code> or <code>teleg-evict_session</code> after hard kills.</p></div>
+        <div class="mini"><strong>Declare capabilities</strong><p>Add <code>INFO_REL.md</code> so Telegram messages route to the correct workspace.</p></div>
+      </div>
+      <h3>Install and build</h3>
+      <div class="codebox"><button class="copy-btn" type="button">Copy</button><pre><code>npm install
+npm run build
+./deploy.sh</code></pre></div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="shell">Pastel interactive project overview for <strong>pi-teleg / teleg-bridge</strong>. See <a href="README.md">README.md</a>, <a href="docs/GROUP_CHANNEL_SUPPORT.md">group/channel support</a>, and <a href="graphify-out/GRAPH_REPORT.md">Graphify report</a>.</div>
+  </footer>
+
+  <script>
+    const root = document.documentElement;
+    const storedTheme = localStorage.getItem('teleg-theme');
+    if (storedTheme) root.dataset.theme = storedTheme;
+
+    const themeToggle = document.getElementById('themeToggle');
+    const setThemeLabel = () => { themeToggle.textContent = root.dataset.theme === 'night' ? 'Pastel day' : 'Night mode'; };
+    setThemeLabel();
+    themeToggle.addEventListener('click', () => {
+      root.dataset.theme = root.dataset.theme === 'night' ? 'pastel' : 'night';
+      localStorage.setItem('teleg-theme', root.dataset.theme);
+      setThemeLabel();
+    });
+
+    document.querySelectorAll('.tab-btn').forEach((button) => {
+      button.addEventListener('click', () => {
+        const tab = button.dataset.tab;
+        document.querySelectorAll('.tab-btn').forEach((b) => b.setAttribute('aria-selected', String(b === button)));
+        document.querySelectorAll('.tab-panel').forEach((panel) => panel.classList.toggle('active', panel.dataset.panel === tab));
+      });
+    });
+
+    document.querySelectorAll('.schema-card button').forEach((button) => {
+      button.addEventListener('click', () => {
+        const card = button.closest('.schema-card');
+        card.classList.toggle('collapsed');
+        button.setAttribute('aria-expanded', String(!card.classList.contains('collapsed')));
+      });
+      button.setAttribute('aria-expanded', 'true');
+    });
+
+    const stateDetails = {
+      pending: 'Rows start as pending when inserted from Telegram or relay. Targeted rows may already include session_name and a synthetic session_id.',
+      processing: 'A live session claims the row with claimNextMessage or markMessageProcessing. The row records started_at, session_id, and session_name.',
+      completed: 'Processing ends with completeMessage(response) or failMessage(error). Stale processing rows can be reset to pending during recovery.'
+    };
+    const stateDetail = document.getElementById('stateDetail');
+    document.querySelectorAll('.state-pill').forEach((button) => {
+      button.addEventListener('click', () => {
+        document.querySelectorAll('.state-pill').forEach((b) => b.setAttribute('aria-pressed', String(b === button)));
+        stateDetail.innerHTML = stateDetails[button.dataset.state];
+      });
+    });
+
+    document.querySelectorAll('.copy-btn').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const code = button.parentElement.querySelector('code, pre').innerText;
+        await navigator.clipboard.writeText(code);
+        const old = button.textContent;
+        button.textContent = 'Copied';
+        setTimeout(() => { button.textContent = old; }, 1200);
+      });
+    });
+
+    const search = document.getElementById('commandSearch');
+    const rows = Array.from(document.querySelectorAll('#commandTable tbody tr'));
+    search.addEventListener('input', () => {
+      const query = search.value.trim().toLowerCase();
+      rows.forEach((row) => { row.style.display = row.innerText.toLowerCase().includes(query) ? '' : 'none'; });
+    });
+
+    const cards = document.querySelectorAll('.card');
+    const reveal = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => { if (entry.isIntersecting) entry.target.classList.add('visible'); });
+    }, { threshold: 0.12 });
+    cards.forEach((card) => reveal.observe(card));
+
+    const navLinks = Array.from(document.querySelectorAll('nav.toc a'));
+    const sections = navLinks.map((link) => document.querySelector(link.getAttribute('href'))).filter(Boolean);
+    const spy = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        if (!entry.isIntersecting) return;
+        navLinks.forEach((link) => link.classList.toggle('active', link.getAttribute('href') === '#' + entry.target.id));
+      });
+    }, { rootMargin: '-35% 0px -55% 0px' });
+    sections.forEach((section) => spy.observe(section));
+  </script>
+</body>
+</html>

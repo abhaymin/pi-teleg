@@ -68,6 +68,8 @@ interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
   edited_message?: TelegramMessage;
+  channel_post?: TelegramMessage;
+  edited_channel_post?: TelegramMessage;
 }
 
 type WorkerMessage =
@@ -257,7 +259,7 @@ async function pollLoop(): Promise<void> {
     const recovered = getDb().prepare(
       "UPDATE message_queue SET status = 'pending', started_at = NULL, session_id = 'unassigned', session_name = 'unknown' WHERE status = 'processing'"
     ).run().changes;
-    if (recovered > 0) console.log(`[teleg-poll] Recovered ${recovered} stale processing messages`);
+
   } catch (e) {
     console.error("[teleg-poll] Recovery error:", e);
   }
@@ -268,7 +270,7 @@ async function pollLoop(): Promise<void> {
         offset: lastUpdateId !== undefined ? lastUpdateId + 1 : undefined,
         limit: 10,
         timeout: POLL_TIMEOUT,
-        allowed_updates: ["message", "edited_message"],
+        allowed_updates: ["message", "edited_message", "channel_post", "edited_channel_post"],
       });
 
       consecutiveErrors = 0;
@@ -279,13 +281,8 @@ async function pollLoop(): Promise<void> {
       for (const update of updates) {
         lastUpdateId = update.update_id;
 
-        const message = update.message || update.edited_message;
-        if (
-          !message ||
-          message.chat.type !== "private" ||
-          !message.from ||
-          message.from.is_bot
-        ) {
+        const message = update.message || update.edited_message || update.channel_post || update.edited_channel_post;
+        if (!message || (message.from && message.from.is_bot)) {
           continue;
         }
 

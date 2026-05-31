@@ -272,7 +272,7 @@ export function evictSession(botId: number, sessionName: string): void {
     // Best effort - file may already be gone
   }
   
-  console.log(`[registry] Evicted session: ${sessionName} (bot: ${botId})`);
+
 }
 
 // ============================================================================
@@ -291,7 +291,7 @@ export function electPrimary(botId: number): string | null {
   const sessions = getRelaySessionsForBot(botId);
   
   if (sessions.length === 0) {
-    console.log(`[registry] No sessions available for primary election (bot: ${botId})`);
+  
     return null;
   }
   
@@ -329,7 +329,7 @@ export function electPrimary(botId: number): string | null {
   clearPrimary(botId);
   Db.setPrimary(botId, winner.session_name);
   
-  console.log(`[registry] Elected new primary: ${winner.session_name} (bot: ${botId})`);
+
   
   return winner.session_name;
 }
