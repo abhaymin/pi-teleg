@@ -741,9 +741,12 @@ export function purgeOldMessages(keepCount: number = 1000, botId?: number): numb
 
   if (!row) return 0;
 
-  const result = d.prepare(`
-    DELETE FROM message_queue WHERE status IN ('completed', 'failed') AND bot_id = ? AND id < ?
-  `).run(botId, row.id);
+  const deleteSql = botId !== undefined
+    ? `DELETE FROM message_queue WHERE status IN ('completed', 'failed') AND bot_id = ? AND id < ?`
+    : `DELETE FROM message_queue WHERE status IN ('completed', 'failed') AND id < ?`;
+  const result = botId !== undefined
+    ? d.prepare(deleteSql).run(botId, row.id)
+    : d.prepare(deleteSql).run(row.id);
   return result.changes;
 }
 
@@ -954,7 +957,7 @@ export function setPrimary(botId: number, sessionName: string): void {
 export function cleanStaleRelaySessions(botId?: number): number {
   const whereClause = botId !== undefined ? `WHERE bot_id = ${botId}` : "";
   const sessions = getDb().prepare(`
-    SELECT session_name, pid FROM relay_sessions ${whereClause}
+    SELECT bot_id, session_name, pid FROM relay_sessions ${whereClause}
   `).all() as Array<{ session_name: string; pid: number; bot_id: number }>;
 
   let removed = 0;
@@ -1324,10 +1327,10 @@ export function runStartupRecovery(botId?: number): {
  */
 function mergeLocalSessionNames(): number {
   const db = getDb();
-  // Known local DB paths from before the dbPath fix
+  // Legacy recovery should only look at the DB alongside the deployed extension,
+  // not at arbitrary development checkouts.
   const localDbPaths = [
-    join(process.env.HOME || "~", "Development", "PTGD", "teleg", "teleg-bridge.db"),
-    join(process.env.HOME || "~", "Development", "PTGD", "data-scrapper", "teleg-bridge.db"),
+    join(dirname(__dirname), "teleg-bridge.db"),
   ];
   let merged = 0;
   for (const localPath of localDbPaths) {
