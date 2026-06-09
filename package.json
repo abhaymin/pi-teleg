@@ -15,6 +15,7 @@
     },
     "scripts": {
         "build": "tsc",
+        "test": "npm run build && node --test test/db.test.js",
         "dev": "tsc --watch",
         "prepublishOnly": "npm run build",
         "build:mcp": "cd mcp-server && npm install",
