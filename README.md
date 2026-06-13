@@ -22,13 +22,14 @@ The project is especially useful when you keep multiple specialized Pi sessions 
 
 ## Core Capabilities
 
-### Messaging and Telegram I/O
-
 | Capability | Description |
 |---|---|
 | Telegram polling | Uses Telegram `getUpdates` through one active poller per bot token. |
 | Message forwarding | Converts authorized Telegram messages into Pi turns prefixed with `[telegram]`. |
 | Reply delivery | Sends final agent responses back to Telegram. |
+| Reply context capture | Reconstructs each message's `reply_to_message` chain and prior DB history and folds it into the `[telegram]` turn so the agent has conversational context. |
+| Chat media retrieval | The poll worker downloads photos, videos, animations, documents, audio, voice, and stickers from chat messages into a per-bot local media cache and surfaces their file paths to the agent (Telegram's ~20 MB `getFile` limit applies). |
+| Telegram poll support | Poll messages are stored with their question and numbered options; poll-answer votes are forwarded to the polling session as ephemeral steer turns. |
 | Chunked text replies | Handles Telegram message length constraints. |
 | Photo and video sending | `teleg-send_photo` and `teleg-send_video` send local media files. |
 | File attachments | `teleg-attach` queues local files to send with the next Telegram reply. |
@@ -74,6 +75,7 @@ flowchart LR
   User[Telegram User] --> Bot[Telegram Bot API]
   Bot --> Poller[Per-bot PollingManager]
   Poller --> Worker[Poll Worker Thread]
+  Worker --> Media[(Local media cache)]
   Worker --> Queue[(SQLite message_queue)]
   Queue --> Router[Routing Decision]
   Router --> Direct[Session Route]
@@ -92,11 +94,11 @@ flowchart LR
 
 | Component | Path | Responsibility |
 |---|---|---|
-| Extension entrypoint | `src/index.ts` | Registers Pi commands/tools, manages session lifecycle, drains queue, handles Telegram turns. |
+| Extension entrypoint | `src/index.ts` | Registers Pi commands/tools, manages session lifecycle, drains queue, and handles Telegram turns including reply context, incoming media, and poll-answer forwarding. |
 | Configuration | `src/config.ts` | Resolves bot context, global/project config, DB path, bot migration, split-DB checks. |
 | SQLite persistence | `src/db.ts` | Stores message queue, relay sessions, downloads, pub-sub, stats, and schema migrations. |
 | Polling manager | `src/polling-manager.ts` | Starts/stops one worker per bot and maintains bot-specific polling locks. |
-| Poll worker | `src/poll-worker.ts` | Long-polls Telegram and persists updates into SQLite. |
+| Poll worker | `src/poll-worker.ts` | Long-polls Telegram, downloads chat media to a local cache, and persists messages (including polls and reply context) into SQLite. |
 | Relay server/client | `src/relay.ts` | Runs local HTTP relay endpoints and forwards commands between sessions. |
 | Session registry | `src/session-registry.ts` | Checks liveness, reconciles sessions, evicts ghosts, elects primary. |
 | Session config | `src/session-config.ts` | Reads/writes session registry and user allowlist/archive settings. |
@@ -117,7 +119,7 @@ flowchart LR
 | Journal mode | `PRAGMA journal_mode=WAL` for safer concurrent session access. |
 | Busy timeout | `PRAGMA busy_timeout=5000` to reduce write-contention failures. |
 | Sync mode | `PRAGMA synchronous=NORMAL` for WAL-friendly durability/performance balance. |
-| Schema version | `PRAGMA user_version = 2` after migration. |
+| Schema version | `PRAGMA user_version = 4` after migration (v3 added `reply_to_message_id`; v4 added `attachments` and `poll_id`). |
 | Scope key | Most runtime tables are scoped by `bot_id`. |
 
 ### Database responsibility diagram
@@ -126,6 +128,7 @@ flowchart LR
 flowchart TD
   Telegram[Telegram Bot API] --> Worker[poll-worker.ts]
   Worker --> MQ[(message_queue)]
+  Worker --> Media[(teleg-media cache)]
   Router[index.ts routing] --> MQ
   Router --> RS[(relay_sessions)]
   Router --> RH[(relay_history)]
@@ -160,9 +163,12 @@ erDiagram
     integer bot_id
     integer chat_id
     integer message_id
+    integer reply_to_message_id
     integer from_user_id
     text from_username
     text text
+    text attachments "JSON array of incoming media"
+    text poll_id
     text session_id
     text session_name
     text status "pending|processing|completed|failed"
@@ -261,7 +267,9 @@ stateDiagram-v2
 
 | Flow | Read / Write Path |
 |---|---|
-| Incoming Telegram update | `poll-worker.ts` inserts or deduplicates into `message_queue` by `(bot_id, chat_id, message_id)`. |
+| Incoming Telegram update | `poll-worker.ts` inserts or deduplicates into `message_queue` by `(bot_id, chat_id, message_id)`, storing `reply_to_message_id`, downloaded media paths in `attachments`, and any `poll_id`. |
+| Chat media retrieval | The worker downloads attached media via `getFile` into `~/.pi/agent/tmp/teleg-media/<botId>/` and records the local paths in `message_queue.attachments`; the dispatching session exposes them to the agent. |
+| Poll capture and answers | Poll messages are stored with formatted question/options text and a `poll_id`; later `poll_answer` updates are matched by `poll_id` and surfaced to the polling session as an ephemeral steer turn. |
 | Session claim | Queue drainers call `claimNextMessage` / `claimNextMessageForSession`, moving rows from `pending` to `processing`. |
 | Route assignment | Router assigns `session_name` and synthetic `session_id` like `__session__:name` for targeted delivery. |
 | Completion | Active turn completion updates `message_queue.status`, `completed_at`, `response`, or `error`. |
@@ -342,6 +350,8 @@ Routing order is intentionally deterministic:
 2. Explicit `@sessionName` route.
 3. Capability match from the active session registry.
 4. Primary session fallback.
+
+Before a turn is dispatched it is enriched with conversational context: the `reply_to_message` chain is reconstructed, downloaded media is referenced by local file path, and poll messages carry their question and options.
 
 ### 4. Response workflow
 
@@ -442,6 +452,7 @@ Capability matching uses:
 | `~/.pi/agent/teleg-bridge.json` | Global multi-bot configuration. |
 | `~/.pi/agent/teleg-capabilities.json` | Runtime capability registry. |
 | `~/.pi/agent/tmp/teleg-bridge/polling-{botId}.lock` | Per-bot polling lock. |
+| `~/.pi/agent/tmp/teleg-media/{botId}/` | Per-bot cache for media downloaded from chat messages. |
 | `.pi/teleg.json` | Optional project-local bot pin used by the extension and MCP server. |
 | `INFO_REL.md` | Project capability declaration. |
 

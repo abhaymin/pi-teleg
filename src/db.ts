@@ -22,7 +22,7 @@ import { readGlobalConfigSync } from "./config.js";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // Schema version for migrations
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 // DB path: env override → shared default
 const DEFAULT_DB_PATH = join(process.env.HOME || "~", ".pi", "agent", "teleg-bridge.db");
@@ -51,6 +51,10 @@ export interface QueuedMessage {
   completed_at: number | null;
   error: string | null;
   response: string | null;
+  // v4: JSON array of downloaded incoming media [{path, fileName, type}]
+  attachments: string | null;
+  // v4: Telegram poll id linking a poll message to its poll_answer updates
+  poll_id: string | null;
 }
 
 export interface RelaySession {
@@ -138,6 +142,11 @@ function runMigrations(database: DatabaseSync): void {
   // Migration from v2 to v3: Add reply_to_message_id column
   if (currentVersion < 3) {
     migrateToV3(database);
+  }
+
+  // Migration from v3 to v4: Add attachments (incoming media JSON) + poll_id
+  if (currentVersion < 4) {
+    migrateToV4(database);
   }
 
   initSchema(database);
@@ -247,6 +256,28 @@ function migrateToV3(database: DatabaseSync): void {
     }
   }
 }
+function migrateToV4(database: DatabaseSync): void {
+  const tableExists = (database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='message_queue'").get() as { name: string } | undefined) != null;
+  if (!tableExists) return; // initSchema will create the table with the columns
+
+  // JSON array of downloaded incoming media: [{path, fileName, type}]
+  try {
+    database.exec(`ALTER TABLE message_queue ADD COLUMN attachments TEXT`);
+  } catch (err) {
+    if (!(err instanceof Error && (err.message.includes("duplicate column") || err.message.includes("no such table")))) {
+      console.error("[db] Error adding attachments to message_queue:", err);
+    }
+  }
+
+  // Telegram poll id linking a poll message to its poll_answer updates
+  try {
+    database.exec(`ALTER TABLE message_queue ADD COLUMN poll_id TEXT`);
+  } catch (err) {
+    if (!(err instanceof Error && (err.message.includes("duplicate column") || err.message.includes("no such table")))) {
+      console.error("[db] Error adding poll_id to message_queue:", err);
+    }
+  }
+}
 
 function repairLegacyRelaySessionsSchema(database: DatabaseSync): void {
   const row = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'relay_sessions'").get() as { sql?: string } | undefined;
@@ -314,7 +345,9 @@ function initSchema(database: DatabaseSync): void {
       started_at        INTEGER,
       completed_at      INTEGER,
       error             TEXT,
-      response          TEXT
+      response          TEXT,
+      attachments       TEXT,
+      poll_id           TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_queue_status ON message_queue(status);
@@ -435,11 +468,13 @@ export function enqueueMessage(params: {
   session_name?: string;
   source?: "telegram" | "relay";
   source_session?: string | null;
+  attachments?: string | null;
+  poll_id?: string | null;
 }): number {
   const d = getDb();
   const stmt = d.prepare(`
-    INSERT INTO message_queue (bot_id, chat_id, message_id, reply_to_message_id, from_user_id, from_username, text, session_id, session_name, source, source_session)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO message_queue (bot_id, chat_id, message_id, reply_to_message_id, from_user_id, from_username, text, session_id, session_name, source, source_session, attachments, poll_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   stmt.run(
     params.bot_id,
@@ -453,6 +488,8 @@ export function enqueueMessage(params: {
     params.session_name || "unknown",
     params.source || "telegram",
     params.source_session || null,
+    params.attachments ?? null,
+    params.poll_id ?? null,
   );
   // Get the last inserted row ID
   const row = d.prepare("SELECT last_insert_rowid() as id").get() as { id: number };

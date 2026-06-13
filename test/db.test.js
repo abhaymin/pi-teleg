@@ -538,6 +538,101 @@ test("app coverage", async (t) => {
     assert.equal(Db.getQueueStats(2).pending, 1);
   });
 
+  await t.test("v4 migration adds attachments + poll_id to an existing v3 message_queue", async () => {
+    resetState();
+    // Simulate a pre-v4 DB: create message_queue WITHOUT the new columns,
+    // stamp user_version=3, then re-open so the migration runs.
+    const seed = new DatabaseSync(dbPath);
+    seed.exec(`
+      CREATE TABLE message_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        bot_id INTEGER NOT NULL DEFAULT 0,
+        chat_id INTEGER NOT NULL,
+        message_id INTEGER NOT NULL,
+        reply_to_message_id INTEGER,
+        from_user_id INTEGER NOT NULL,
+        from_username TEXT,
+        text TEXT NOT NULL DEFAULT '',
+        session_id TEXT NOT NULL DEFAULT 'unassigned',
+        session_name TEXT NOT NULL DEFAULT 'unknown',
+        status TEXT NOT NULL DEFAULT 'pending',
+        source TEXT NOT NULL DEFAULT 'telegram',
+        source_session TEXT,
+        created_at INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000),
+        started_at INTEGER,
+        completed_at INTEGER,
+        error TEXT,
+        response TEXT
+      );
+    `);
+    seed.exec(`INSERT INTO message_queue (bot_id, chat_id, message_id, from_user_id, text) VALUES (1, 1, 1, 5, 'pre-v4 row')`);
+    seed.exec(`PRAGMA user_version = 3`);
+    seed.close();
+    Db.closeDb();
+
+    const d = Db.getDb(); // migrateToV4 → ALTER TABLE ADD COLUMN attachments, poll_id
+    const cols = d.prepare("PRAGMA table_info(message_queue)").all().map((c) => c.name);
+    assert.ok(cols.includes("attachments"), "attachments column added by v4 migration");
+    assert.ok(cols.includes("poll_id"), "poll_id column added by v4 migration");
+
+    // Existing rows survive and the new columns are nullable.
+    const row = d.prepare("SELECT text, attachments, poll_id FROM message_queue WHERE message_id = 1").get();
+    assert.equal(row.text, "pre-v4 row");
+    assert.equal(row.attachments, null);
+    assert.equal(row.poll_id, null);
+    assert.equal(d.prepare("PRAGMA user_version").get().user_version, 4);
+  });
+
+  await t.test("attachments and poll_id persist and resolve (media + poll capture)", async () => {
+    resetState();
+    const d = Db.getDb();
+
+    // A poll-bearing message: poll_id links later poll_answer updates to this chat.
+    const pollText = "📊 Poll: Tea or coffee?\n  1. Tea\n  2. Coffee";
+    const pollId = Db.enqueueMessage({
+      bot_id: 7, chat_id: 300, message_id: 50, from_user_id: 99,
+      text: pollText, poll_id: "poll-abc",
+    });
+
+    // A media-bearing message: attachments is the JSON array the poll worker writes
+    // (local file paths downloaded via getFile).
+    const media = JSON.stringify([
+      { path: "/tmp/teleg-media/7/photo-x.jpg", fileName: "photo.jpg", type: "image" },
+      { path: "/tmp/teleg-media/7/doc-y.pdf", fileName: "report.pdf", type: "document" },
+    ]);
+    const mediaId = Db.enqueueMessage({
+      bot_id: 7, chat_id: 300, message_id: 51, from_user_id: 99,
+      text: "here is the photo", attachments: media,
+    });
+
+    // Columns persist verbatim.
+    assert.equal(d.prepare("SELECT poll_id, attachments FROM message_queue WHERE id = ?").get(pollId).poll_id, "poll-abc");
+    assert.equal(d.prepare("SELECT attachments FROM message_queue WHERE id = ?").get(pollId).attachments, null);
+    const mediaRow = d.prepare("SELECT poll_id, attachments FROM message_queue WHERE id = ?").get(mediaId);
+    assert.equal(mediaRow.poll_id, null);
+    assert.deepEqual(JSON.parse(mediaRow.attachments), JSON.parse(media));
+
+    // claimNextMessage surfaces the new fields on the returned row (draining
+    // sessions read attachments from here to populate incomingAttachments).
+    const first = Db.claimNextMessage(7, "session-7", "worker-7");
+    const second = Db.claimNextMessage(7, "session-7", "worker-7");
+    for (const row of [first, second]) {
+      assert.ok(row, "claimed row present");
+      assert.ok(Object.prototype.hasOwnProperty.call(row, "attachments"), "claimed row carries attachments");
+      assert.ok(Object.prototype.hasOwnProperty.call(row, "poll_id"), "claimed row carries poll_id");
+    }
+    assert.equal([first, second].find((r) => r.message_id === 50).poll_id, "poll-abc");
+    assert.deepEqual(JSON.parse([first, second].find((r) => r.message_id === 51).attachments), JSON.parse(media));
+
+    // poll_answer resolution mirrors index.ts onPollAnswer: link a vote back to
+    // its chat via poll_id, bot-scoped (a poll_id on another bot must not leak).
+    const lookup = d.prepare("SELECT chat_id, message_id, text FROM message_queue WHERE bot_id = ? AND poll_id = ? ORDER BY id DESC LIMIT 1").get(7, "poll-abc");
+    assert.equal(lookup.chat_id, 300);
+    assert.equal(lookup.message_id, 50);
+    assert.equal(lookup.text, pollText);
+    assert.equal(d.prepare("SELECT chat_id FROM message_queue WHERE bot_id = ? AND poll_id = ?").get(8, "poll-abc"), undefined);
+  });
+
   await t.test("fallback claim for silent sessions is bot-scoped and linked-only", async () => {
     resetState();
     const d = Db.getDb();

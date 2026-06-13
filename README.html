@@ -272,9 +272,9 @@
           <div class="flow">
             <div class="node">Telegram User<small>chat / files</small></div><div class="arrow">→</div>
             <div class="node">Bot API<small>getUpdates</small></div><div class="arrow">→</div>
-            <div class="node">PollingManager<small>per-bot lock</small></div><div class="arrow">→</div>
+            <div class="node">PollingManager<small>per-bot lock · media + polls</small></div><div class="arrow">→</div>
             <div class="node">SQLite Queue<small>bot-scoped</small></div><div class="arrow">→</div>
-            <div class="node">Pi Session<small>[telegram] turn</small></div>
+            <div class="node">Pi Session<small>[telegram] turn + reply context</small></div>
           </div>
         </div>
       </div>
@@ -291,7 +291,7 @@
 
       <div id="panel-dbflow" class="tab-panel" role="tabpanel" aria-labelledby="tab-dbflow" data-panel="dbflow">
         <div class="diagram"><div class="flow">
-          <div class="dbnode">Poll Worker<small>insert/dedupe</small></div><div class="arrow">→</div>
+          <div class="dbnode">Poll Worker<small>insert/dedupe · media · polls</small></div><div class="arrow">→</div>
           <div class="dbnode">message_queue<small>pending work</small></div><div class="arrow">↔</div>
           <div class="dbnode">Router / Drainer<small>assign + claim</small></div><div class="arrow">↔</div>
           <div class="dbnode">relay_sessions<small>liveness</small></div><div class="arrow">↔</div>
@@ -303,14 +303,14 @@
       <table>
         <thead><tr><th>Component</th><th>Path</th><th>Responsibility</th></tr></thead>
         <tbody>
-          <tr><td>Extension entrypoint</td><td><code>src/index.ts</code></td><td>Commands, tools, session lifecycle, routing, queue draining.</td></tr>
+          <tr><td>Extension entrypoint</td><td><code>src/index.ts</code></td><td>Commands, tools, session lifecycle, routing, queue draining, reply-context capture, incoming media retrieval, and poll handling.</td></tr>
           <tr><td>Configuration</td><td><code>src/config.ts</code></td><td>Bot context, global/project config, DB path, split-DB checks.</td></tr>
           <tr><td>SQLite persistence</td><td><code>src/db.ts</code></td><td>Queue, relay sessions, downloads, pub-sub, migrations.</td></tr>
           <tr><td>Polling manager</td><td><code>src/polling-manager.ts</code></td><td>Worker lifecycle and per-bot lock management.</td></tr>
+          <tr><td>Poll worker</td><td><code>src/poll-worker.ts</code></td><td>Long-polls Telegram, downloads chat media, and persists messages and polls.</td></tr>
           <tr><td>Relay</td><td><code>src/relay.ts</code></td><td>Authenticated local HTTP forwarding between sessions.</td></tr>
           <tr><td>Session registry</td><td><code>src/session-registry.ts</code></td><td>Liveness checks, reconciliation, ghost eviction, primary election.</td></tr>
           <tr><td>Capabilities</td><td><code>src/capabilities.ts</code></td><td>Capability detection and message matching.</td></tr>
-        </tbody>
       </table>
     </section>
 
@@ -328,12 +328,11 @@
       <p>Click any table header to collapse or expand its fields.</p>
       <div class="diagram" role="img" aria-label="SQLite logical schema">
         <div class="schema-grid">
-          <article class="schema-card"><button type="button">message_queue</button><ul><li><span class="pk">PK</span> id</li><li><span class="fk">bot_id</span></li><li>chat_id, message_id</li><li>from_user_id, from_username</li><li>text</li><li>session_id, session_name</li><li>status: pending / processing / completed / failed</li><li>source: telegram / relay</li><li>timestamps, error, response</li></ul></article>
+          <article class="schema-card"><button type="button">message_queue</button><ul><li><span class="pk">PK</span> id</li><li><span class="fk">bot_id</span></li><li>chat_id, message_id</li><li>reply_to_message_id</li><li>from_user_id, from_username</li><li>text</li><li>attachments: JSON media paths</li><li>poll_id</li><li>session_id, session_name</li><li>status: pending / processing / completed / failed</li><li>source: telegram / relay</li><li>timestamps, error, response</li></ul></article>
           <article class="schema-card"><button type="button">relay_sessions</button><ul><li><span class="pk">PK</span> id</li><li><span class="fk">bot_id</span></li><li>session_name, session_id</li><li>pid, port, secret</li><li>project_dir</li><li>capabilities JSON</li><li>role: active / drain</li><li>is_primary</li><li>registered_at, last_heartbeat</li></ul></article>
           <article class="schema-card"><button type="button">download_queue</button><ul><li><span class="pk">PK</span> id</li><li><span class="fk">bot_id</span></li><li>chat_id, message_id</li><li>url</li><li>source: twitter / youtube / reddit / gallery / other</li><li>session_name</li><li>status, retry_count</li><li>error, result, timestamps</li></ul></article>
           <article class="schema-card"><button type="button">relay_history</button><ul><li><span class="pk">PK</span> id</li><li>from_session</li><li>to_session</li><li>chat_id</li><li>command</li><li>success</li><li>error</li><li>created_at</li></ul></article>
           <article class="schema-card"><button type="button">pubsub</button><ul><li><span class="pk">PK</span> id</li><li><span class="fk">bot_id</span></li><li>channel</li><li>publisher</li><li>payload</li><li>target_session</li><li>consumed_by</li><li>created_at, consumed_at</li></ul></article>
-        </div>
       </div>
 
       <h3>Indexes and constraints</h3>
@@ -366,9 +365,9 @@
       <div class="timeline">
         <div class="step"><div><h3>Setup</h3><p>Install, build, deploy, then configure the bot with <code>/teleg-setup</code>, config files, or environment variables.</p></div></div>
         <div class="step"><div><h3>Session registration</h3><p>Resolve <code>BotContext</code>, detect capabilities from <code>INFO_REL.md</code>, start relay server, register in SQLite, and heartbeat.</p></div></div>
-        <div class="step"><div><h3>Polling</h3><p>One session per bot acquires <code>polling-{botId}.lock</code>; other linked sessions remain available for routed work.</p></div></div>
+        <div class="step"><div><h3>Polling</h3><p>One session per bot acquires <code>polling-{botId}.lock</code> and the worker long-polls Telegram, downloading chat media and capturing polls; other linked sessions remain available for routed work.</p></div></div>
         <div class="step"><div><h3>Routing</h3><p>Commands are handled first, then direct route, capability route, and primary fallback.</p></div></div>
-        <div class="step"><div><h3>Response</h3><p>The selected session completes the <code>[telegram]</code> turn and the bridge sends replies or attachments.</p></div></div>
+        <div class="step"><div><h3>Response</h3><p>The selected session completes the <code>[telegram]</code> turn — enriched with reply context, media paths, and poll content — and the bridge sends replies or attachments.</p></div></div>
         <div class="step"><div><h3>Reconciliation</h3><p>Reconcile sessions, evict ghosts, reset stuck queue rows, and elect a primary.</p></div></div>
       </div>
     </section>
@@ -394,7 +393,7 @@ Multi-session Telegram bridge extension for Pi. Handles polling, session routing
     <section id="capabilities" class="card">
       <h2>Capability listing</h2>
       <div class="grid cols-2">
-        <div class="mini"><strong>Telegram I/O</strong><p>Polling private chats, groups, supergroups, and configured channels; authorized intake, chunked replies, media sends, attachments, typing indicator.</p></div>
+        <div class="mini"><strong>Telegram I/O</strong><p>Polling private chats, groups, supergroups, and configured channels; authorized intake, reply-context capture, chat media retrieval, Telegram polls and poll-answer forwarding, chunked replies, media sends, attachments, typing indicator.</p></div>
         <div class="mini"><strong>Multi-session routing</strong><p>Direct routing, capability matching, primary fallback, cross-session HTTP relay.</p></div>
         <div class="mini"><strong>SQLite persistence</strong><p>Message queue, download queue, relay registry, relay history, and pub-sub delegation.</p></div>
         <div class="mini"><strong>Reliability</strong><p>WAL mode, per-bot locks, stale message recovery, liveness checks, ghost eviction.</p></div>

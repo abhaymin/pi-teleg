@@ -103,7 +103,13 @@ interface TelegramMessage {
   from?: TelegramUser;
   text?: string;
   caption?: string;
+  poll?: { id: string; question: string; options: Array<{ text: string }> };
   reply_to_message?: TelegramMessage;
+  photo?: Array<{ file_id: string; file_unique_id: string; width: number; height: number; file_size?: number }>;
+  video?: { file_id: string; file_unique_id: string; width: number; height: number; duration: number; file_size?: number };
+  document?: { file_id: string; file_unique_id: string; file_name?: string; mime_type?: string; file_size?: number };
+  audio?: { file_id: string; file_unique_id: string; duration: number; performer?: string; title?: string; mime_type?: string; file_size?: number };
+  voice?: { file_id: string; file_unique_id: string; duration: number; mime_type?: string; file_size?: number };
 }
 
 interface TelegramReactionType {
@@ -118,15 +124,6 @@ interface TelegramMessageReactionUpdated {
   date: number;
   old_reaction: TelegramReactionType[];
   new_reaction: TelegramReactionType[];
-}
-
-interface TelegramUpdate {
-  update_id: number;
-  message?: TelegramMessage;
-  edited_message?: TelegramMessage;
-  channel_post?: TelegramMessage;
-  edited_channel_post?: TelegramMessage;
-  message_reaction?: TelegramMessageReactionUpdated;
 }
 
 interface TelegramApiResponse<T> {
@@ -145,12 +142,27 @@ interface QueuedAttachment {
   fileName: string;
 }
 
+
+interface TelegramUpdate {
+  update_id: number;
+  message?: TelegramMessage;
+  edited_message?: TelegramMessage;
+  channel_post?: TelegramMessage;
+  edited_channel_post?: TelegramMessage;
+  message_reaction?: TelegramMessageReactionUpdated;
+  poll?: { id: string; question: string; options: Array<{ text: string }> };
+  poll_answer?: { poll_id: string; user?: { id: number; username?: string; first_name?: string }; option_ids: number[] };
+}
+
 interface PendingTelegramTurn {
   sessionId: string;
   sessionName: string;
   chatId: number;
   replyToMessageId: number;
   queuedAttachments: QueuedAttachment[];
+  // Media the Telegram user sent IN (downloaded by the poll worker). Local file
+  // paths the agent may read; never re-sent outbound on reply (unlike queuedAttachments).
+  incomingAttachments: QueuedAttachment[];
   content: Array<TextContent | ImageContent>;
   historyText: string;
   replyChainText?: string;
@@ -175,6 +187,46 @@ interface PendingForward {
   messageId: number;
   text: string;
   sourceSession: string;
+}
+
+// ============================================================================
+// Attachment / poll helpers
+// ============================================================================
+
+// Read the worker-downloaded local media paths persisted on the message row.
+// The poll worker downloads via getFile and stores a JSON array here; these are
+// real readable local paths (never Telegram file_ids).
+function readIncomingAttachments(dbId?: number): QueuedAttachment[] {
+  if (!dbId) return [];
+  try {
+    const row = Db.getDb().prepare("SELECT attachments FROM message_queue WHERE id = ?").get(dbId) as { attachments: string | null } | undefined;
+    if (!row?.attachments) return [];
+    const parsed = JSON.parse(row.attachments) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((a): a is { path: string; fileName: string } =>
+        typeof a === "object" && a !== null && typeof (a as { path?: unknown }).path === "string" && typeof (a as { fileName?: unknown }).fileName === "string")
+      .map((a) => ({ path: a.path, fileName: a.fileName }));
+  } catch {
+    return [];
+  }
+}
+
+function describePoll(message: TelegramMessage): string {
+  if (!message.poll) return "";
+  const options = message.poll.options.map((option, index) => `${index + 1}. ${option.text}`).join("\n");
+  return [`[poll] ${message.poll.question}`, options].join("\n");
+}
+
+// Recover option labels from a stored poll text block (produced by formatPollText
+// or describePoll) so a poll_answer's numeric option_ids can be shown by label.
+function parsePollOptions(pollText: string): string[] {
+  const out: string[] = [];
+  for (const line of pollText.split("\n")) {
+    const m = line.match(/^\s*\d+\.\s+(.+)$/);
+    if (m) out.push(m[1].trim());
+  }
+  return out;
 }
 
 // ============================================================================
@@ -1055,25 +1107,32 @@ export default function (pi: ExtensionAPI): void {
           state.config.botToken,
           String(message.chat.id),
           message.message_id,
-          `📥 Queued for @${sessionName}${pending > 0 ? ` (${pending} pending)` : ""}`
+          `📥 Queued for @${sessionName}${pending > 0 ? ` (${pending} pending)` : ""}`,
         );
       }
       return;
     }
-
-    markIncomingProcessing(dbId);
-
     // Build reply chain context from the nested reply_to_message and DB
     const replyChainText = buildReplyChain(message);
-    const historyText = replyChainText ? `${replyChainText}\n${rawText || "(no text)"}` : (rawText || "(no text)");
+    // Incoming media is downloaded by the poll worker and persisted on the row;
+    // read the real local paths here (never Telegram file_ids).
+    const incomingAttachments = readIncomingAttachments(dbId);
+    const mediaText = incomingAttachments.length > 0
+      ? `📎 Incoming media:\n${incomingAttachments.map(a => `- ${a.path} (${a.fileName})`).join("\n")}`
+      : "";
+    const pollText = describePoll(message);
+    const bodyText = [replyChainText, mediaText, pollText, rawText || "(no text)"]
+      .filter(Boolean)
+      .join("\n");
     const turn: PendingTelegramTurn = {
       sessionId,
       sessionName,
       chatId: message.chat.id,
       replyToMessageId: message.message_id,
       queuedAttachments: [],
-      content: [{ type: "text", text: `${TELEGRAM_PREFIX} ${historyText}` }],
-      historyText,
+      incomingAttachments,
+      content: [{ type: "text", text: `${TELEGRAM_PREFIX} ${bodyText}` }],
+      historyText: bodyText,
       replyChainText,
       dbId,
     };
@@ -1376,6 +1435,7 @@ export default function (pi: ExtensionAPI): void {
         chatId: next.chatId,
         replyToMessageId: next.messageId,
         queuedAttachments: [],
+        incomingAttachments: [],
         content: [{ type: "text", text: `${TELEGRAM_PREFIX} ${next.text}` }],
         historyText: next.text,
       };
@@ -2367,6 +2427,46 @@ export default function (pi: ExtensionAPI): void {
       console.log(`[teleg:${sessionName}] Reaction on msg ${reaction.message_id} in chat ${reaction.chat.id}: ${emojis} by ${reaction.user?.username || userId || "unknown"}`);
     });
 
+    // Wire up polling poll-answer handler. A poll_answer has no chat/message id,
+    // so link it back via the stored poll_id and surface the vote to this session
+    // as a steer turn when idle (ephemeral, like reactions — not durable in the queue).
+    pm?.onPollAnswer((update) => {
+      const pa = update.poll_answer;
+      if (!pa) return;
+      const paBotId = currentBotId();
+      if (!paBotId) return;
+      try {
+        const pollRow = Db.getDb().prepare(
+          "SELECT chat_id, message_id, text FROM message_queue WHERE bot_id = ? AND poll_id = ? ORDER BY id DESC LIMIT 1"
+        ).get(paBotId, pa.poll_id) as { chat_id: number; message_id: number; text: string } | undefined;
+        const voter = pa.user?.username || pa.user?.first_name || pa.user?.id || "someone";
+        if (!pollRow) {
+          console.log(`[teleg:${sessionName}] Poll answer for unknown poll ${pa.poll_id} by ${voter}: options ${pa.option_ids.join(",")}`);
+          return;
+        }
+        const optionLabels = parsePollOptions(pollRow.text);
+        const picked = pa.option_ids.map((i) => optionLabels[i] ?? `option ${i + 1}`).join(", ");
+        const answerText = `📊 Poll vote from ${voter} on:\n${pollRow.text}\nVoted: ${picked}`;
+        console.log(`[teleg:${sessionName}] poll_answer ${pa.poll_id} by ${voter}: ${picked}`);
+        if (!state.activeTurn && ctx.isIdle()) {
+          const turn: PendingTelegramTurn = {
+            sessionId,
+            sessionName,
+            chatId: pollRow.chat_id,
+            replyToMessageId: pollRow.message_id,
+            queuedAttachments: [],
+            incomingAttachments: [],
+            content: [{ type: "text", text: `${TELEGRAM_PREFIX} ${answerText}` }],
+            historyText: answerText,
+          };
+          activateTurn(turn as ActiveTelegramTurn);
+          pi.sendUserMessage(turn.content, { deliverAs: "steer" });
+        }
+      } catch (err) {
+        console.error(`[teleg:${sessionName}] poll_answer handling failed:`, err);
+      }
+    });
+
     // Periodic tasks: heartbeat, reconcile, polling restart
     setInterval(async () => {
       await heartbeatSession();
@@ -2408,6 +2508,7 @@ export default function (pi: ExtensionAPI): void {
               chatId: 0,
               replyToMessageId: 0,
               queuedAttachments: [],
+              incomingAttachments: [],
               content: [{ type: "text", text: `[telegram] [pubsub:${msg.channel}] ${msg.payload}` }],
               historyText: msg.payload,
             };
@@ -2449,6 +2550,7 @@ export default function (pi: ExtensionAPI): void {
                 chatId: unassigned.chat_id,
                 replyToMessageId: unassigned.message_id,
                 queuedAttachments: [],
+                incomingAttachments: [],
                 content: [{ type: "text", text: `[telegram] ${text}` }],
                 historyText: text,
                 dbId: unassigned.id,

@@ -16,12 +16,19 @@
 import { parentPort, workerData } from "node:worker_threads";
 import { DatabaseSync } from "node:sqlite";
 import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
-import { existsSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 
 // DB path: env override → workerData → shared default
 const DEFAULT_DB_PATH = join(process.env.HOME || "~", ".pi", "agent", "teleg-bridge.db");
 const DB_PATH = process.env.TELEG_DB_PATH || ((workerData as { dbPath?: string } | undefined)?.dbPath) || DEFAULT_DB_PATH;
+
+// Incoming media (photos/videos/documents/...) is downloaded here so any draining
+// session can read the local files referenced by the turn payload.
+const MEDIA_DIR = join(homedir(), ".pi", "agent", "tmp", "teleg-media");
+
+// Bot API getFile only serves files up to 20 MB; larger files cannot be fetched.
+const MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024;
 
 // ============================================================================
 // Types
@@ -56,6 +63,12 @@ interface TelegramChat {
   type: string;
 }
 
+interface TelegramFileRef {
+  file_id: string;
+  file_unique_id: string;
+  file_size?: number;
+}
+
 interface TelegramMessage {
   message_id: number;
   chat: TelegramChat;
@@ -63,6 +76,14 @@ interface TelegramMessage {
   text?: string;
   caption?: string;
   reply_to_message?: TelegramMessage;
+  poll?: TelegramPoll;
+  photo?: Array<TelegramFileRef & { width: number; height: number }>;
+  video?: TelegramFileRef & { width: number; height: number; duration: number };
+  animation?: TelegramFileRef & { width: number; height: number; duration: number };
+  document?: TelegramFileRef & { file_name?: string; mime_type?: string };
+  audio?: TelegramFileRef & { duration: number; performer?: string; title?: string; mime_type?: string };
+  voice?: TelegramFileRef & { duration: number; mime_type?: string };
+  sticker?: TelegramFileRef & { width: number; height: number; emoji?: string; is_animated?: boolean; is_video?: boolean };
 }
 
 interface TelegramReactionType {
@@ -79,6 +100,25 @@ interface TelegramMessageReactionUpdated {
   new_reaction: TelegramReactionType[];
 }
 
+interface TelegramPollOption {
+  text: string;
+  voter_count?: number;
+}
+
+interface TelegramPoll {
+  id: string;
+  question: string;
+  options: TelegramPollOption[];
+  is_anonymous?: boolean;
+  allows_multiple_answers?: boolean;
+}
+
+interface TelegramPollAnswer {
+  poll_id: string;
+ user?: TelegramUser;
+ option_ids: number[];
+}
+
 interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
@@ -86,6 +126,8 @@ interface TelegramUpdate {
   channel_post?: TelegramMessage;
   edited_channel_post?: TelegramMessage;
   message_reaction?: TelegramMessageReactionUpdated;
+  poll?: TelegramPoll;
+  poll_answer?: TelegramPollAnswer;
 }
 
 type WorkerMessage =
@@ -97,6 +139,8 @@ type WorkerMessage =
 type MainMessage =
   | { type: "message"; update: TelegramUpdate; dbId: number }
   | { type: "reaction"; update: TelegramUpdate }
+  | { type: "poll_answer"; update: TelegramUpdate }
+  | { type: "poll"; update: TelegramUpdate }
   | { type: "health"; healthy: boolean; consecutiveErrors: number }
   | { type: "error"; error: string }
   | { type: "started" }
@@ -181,11 +225,72 @@ async function callTelegram<T>(
   }
 }
 
-function persistMessage(message: TelegramMessage): number {
+interface TelegramFile {
+  file_id: string;
+  file_unique_id: string;
+  file_size?: number;
+  file_path?: string;
+}
+
+interface QueuedAttachment {
+  path: string;
+  fileName: string;
+  type: string;
+}
+
+/** Format a Telegram poll into a readable text block (question + numbered options). */
+function formatPollText(poll: TelegramPoll): string {
+  const options = poll.options.map((opt, i) => `  ${i + 1}. ${opt.text}`).join("\n");
+  const multi = poll.allows_multiple_answers ? " (multiple answers)" : "";
+  return `📊 Poll${multi}: ${poll.question}\n${options}`;
+}
+
+/** Best-effort download of all media attached to a message via the Bot API getFile endpoint. */
+async function downloadMedia(message: TelegramMessage): Promise<QueuedAttachment[]> {
+  const refs: Array<{ file_id: string; type: string; fileName?: string; file_size?: number }> = [];
+  if (message.photo && message.photo.length > 0) {
+    // photo is an array of sizes — keep the largest.
+    const largest = message.photo.reduce((a, b) => ((b.file_size ?? 0) > (a.file_size ?? 0) ? b : a));
+    refs.push({ file_id: largest.file_id, type: "image", file_size: largest.file_size });
+  }
+  if (message.video) refs.push({ file_id: message.video.file_id, type: "video", file_size: message.video.file_size });
+  if (message.animation) refs.push({ file_id: message.animation.file_id, type: "animation", file_size: message.animation.file_size });
+  if (message.document) refs.push({ file_id: message.document.file_id, type: "document", fileName: message.document.file_name, file_size: message.document.file_size });
+  if (message.audio) refs.push({ file_id: message.audio.file_id, type: "audio", file_size: message.audio.file_size });
+  if (message.voice) refs.push({ file_id: message.voice.file_id, type: "voice", file_size: message.voice.file_size });
+  if (message.sticker) refs.push({ file_id: message.sticker.file_id, type: "sticker", file_size: message.sticker.file_size });
+
+  const out: QueuedAttachment[] = [];
+  for (const ref of refs) {
+    // getFile only works for files ≤ 20 MB; skip larger ones up front.
+    if (ref.file_size && ref.file_size > MAX_DOWNLOAD_BYTES) continue;
+    try {
+      const file = await callTelegram<TelegramFile>("getFile", { file_id: ref.file_id }, 15000);
+      if (!file.file_path) continue;
+      const dir = join(MEDIA_DIR, String(botId));
+      mkdirSync(dir, { recursive: true });
+      const baseName = ref.fileName || file.file_path.split("/").pop() || ref.file_id;
+      const safeName = `${ref.type}-${file.file_unique_id || ref.file_id}-${baseName}`.replace(/[^A-Za-z0-9._-]/g, "_");
+      const path = join(dir, safeName);
+      const resp = await fetch(`https://api.telegram.org/file/bot${botToken}/${file.file_path}`);
+      if (!resp.ok) continue;
+      const buf = Buffer.from(await resp.arrayBuffer());
+      writeFileSync(path, buf);
+      out.push({ path, fileName: baseName, type: ref.type });
+    } catch (err) {
+      console.error(`[teleg-poll] media download failed (${ref.type}):`, err instanceof Error ? err.message : err);
+    }
+  }
+  return out;
+}
+
+function persistMessage(message: TelegramMessage, attachments: QueuedAttachment[] = [], pollId: string | null = null): number {
   const d = getDb();
+  const text = message.text || message.caption || (message.poll ? formatPollText(message.poll) : "");
+  const attachmentsJson = attachments.length > 0 ? JSON.stringify(attachments) : null;
   const stmt = d.prepare(`
-    INSERT INTO message_queue (bot_id, chat_id, message_id, reply_to_message_id, from_user_id, from_username, text, session_id, session_name, source)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'unassigned', 'unknown', 'telegram')
+    INSERT INTO message_queue (bot_id, chat_id, message_id, reply_to_message_id, from_user_id, from_username, text, session_id, session_name, source, attachments, poll_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'unassigned', 'unknown', 'telegram', ?, ?)
   `);
   try {
     stmt.run(
@@ -195,7 +300,9 @@ function persistMessage(message: TelegramMessage): number {
       message.reply_to_message?.message_id ?? null,
       message.from?.id ?? 0,
       message.from?.username ?? null,
-      message.text || message.caption || "",
+      text,
+      attachmentsJson,
+      pollId,
     );
     const row = d.prepare("SELECT last_insert_rowid() as id").get() as { id: number };
     return row.id;
@@ -254,7 +361,7 @@ async function pollLoop(): Promise<void> {
         offset: lastUpdateId !== undefined ? lastUpdateId + 1 : undefined,
         limit: 10,
         timeout: POLL_TIMEOUT,
-        allowed_updates: ["message", "edited_message", "channel_post", "edited_channel_post", "message_reaction"],
+        allowed_updates: ["message", "edited_message", "channel_post", "edited_channel_post", "message_reaction", "poll", "poll_answer"],
       });
 
       consecutiveErrors = 0;
@@ -271,13 +378,33 @@ async function pollLoop(): Promise<void> {
           continue;
         }
 
+        // Poll answers and standalone poll-state changes are not chat messages;
+        // forward them to the main thread which links them back to a chat.
+        if (update.poll_answer) {
+          post({ type: "poll_answer", update });
+          continue;
+        }
+        if (update.poll) {
+          post({ type: "poll", update });
+          continue;
+        }
+
         const message = update.message || update.edited_message || update.channel_post || update.edited_channel_post;
         if (!message || (message.from && message.from.is_bot)) {
           continue;
         }
 
+        // Download any attached media (best-effort) before persisting so the
+        // local file paths survive the queue and reach any draining session.
+        let attachments: QueuedAttachment[] = [];
+        try {
+          attachments = await downloadMedia(message);
+        } catch (e) {
+          console.error("[teleg-poll] media capture error:", e);
+        }
+
         // Persist to SQLite immediately
-        const dbId = persistMessage(message);
+        const dbId = persistMessage(message, attachments, message.poll ? message.poll.id : null);
 
         // Post to main thread for routing and dispatch
         post({ type: "message", update, dbId });

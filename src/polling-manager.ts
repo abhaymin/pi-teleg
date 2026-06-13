@@ -69,6 +69,8 @@ export interface TelegramUpdate {
   channel_post?: TelegramMessage;
   edited_channel_post?: TelegramMessage;
   message_reaction?: TelegramMessageReactionUpdated;
+  poll?: { id: string; question: string; options: Array<{ text: string }> };
+  poll_answer?: { poll_id: string; user?: { id: number; username?: string; first_name?: string }; option_ids: number[] };
 }
 
 export interface PendingTelegramTurn {
@@ -77,6 +79,9 @@ export interface PendingTelegramTurn {
   chatId: number;
   replyToMessageId: number;
   queuedAttachments: { path: string; fileName: string }[];
+  // Media the Telegram user sent IN. These are local file paths the agent may
+  // read; unlike queuedAttachments they are never re-sent outbound on reply.
+  incomingAttachments: { path: string; fileName: string; type: string }[];
   content: Array<{ type: "text" | string; text: string }>;
   historyText: string;
   replyChainText?: string;
@@ -90,7 +95,7 @@ export interface TurnQueueItem {
 }
 
 interface WorkerMessage {
-  type: "started" | "stopped" | "health" | "error" | "offset" | "message" | "reaction";
+  type: "started" | "stopped" | "health" | "error" | "offset" | "message" | "reaction" | "poll_answer" | "poll";
   healthy?: boolean;
   consecutiveErrors?: number;
   error?: string;
@@ -130,6 +135,21 @@ function normalizeSessionKey(sessionName: string): string {
   return sessionName.startsWith("__session__:") ? sessionName.slice("__session__:".length) : sessionName;
 }
 
+/** Parse the JSON attachments column into typed incoming media descriptors. */
+function parseAttachments(json: string | null): Array<{ path: string; fileName: string; type: string }> {
+  if (!json) return [];
+  try {
+    const parsed = JSON.parse(json) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((a): a is { path: string; fileName: string; type?: string } =>
+        typeof a === "object" && a !== null && typeof (a as { path?: unknown }).path === "string" && typeof (a as { fileName?: unknown }).fileName === "string")
+      .map((a) => ({ path: a.path, fileName: a.fileName, type: a.type ?? "media" }));
+  } catch {
+    return [];
+  }
+}
+
 export class PollingManager {
   readonly botId: number;
   private worker: Worker | null = null;
@@ -141,6 +161,8 @@ export class PollingManager {
   private activeTurns = new Map<string, PendingTelegramTurn>();
   private messageHandler: ((update: TelegramUpdate, dbId: number) => void) | null = null;
   private reactionHandler: ((update: TelegramUpdate) => void) | null = null;
+  private pollAnswerHandler: ((update: TelegramUpdate) => void) | null = null;
+  private pollHandler: ((update: TelegramUpdate) => void) | null = null;
   private healthHandler: ((state: PollState) => void) | null = null;
   private errorHandler: ((error: string) => void) | null = null;
   private botInfo: BotInfo = { botId: 0, username: null, displayName: "" };
@@ -293,6 +315,14 @@ export class PollingManager {
     this.reactionHandler = handler;
   }
 
+  onPollAnswer(handler: (update: TelegramUpdate) => void): void {
+    this.pollAnswerHandler = handler;
+  }
+
+  onPoll(handler: (update: TelegramUpdate) => void): void {
+    this.pollHandler = handler;
+  }
+
   onHealth(handler: (state: PollState) => void): void {
     this.healthHandler = handler;
   }
@@ -306,16 +336,21 @@ export class PollingManager {
     if (recovered > 0) this.pollState.lastHealthCheck = now();
     return recovered;
   }
-
   private buildTurn(dbMsg: Db.QueuedMessage, sessionId: string, sessionName: string): TurnQueueItem {
     const replyChainText = this.resolveReplyChain(dbMsg.chat_id, dbMsg.reply_to_message_id);
-    const historyText = replyChainText ? `${replyChainText}\n${dbMsg.text}` : dbMsg.text;
+    const incomingAttachments = parseAttachments(dbMsg.attachments);
+    const mediaText = incomingAttachments.length > 0
+      ? `\n\n📎 Incoming media:\n${incomingAttachments.map((a) => `- ${a.path} (${a.type})`).join("\n")}`
+      : "";
+    const baseHistory = replyChainText ? `${replyChainText}\n${dbMsg.text}` : dbMsg.text;
+    const historyText = `${baseHistory}${mediaText}`;
     const turn: PendingTelegramTurn = {
       sessionId,
       sessionName,
       chatId: dbMsg.chat_id,
       replyToMessageId: dbMsg.message_id,
       queuedAttachments: [],
+      incomingAttachments,
       content: [{ type: "text", text: `[telegram] ${historyText}` }],
       historyText,
       replyChainText,
@@ -455,6 +490,16 @@ export class PollingManager {
       case "reaction":
         if (msg.update && this.reactionHandler) {
           this.reactionHandler(msg.update);
+        }
+        break;
+      case "poll_answer":
+        if (msg.update && this.pollAnswerHandler) {
+          this.pollAnswerHandler(msg.update);
+        }
+        break;
+      case "poll":
+        if (msg.update && this.pollHandler) {
+          this.pollHandler(msg.update);
         }
         break;
       default:
