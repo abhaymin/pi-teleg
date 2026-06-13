@@ -329,7 +329,7 @@ flowchart TD
   CapLive -- no --> Fallback
   Match -- no --> Fallback
   Fallback --> Primary[Assign to primary session]
-  Relay --> Turn[Create [telegram] Pi turn]
+  Relay --> Turn[Create telegram Pi turn]
   Primary --> Turn
   Turn --> Reply[Send response / attachments to Telegram]
 ```
@@ -505,36 +505,22 @@ Fix: add INFO_REL.md with capabilities and a concise description.
 ## Installation
 
 `teleg-bridge` ships a single `install.sh` dispatcher that handles the full
-git-based lifecycle: **install / update / uninstall / status / version**. Git
-operations are host-agnostic, so the same flow works for **GitHub, gitlab.com,
-and self-hosted GitLab** remotes.
+git-based lifecycle: **install / update / uninstall / status / version**.
 
-### One-liner (public)
+### Public install
 
 ```bash
 # GitHub
-curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/HEAD/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/abhaymin/pi-teleg/HEAD/install.sh | bash
 
-# GitLab (gitlab.com OR self-hosted — same shape)
-curl -fsSL https://<host>/<owner>/<repo>/-/raw/HEAD/install.sh | bash
+# GitLab
+curl -fsSL https://gitlab.abhaymenon.com/abhaymin/pi-teleg/-/raw/HEAD/install.sh | bash
 ```
 
 This clones the canonical upstream to **`~/.teleg-bridge`** (override with
 `TELEG_HOME`), runs `npm install` + build, wires `~/.pi/agent/settings.json` and
 `~/.pi/agent/mcp.json`, and installs a `teleg` shim at `~/.local/bin/teleg`.
 Re-running the one-liner is always safe — it acts as an update.
-
-To target a fork or another host, pass `--repo` and `--host`:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/HEAD/install.sh | bash -s -- --repo myorg/myfork --host github.com
-```
-
-To review the script before running:
-
-```bash
-curl -fsSL https://<host>/<owner>/<repo>/-/raw/HEAD/install.sh -o install.sh && less install.sh && bash install.sh
-```
 
 ### Lifecycle commands
 
@@ -563,6 +549,14 @@ If your GitLab/GitHub repo is private, use either:
 - a tokenized HTTPS remote / credential helper available to `git`.
 
 The installer runs with `GIT_TERMINAL_PROMPT=0`, so it will fail fast rather than prompting interactively.
+
+## License
+
+MIT
+
+## Status
+
+This repository is actively maintained and tracks the current Pi-facing local deployment workflow plus the git-based public install/update path.
 
 ## License
 
