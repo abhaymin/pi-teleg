@@ -9,6 +9,7 @@
  */
 
 import { createServer } from "http";
+import { randomBytes } from "crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -20,11 +21,39 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const RELAY_DIR = join(process.env.HOME || "~", ".pi/agent/tmp/teleg-relay");
 
 function ensureRelayDir() {
-  if (!existsSync(RELAY_DIR)) mkdirSync(RELAY_DIR, { recursive: true });
+  if (!existsSync(RELAY_DIR)) mkdirSync(RELAY_DIR, { recursive: true, mode: 0o700 });
 }
 
-function getRelayPath(sessionName: string): string {
-  return join(RELAY_DIR, `${sessionName}.json`);
+function sanitizeSessionName(name: string): string {
+  if (name.includes("..") || name.includes("/") || name.includes("\\")) {
+    throw new Error(`Invalid session name: ${name}`);
+  }
+  return name;
+}
+
+function getRelayPath(sessionName: string, botId?: number): string {
+  const safe = sanitizeSessionName(sessionName);
+  const prefix = botId ? `${botId}-` : "";
+  return join(RELAY_DIR, `${prefix}${safe}.json`);
+}
+
+/**
+ * Find a relay file by session name, searching across all botId namespaces.
+ * Used for cross-session lookups where the caller doesn't know the target's botId.
+ */
+function findRelayPath(sessionName: string): string | null {
+  // First try exact name (legacy / no botId)
+  const direct = getRelayPath(sessionName);
+  if (existsSync(direct)) return direct;
+  // Search for any botId-prefixed match
+  ensureRelayDir();
+  try {
+    const suffix = `-${sessionName}.json`;
+    for (const file of readdirSync(RELAY_DIR)) {
+      if (file.endsWith(suffix)) return join(RELAY_DIR, file);
+    }
+  } catch {}
+  return null;
 }
 
 export interface RelayInfo {
@@ -45,12 +74,12 @@ export interface StartRelayOptions {
 
 let relayServer: ReturnType<typeof createServer> | null = null;
 let currentRelayInfo: RelayInfo | null = null;
-
 function generateSecret(length = 32): string {
+  const bytes = randomBytes(length);
   const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
   let result = "";
   for (let i = 0; i < length; i++) {
-    result += chars[Math.floor(Math.random() * chars.length)];
+    result += chars[bytes[i]! % chars.length];
   }
   return result;
 }
@@ -136,14 +165,23 @@ export function startRelayServer(
   botId?: number
 ): Promise<RelayInfo> {
   return new Promise((resolve, reject) => {
+    // Guard: this module uses singleton state — only one relay per process
+    if (relayServer || currentRelayInfo) {
+      reject(new Error(
+        `Relay already active for session "${currentRelayInfo?.sessionName}". ` +
+        `Only one relay server per process is supported.`
+      ));
+      return;
+    }
+
     ensureRelayDir();
-    
+
     // Clean stale relay files for dead PIDs before registering
     cleanStaleRelayFiles();
-    
+
     // Find an available port starting from basePort
     let port = basePort;
-    
+
     function tryPort(portToTry: number): void {
       const server = createServer();
       
@@ -164,18 +202,18 @@ export function startRelayServer(
           pid: process.pid,
           botId, // Phase 4: link relay to a specific bot
         };
-        
         currentRelayInfo = relayInfo;
-        
+        relayServer = server;  // Track so stopRelayServer can close it
+
         // Write relay info file so other sessions can find us
-        const relayPath = getRelayPath(sessionName);
-        writeFileSync(relayPath, JSON.stringify(relayInfo, null, 2));
-        
+        const relayPath = getRelayPath(sessionName, botId);
+        writeFileSync(relayPath, JSON.stringify(relayInfo, null, 2), { mode: 0o600 });
+
         // Handle incoming command requests
         server.on("request", async (req, res) => {
           if (req.url === "/health") {
             res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ status: "ok", sessionName }));
+            res.end(JSON.stringify({ status: "ok" }));
             return;
           }
           
@@ -201,9 +239,9 @@ export function startRelayServer(
                   res.writeHead(404, { "Content-Type": "application/json" });
                   res.end(JSON.stringify({ error: "No command handler registered" }));
                 }
-              } catch (err) {
+              } catch {
                 res.writeHead(400, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ error: String(err) }));
+                res.end(JSON.stringify({ error: "Bad request" }));
               }
             });
             return;
@@ -215,8 +253,12 @@ export function startRelayServer(
             req.on("data", (chunk: Buffer) => (body += chunk.toString()));
             req.on("end", () => {
               try {
-                const { id, sourceSession } = JSON.parse(body);
-                // Signal the parent process to complete the message — handled via onComplete callback
+                const { id, sourceSession, secret: incomingSecret } = JSON.parse(body);
+                if (incomingSecret !== secret) {
+                  res.writeHead(401, { "Content-Type": "application/json" });
+                  res.end(JSON.stringify({ error: "Unauthorized" }));
+                  return;
+                }
                 if (onComplete) {
                   onComplete(id, sourceSession);
                   res.writeHead(200, { "Content-Type": "application/json" });
@@ -225,9 +267,9 @@ export function startRelayServer(
                   res.writeHead(404, { "Content-Type": "application/json" });
                   res.end(JSON.stringify({ error: "No complete handler registered" }));
                 }
-              } catch (err) {
+              } catch {
                 res.writeHead(400, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ error: String(err) }));
+                res.end(JSON.stringify({ error: "Bad request" }));
               }
             });
             return;
@@ -253,9 +295,9 @@ export function startRelayServer(
                   res.writeHead(404, { "Content-Type": "application/json" });
                   res.end(JSON.stringify({ error: "No shutdown handler" }));
                 }
-              } catch (err) {
+              } catch {
                 res.writeHead(400, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ error: String(err) }));
+                res.end(JSON.stringify({ error: "Bad request" }));
               }
             });
             return;
@@ -264,7 +306,7 @@ export function startRelayServer(
           // CORS preflight
           if (req.method === "OPTIONS") {
             res.writeHead(204, {
-              "Access-Control-Allow-Origin": "*",
+              "Access-Control-Allow-Origin": "http://127.0.0.1",
               "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
               "Access-Control-Allow-Headers": "Content-Type",
             });
@@ -292,7 +334,7 @@ export function stopRelayServer(): void {
   }
   if (currentRelayInfo) {
     try {
-      const relayPath = getRelayPath(currentRelayInfo.sessionName);
+      const relayPath = getRelayPath(currentRelayInfo.sessionName, currentRelayInfo.botId);
       if (existsSync(relayPath)) {
         const info = JSON.parse(readFileSync(relayPath, "utf8"));
         if (info.pid === process.pid) {
@@ -320,9 +362,9 @@ export async function forwardToSession(
   text: string,
   meta: { chatId: number; messageId: number; sourceSession?: string }
 ): Promise<{ ok: boolean; response?: string; error?: string }> {
-  const relayPath = getRelayPath(targetSessionName);
+  const relayPath = findRelayPath(targetSessionName);
   
-  if (!existsSync(relayPath)) {
+  if (!relayPath) {
     return { ok: false, error: `Session "${targetSessionName}" has no relay (not connected?)` };
   }
   
@@ -411,8 +453,8 @@ export async function completeMessageOnSource(
   messageId: number,
   sourceSecret: string
 ): Promise<boolean> {
-  const relayPath = getRelayPath(sourceSession);
-  if (!existsSync(relayPath)) return false;
+  const relayPath = findRelayPath(sourceSession);
+  if (!relayPath) return false;
   let relayInfo: RelayInfo;
   try {
     relayInfo = JSON.parse(readFileSync(relayPath, "utf8"));
@@ -424,7 +466,7 @@ export async function completeMessageOnSource(
     const res = await fetch(`http://127.0.0.1:${relayInfo.port}/complete`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: messageId, secret: sourceSecret }),
+      body: JSON.stringify({ id: messageId, sourceSession, secret: sourceSecret }),
     });
     const data = await res.json() as { ok: boolean; error?: string };
     return data.ok;

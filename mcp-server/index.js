@@ -24,19 +24,71 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const CONFIG_PATH = join(process.env.HOME || "~", ".pi/agent/teleg-bridge.json");
+const HOME_DIR = process.env.HOME || "~";
+const GLOBAL_CONFIG_PATH = join(HOME_DIR, ".pi/agent/teleg-bridge.json");
+const PROJECT_DIR = process.env.TELEG_PROJECT_DIR || process.cwd();
+const PROJECT_CONFIG_PATH = join(PROJECT_DIR, ".pi", "teleg.json");
 
-function loadConfig() {
+function readJson(path) {
   try {
-    return JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
+    return JSON.parse(readFileSync(path, "utf8"));
   } catch {
     return null;
   }
 }
 
+function loadGlobalConfig() {
+  return readJson(GLOBAL_CONFIG_PATH);
+}
+
+function loadProjectConfig() {
+  return readJson(PROJECT_CONFIG_PATH);
+}
+
+function loadConfig() {
+  const globalCfg = loadGlobalConfig() || {};
+  const projectCfg = loadProjectConfig() || {};
+  const envBotId = process.env.TELEG_BOT_ID ? parseInt(process.env.TELEG_BOT_ID, 10) : 0;
+  const selectedBotId = envBotId || projectCfg.botId || globalCfg.defaultBotId || globalCfg.botId || 0;
+  const selectedEntry = selectedBotId ? { ...(globalCfg.bots?.[String(selectedBotId)] || {}) } : {};
+  const botToken = process.env.TELEG_BOT_TOKEN || projectCfg.botToken || selectedEntry.botToken || globalCfg.botToken || null;
+  const botUsername = projectCfg.botUsername || selectedEntry.botUsername || globalCfg.botUsername || null;
+  const allowedUserIds = projectCfg.allowedUserIds || selectedEntry.allowedUserIds || globalCfg.allowedUserIds || [];
+  const allowedChatIds = projectCfg.allowedChatIds || selectedEntry.allowedChatIds || globalCfg.allowedChatIds || [];
+  const lastUpdateId = projectCfg.lastUpdateId ?? selectedEntry.lastUpdateId ?? globalCfg.lastUpdateId ?? 0;
+  const defaultBotId = selectedBotId || selectedEntry.botId || projectCfg.botId || globalCfg.defaultBotId || 0;
+  const botId = selectedBotId || selectedEntry.botId || projectCfg.botId || globalCfg.botId || 0;
+
+  const bots = { ...(globalCfg.bots || {}) };
+  if (botId) {
+    bots[String(botId)] = {
+      ...(bots[String(botId)] || {}),
+      botId,
+      botToken: botToken || bots[String(botId)]?.botToken,
+      botUsername: botUsername || bots[String(botId)]?.botUsername,
+      allowedUserIds,
+      allowedChatIds,
+      lastUpdateId,
+    };
+  }
+
+  return {
+    ...globalCfg,
+    ...projectCfg,
+    botId,
+    botToken,
+    botUsername,
+    allowedUserIds,
+    allowedChatIds,
+    lastUpdateId,
+    defaultBotId,
+    bots,
+  };
+}
+
 const config = loadConfig();
 if (!config || !config.botToken) {
-  // Silent fail — allow MCP to load even without config
+  // Silent fail — allow MCP to load even without config.
 }
 
 const BOT_TOKEN = config?.botToken;

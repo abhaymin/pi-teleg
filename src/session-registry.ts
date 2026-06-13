@@ -11,7 +11,7 @@ import { existsSync, readFileSync, unlinkSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as Db from "./db.js";
-
+import { readSessionRegistry, writeSessionRegistry } from "./session-config.js";
 // ============================================================================
 // Constants
 // ============================================================================
@@ -22,8 +22,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const RELAY_DIR = join(process.env.HOME || "~", ".pi/agent/tmp/teleg-relay");
 
 // Replicate getRelayPath logic from relay.ts (relay.ts doesn't export it)
-function getRelayPath(sessionName: string): string {
-  return join(RELAY_DIR, `${sessionName}.json`);
+function getRelayPath(sessionName: string, botId?: number): string {
+  const prefix = botId ? `${botId}-` : "";
+  return join(RELAY_DIR, `${prefix}${sessionName}.json`);
 }
 
 interface RelayInfo {
@@ -86,7 +87,7 @@ export async function checkSessionLiveness(session: Db.RelaySession): Promise<{
   }
   
   // 2. relay_file - Check if relay file exists
-  const relayPath = getRelayPath(session.session_name);
+  const relayPath = getRelayPath(session.session_name, session.bot_id);
   const relayFileExists = existsSync(relayPath);
   if (!relayFileExists) {
     failedChecks.push("relay_file");
@@ -144,14 +145,14 @@ export async function checkSessionLiveness(session: Db.RelaySession): Promise<{
   };
   
   // Classify liveness
-  // GHOST: PID dead OR (no relay file OR PID mismatch) OR no HTTP
-  // STALE: heartbeat stale but otherwise OK
+  // GHOST: actual console/PID is dead
+  // STALE: console is alive but relay/heartbeat state is degraded
   // LINKED: all checks pass
   let liveness: SessionLiveness;
-  
-  if (!pidAlive || !relayFileExists || !relayPidMatch || !relayHttp) {
+
+  if (!pidAlive) {
     liveness = SessionLiveness.GHOST;
-  } else if (!heartbeatFresh) {
+  } else if (!relayFileExists || !relayPidMatch || !relayHttp || !heartbeatFresh) {
     liveness = SessionLiveness.STALE;
   } else {
     liveness = SessionLiveness.LINKED;
@@ -181,41 +182,46 @@ function getRelaySessionsForBot(botId: number): Db.RelaySession[] {
  * @param botId - Optional bot to reconcile. If not specified, reconciles all bots.
  * @returns ReconcileReport with evicted sessions, new primary, and any errors.
  */
-export async function reconcileSessions(botId?: number): Promise<ReconcileReport> {
+export async function reconcileSessions(botId?: number): Promise<ReconcileReport | ReconcileReport[]> {
+  // When no specific botId, reconcile per-bot to avoid cross-bot bias
+  if (!botId) {
+    const db = Db.getDb();
+    const allSessions = db.prepare("SELECT DISTINCT bot_id FROM relay_sessions")
+      .all() as Array<{ bot_id: number }>;
+    if (allSessions.length === 0) {
+      return { botId: 0, checkedSessions: 0, evictedSessions: [], newPrimary: null, errors: [] };
+    }
+    if (allSessions.length === 1) {
+      return reconcileForSingleBot(allSessions[0].bot_id);
+    }
+    // Multiple bots — return per-bot reports
+    const reports = await Promise.all(
+      allSessions.map(row => reconcileForSingleBot(row.bot_id))
+    );
+    return reports;
+  }
+  return reconcileForSingleBot(botId);
+}
+
+async function reconcileForSingleBot(botId: number): Promise<ReconcileReport> {
   const report: ReconcileReport = {
-    botId: botId ?? 0,
+    botId,
     checkedSessions: 0,
     evictedSessions: [],
     newPrimary: null,
     errors: [],
   };
-  
+
   try {
-    // Get all relay sessions for this bot (or all bots)
-    let sessions: Db.RelaySession[] = [];
-    if (botId) {
-      sessions = getRelaySessionsForBot(botId);
-    } else {
-      // Get from all bots - query without bot_id filter
-      const db = Db.getDb();
-      sessions = db.prepare("SELECT * FROM relay_sessions ORDER BY registered_at ASC")
-        .all() as unknown as Db.RelaySession[];
-    }
-    
+    const sessions = getRelaySessionsForBot(botId);
     report.checkedSessions = sessions.length;
-    
-    // If no botId specified but we have sessions, use first session's botId
-    if (!botId && sessions.length > 0) {
-      report.botId = sessions[0].bot_id;
-    }
-    
+
     // Check liveness of each session
     for (const session of sessions) {
       try {
         const { liveness } = await checkSessionLiveness(session);
-        
+
         if (liveness === SessionLiveness.GHOST) {
-          // Evict ghost session
           try {
             evictSession(session.bot_id, session.session_name);
             report.evictedSessions.push(session.session_name);
@@ -223,7 +229,6 @@ export async function reconcileSessions(botId?: number): Promise<ReconcileReport
             report.errors.push(`Failed to evict ${session.session_name}: ${err}`);
           }
         } else if (liveness === SessionLiveness.STALE) {
-          // Reset processing for stale sessions - they may have left messages in limbo
           try {
             Db.resetProcessingForSession(session.bot_id, session.session_name);
           } catch (err) {
@@ -234,17 +239,15 @@ export async function reconcileSessions(botId?: number): Promise<ReconcileReport
         report.errors.push(`Failed to check liveness of ${session.session_name}: ${err}`);
       }
     }
-    
-    // Re-elect primary if needed (for the reconciled bot)
-    if (report.botId > 0) {
-      const newPrimary = electPrimary(report.botId);
-      report.newPrimary = newPrimary;
-    }
-    
+
+    // Re-elect primary for this specific bot
+    const newPrimary = electPrimary(botId);
+    report.newPrimary = newPrimary;
+
   } catch (err) {
     report.errors.push(`Reconcile failed: ${err}`);
   }
-  
+
   return report;
 }
 
@@ -263,7 +266,7 @@ export function evictSession(botId: number, sessionName: string): void {
   Db.unregisterRelaySession(botId, sessionName);
   
   // 3. Remove relay file
-  const relayPath = getRelayPath(sessionName);
+  const relayPath = getRelayPath(sessionName, botId);
   try {
     if (existsSync(relayPath)) {
       unlinkSync(relayPath);
@@ -271,8 +274,28 @@ export function evictSession(botId: number, sessionName: string): void {
   } catch {
     // Best effort - file may already be gone
   }
-  
 
+  // 4. Remove from JSON session registry (fire-and-forget sync)
+  readSessionRegistry().then(reg => {
+    const before = reg.sessions.length;
+    reg.sessions = reg.sessions.filter(s => s.sessionName !== sessionName);
+    if (reg.sessions.length !== before) {
+      // Reassign primary if the evicted session held it
+      if (reg.primarySessionId) {
+        const evicted = reg.sessions.length < before;
+        // The removed session might have been primaryByBot for this bot
+        if (reg.primaryByBot && reg.primaryByBot[String(botId)]) {
+          const sameBotSessions = reg.sessions.filter(s => s.botId === botId);
+          if (sameBotSessions.length > 0) {
+            reg.primaryByBot[String(botId)] = sameBotSessions[0].sessionId;
+          } else {
+            delete reg.primaryByBot[String(botId)];
+          }
+        }
+      }
+      void writeSessionRegistry(reg);
+    }
+  }).catch(() => { /* non-critical */ });
 }
 
 // ============================================================================
@@ -299,13 +322,6 @@ export function electPrimary(botId: number): string | null {
   // We use a score-based approach
   const scored = sessions.map((session: Db.RelaySession) => {
     let score = 0;
-    
-    // Check if this session holds the polling lock
-    // For now, just use the first one with is_primary flag
-    // TODO: Actually check the lock file
-    if (session.is_primary) {
-      score += 100;
-    }
     
     // Heartbeat freshness (more recent = higher score)
     const heartbeatScore = Math.floor((Date.now() - session.last_heartbeat) / 1000);

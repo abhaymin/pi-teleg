@@ -17,10 +17,11 @@
         "build": "tsc",
         "test": "npm run build && node --test",
         "dev": "tsc --watch",
-        "prepublishOnly": "npm run build",
-        "build:mcp": "cd mcp-server && npm install",
         "deploy": "./deploy.sh",
-        "deploy:watch": "./deploy.sh --watch"
+        "deploy:watch": "./deploy.sh --watch",
+        "install:cli": "./install.sh install",
+        "update:cli": "./install.sh update",
+        "uninstall:cli": "./install.sh uninstall"
     },
     "keywords": [
         "pi",

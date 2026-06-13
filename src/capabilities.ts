@@ -25,6 +25,7 @@ export interface CapabilitiesEntry {
   capabilities: string[];
   description: string;
   registeredAt: number;
+  botId?: number;
 }
 
 export interface CapabilitiesRegistry {
@@ -128,12 +129,12 @@ export async function writeCapabilitiesRegistry(reg: CapabilitiesRegistry): Prom
   reg.lastUpdated = Date.now();
   await writeFile(CAPABILITIES_FILE, JSON.stringify(reg, null, 2) + "\n", "utf8");
 }
-
 export async function registerSessionCapabilities(
   sessionId: string,
   sessionName: string,
   pid: number,
   projectDir: string,
+  botId?: number,
 ): Promise<void> {
   const { capabilities, description } = detectProjectCapabilities(projectDir);
   
@@ -144,7 +145,7 @@ export async function registerSessionCapabilities(
   
   const reg = await readCapabilitiesRegistry();
   reg.entries = reg.entries.filter(e => e.sessionId !== sessionId);
-  reg.entries.push({ sessionName, sessionId, pid, projectDir, capabilities, description, registeredAt: Date.now() });
+  reg.entries.push({ sessionName, sessionId, pid, projectDir, capabilities, description, registeredAt: Date.now(), botId });
   await writeCapabilitiesRegistry(reg);
 }
 

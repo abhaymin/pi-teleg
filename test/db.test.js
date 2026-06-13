@@ -47,7 +47,8 @@ function readJson(path) {
 
 function writeRelayInfo(sessionName, info) {
   mkdirSync(relayDir, { recursive: true });
-  writeFileSync(join(relayDir, `${sessionName}.json`), `${JSON.stringify(info, null, 2)}\n`, "utf8");
+  const prefix = info.botId ? `${info.botId}-` : "";
+  writeFileSync(join(relayDir, `${prefix}${sessionName}.json`), `${JSON.stringify(info, null, 2)}\n`, "utf8");
 }
 
 function mockTelegramGetMe(result) {
@@ -187,7 +188,7 @@ test("app coverage", async (t) => {
     assert.equal(projectContext.botId, 45678);
     assert.equal(projectContext.botToken, "PROJECT_TOKEN");
     assert.equal(projectContext.botUsername, "projectbot");
-    assert.deepEqual(projectContext.allowedUserIds, []);
+    assert.deepEqual(projectContext.allowedUserIds, [7]);
 
     restoreProjectFetch();
 
@@ -221,9 +222,30 @@ test("app coverage", async (t) => {
           allowedChatIds: [20],
           lastUpdateId: 30,
         },
+        "45678": {
+          botToken: "TOKEN-2",
+          botUsername: "projectbot",
+          botId: 45678,
+          allowedUserIds: [99],
+          allowedChatIds: [98],
+          lastUpdateId: 97,
+        },
       },
     });
+    const pinnedDir = join(tempHome, "project-pinned");
+    const pinnedDbPath = join(tempHome, "project-pinned.db");
+    mkdirSync(pinnedDir, { recursive: true });
+    await Config.writeProjectConfig(pinnedDir, {
+      botId: 45678,
+      allowedUserIds: [7],
+      dbPath: pinnedDbPath,
+    });
 
+    const pinnedContext = await Config.resolveBotContext(pinnedDir);
+    assert.equal(pinnedContext.botId, 45678);
+    assert.equal(pinnedContext.botUsername, "projectbot");
+    assert.equal(pinnedContext.dbPath, pinnedDbPath);
+    assert.deepEqual(pinnedContext.allowedUserIds, [7]);
     assert.equal(await Config.getDefaultBotId(), 1);
     assert.deepEqual(await Config.loadBotConfig(1), {
       botToken: "TOKEN-1",
@@ -240,10 +262,24 @@ test("app coverage", async (t) => {
     const updatedGlobalCfg = Config.readGlobalConfigSync();
     assert.equal(updatedGlobalCfg?.bots?.["1"].lastUpdateId, 99);
     assert.deepEqual(updatedGlobalCfg?.bots?.["1"].allowedUserIds, [88, 77]);
-    assert.deepEqual(await Config.listConfiguredBots(), [{ botId: 1, botUsername: "bot-one", lastUpdateId: 99 }]);
+    assert.deepEqual(await Config.listConfiguredBots(), [
+      { botId: 1, botUsername: "bot-one", lastUpdateId: 99 },
+      { botId: 45678, botUsername: "projectbot", lastUpdateId: 97 },
+    ]);
     assert.equal(await Config.getConfigVersion(), 2);
     assert.equal(await Config.detectSplitDb(1, dbPath), null);
     assert.match((await Config.detectSplitDb(1, join(tempHome, "other.db"))) ?? "", /non-default DB path/);
+    // resolveFromBotId: activate a registered bot by id without a token prompt
+    const resolvedBot = await Config.resolveFromBotId(45678, pinnedDir);
+    assert.equal(resolvedBot.botId, 45678);
+    assert.equal(resolvedBot.botUsername, "projectbot");
+    assert.equal(resolvedBot.botToken, "TOKEN-2");
+    assert.equal(await Config.resolveFromBotId(999999, pinnedDir), null); // unregistered
+
+    // setDefaultBotId: change the global default used by un-pinned projects
+    await Config.setDefaultBotId(45678);
+    assert.equal(await Config.getDefaultBotId(), 45678);
+    await Config.setDefaultBotId(1); // restore for any later assertions
   });
 
   await t.test("session config and registry helpers", async () => {
@@ -502,6 +538,58 @@ test("app coverage", async (t) => {
     assert.equal(Db.getQueueStats(2).pending, 1);
   });
 
+  await t.test("fallback claim for silent sessions is bot-scoped and linked-only", async () => {
+    resetState();
+    const d = Db.getDb();
+
+    // Bot 1: a message queued for a silent session "ghost", a message for an
+    // alive session "alpha", and an unassigned message. Bot 2 holds a ghost
+    // message that must never be claimed across bots.
+    const ghostMsg = Db.enqueueMessage({
+      bot_id: 1, chat_id: 100, message_id: 10, from_user_id: 11,
+      text: "ghost message", session_id: "__session__:ghost", session_name: "ghost",
+    });
+    const aliveMsg = Db.enqueueMessage({
+      bot_id: 1, chat_id: 100, message_id: 11, from_user_id: 11,
+      text: "alive message", session_id: "__session__:alpha", session_name: "alpha",
+    });
+    const unassignedMsg = Db.enqueueMessage({
+      bot_id: 1, chat_id: 100, message_id: 12, from_user_id: 11,
+      text: "unassigned message",
+    });
+    const otherBotMsg = Db.enqueueMessage({
+      bot_id: 2, chat_id: 100, message_id: 13, from_user_id: 11,
+      text: "other bot ghost", session_id: "__session__:ghost", session_name: "ghost",
+    });
+
+    // "rescuer" and "alpha" are alive/linked; "ghost" is silent.
+    const aliveNames = ["rescuer", "alpha"];
+
+    // rescuer (linked) claims ghost's orphaned message.
+    const claimed = Db.claimNextMessageForSilentSession(1, "__session__:rescuer", "rescuer", aliveNames);
+    assert.equal(claimed?.id, ghostMsg);
+    assert.equal(claimed?.session_name, "rescuer");
+    assert.equal(claimed?.status, "processing");
+    assert.equal(Db.getSessionProcessingChat(1, 100), "rescuer");
+
+    // The alive session's own message is NOT stolen (it drains its own queue).
+    const aliveRow = d.prepare("SELECT status, session_name FROM message_queue WHERE id = ?").get(aliveMsg);
+    assert.equal(aliveRow.status, "pending");
+    assert.equal(aliveRow.session_name, "alpha");
+
+    // Unassigned messages flow through a different path and are left alone here.
+    const unassignedRow = d.prepare("SELECT status FROM message_queue WHERE id = ?").get(unassignedMsg);
+    assert.equal(unassignedRow.status, "pending");
+
+    // Cross-bot message is untouched (queue is bot-scoped).
+    const otherRow = d.prepare("SELECT status FROM message_queue WHERE id = ?").get(otherBotMsg);
+    assert.equal(otherRow.status, "pending");
+
+    // Nothing left to rescue for rescuer (alive + unassigned excluded).
+    const second = Db.claimNextMessageForSilentSession(1, "__session__:rescuer", "rescuer", aliveNames);
+    assert.equal(second, null);
+  });
+
   await t.test("relay session operations and startup recovery", async () => {
     resetState();
     const d = Db.getDb();
@@ -525,10 +613,21 @@ test("app coverage", async (t) => {
       secret: "secret-dead",
       role: "drain",
     });
+    Db.registerRelaySession({
+      bot_id: 1,
+      session_name: "orphan",
+      session_id: "orphan-id",
+      pid: process.pid,
+      port: 9002,
+      secret: "secret-orphan",
+      role: "drain",
+    });
 
     Db.setPrimary(1, "alive");
     assert.equal(Db.getPrimarySession(1)?.session_name, "alive");
     assert.equal(Db.getRelaySession(1, "alive")?.session_id, "alive-id");
+    const orphanSession = Db.getRelaySession(1, "orphan");
+    assert.equal((await SessionRegistry.checkSessionLiveness(orphanSession)).liveness, SessionRegistry.SessionLiveness.STALE);
 
     const processing = Db.enqueueMessage({
       bot_id: 1,
@@ -546,6 +645,7 @@ test("app coverage", async (t) => {
     assert.equal(recovery.cleanedSessions, 1);
     assert.equal(recovery.recoveredMessages, 1);
     assert.equal(Db.getRelaySession(1, "dead"), undefined);
+    assert.equal(Db.getRelaySession(1, "orphan")?.session_id, "orphan-id");
     assert.equal(Db.getPrimarySession(1)?.session_name, "alive");
     assert.equal(Db.getSessionProcessingChat(1, 77), null);
     const recoveredRow = d.prepare("SELECT status, session_name, session_id FROM message_queue WHERE id = ?").get(processing);
@@ -565,13 +665,13 @@ test("app coverage", async (t) => {
     writeFileSync(join(relayDir, "bad.json"), "{not json", "utf8");
 
     Relay.cleanStaleRelayFiles();
-    assert.equal(existsSync(join(relayDir, "alive.json")), true);
-    assert.equal(existsSync(join(relayDir, "dead.json")), false);
+    assert.equal(existsSync(join(relayDir, "1-alive.json")), true);
+    assert.equal(existsSync(join(relayDir, "1-dead.json")), false);
     assert.equal(existsSync(join(relayDir, "bad.json")), false);
     assert.deepEqual(Array.from(Relay.getAliveSessionNames()), ["alive"]);
 
     Relay.cleanRelayFilesByPid(process.pid);
-    assert.equal(existsSync(join(relayDir, "alive.json")), false);
+    assert.equal(existsSync(join(relayDir, "1-alive.json")), false);
     assert.deepEqual(await Relay.getRelayStatus(), {});
 
     const blocker = createServer((_req, res) => {
@@ -585,12 +685,12 @@ test("app coverage", async (t) => {
 
     const info = await Relay.startRelayServer("relay-main", 9940, 1);
     assert.notEqual(info.port, 9940);
-    const relayInfo = readJson(join(relayDir, "relay-main.json"));
+    const relayInfo = readJson(join(relayDir, "1-relay-main.json"));
     assert.equal(relayInfo.port, info.port);
 
     const health = await fetch(`http://127.0.0.1:${info.port}/health`);
     assert.equal(health.status, 200);
-    assert.deepEqual(await health.json(), { status: "ok", sessionName: "relay-main" });
+    assert.deepEqual(await health.json(), { status: "ok" });
 
     const noHandler = await fetch(`http://127.0.0.1:${info.port}/command`, {
       method: "POST",
@@ -626,7 +726,7 @@ test("app coverage", async (t) => {
     const completeNoHandler = await fetch(`http://127.0.0.1:${info.port}/complete`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: 7, sourceSession: "source-a" }),
+      body: JSON.stringify({ id: 7, sourceSession: "source-a", secret: info.secret }),
     });
     assert.equal(completeNoHandler.status, 404);
 
@@ -637,7 +737,7 @@ test("app coverage", async (t) => {
     const complete = await fetch(`http://127.0.0.1:${info.port}/complete`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: 7, sourceSession: "source-a" }),
+      body: JSON.stringify({ id: 7, sourceSession: "source-a", secret: info.secret }),
     });
     assert.equal(complete.status, 200);
     assert.deepEqual(await complete.json(), { ok: true });
@@ -719,7 +819,7 @@ test("app coverage", async (t) => {
       sourceSession: "source",
     });
     assert.equal(await Relay.completeMessageOnSource("target", 55, "secret-target"), true);
-    assert.deepEqual(captured.complete, { id: 55, secret: "secret-target" });
+    assert.deepEqual(captured.complete, { id: 55, sourceSession: "target", secret: "secret-target" });
 
     writeRelayInfo("stale", { pid: 999999, port, secret: "secret-stale", sessionName: "stale", botId: 1 });
     const stale = await Relay.forwardToSession("stale", "hello", { chatId: 1, messageId: 2 });
@@ -870,5 +970,35 @@ test("app coverage", async (t) => {
     assert.equal(manager.getPendingCountForSession("alpha"), 0);
     assert.equal(manager.getQueueDepth(), 0);
     assert.equal(Db.getQueueStats(71).completed, 2);
+  });
+
+  await t.test("polling manager fallback claim for a silent session", async () => {
+    resetState();
+    const manager = PollingManager.getPollingManager(71);
+    manager.setConfig("TOKEN-71", 3);
+
+    // A message queued for a silent session "ghost" on bot 71, plus a message
+    // for an alive session "alpha" that must not be stolen.
+    const ghostMsg = Db.enqueueMessage({
+      bot_id: 71, chat_id: 100, message_id: 21, from_user_id: 10,
+      text: "ghost message", session_id: "__session__:ghost", session_name: "ghost",
+    });
+    Db.enqueueMessage({
+      bot_id: 71, chat_id: 100, message_id: 22, from_user_id: 10,
+      text: "alive message", session_id: "__session__:alpha", session_name: "alpha",
+    });
+
+    // "rescuer" is linked/alive; "ghost" is silent. The alive set excludes the
+    // rescuer's own messages (drained separately) and alpha's (self-draining).
+    const claim = manager.claimNextTurnForSilentSession("rescuer", ["rescuer", "alpha"]);
+    assert.ok(claim);
+    assert.equal(claim.dbId, ghostMsg);
+    assert.equal(claim.turn.sessionName, "rescuer");
+    assert.equal(manager.hasActiveTurnFor("__session__:rescuer"), true);
+    assert.equal(manager.getPendingCountForSession("alpha"), 1);
+    manager.completeTurn(claim.turn.sessionId, claim.dbId);
+
+    // alpha's message is still pending for alpha to drain itself.
+    assert.equal(Db.getQueueStats(71).pending, 1);
   });
 });

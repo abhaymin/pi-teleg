@@ -43,9 +43,12 @@ export interface GlobalConfigV2 {
 }
 
 export interface ProjectConfig {
+  botId?: number;
+  botUsername?: string;
   botToken?: string;
   allowedUserIds?: number[];
   allowedChatIds?: number[];
+  lastUpdateId?: number;
   dbPath?: string;
 }
 
@@ -156,6 +159,36 @@ function readProjectConfig(projectDir: string): ProjectConfig {
     return {};
   }
 }
+export async function writeProjectConfig(projectDir: string, cfg: ProjectConfig): Promise<void> {
+  const projectCfgDir = join(projectDir, ".pi");
+  const projectCfgPath = join(projectCfgDir, "teleg.json");
+  const existing = readProjectConfig(projectDir);
+  const next: ProjectConfig = {
+    ...existing,
+    ...cfg,
+    botId: cfg.botId ?? existing.botId,
+    botUsername: cfg.botUsername ?? existing.botUsername,
+    botToken: cfg.botToken ?? existing.botToken,
+    allowedUserIds: cfg.allowedUserIds ?? existing.allowedUserIds,
+    allowedChatIds: cfg.allowedChatIds ?? existing.allowedChatIds,
+    lastUpdateId: cfg.lastUpdateId ?? existing.lastUpdateId,
+    dbPath: cfg.dbPath ?? existing.dbPath,
+  };
+
+  await mkdir(projectCfgDir, { recursive: true });
+  await writeFile(projectCfgPath, JSON.stringify(next, null, "\t") + "\n", "utf8");
+}
+
+function applyProjectConfig(context: BotContext, projectCfg: ProjectConfig, projectDir: string): BotContext {
+  return {
+    ...context,
+    projectDir,
+    allowedUserIds: projectCfg.allowedUserIds ?? context.allowedUserIds,
+    allowedChatIds: projectCfg.allowedChatIds ?? context.allowedChatIds,
+    lastUpdateId: projectCfg.lastUpdateId ?? context.lastUpdateId,
+    dbPath: projectCfg.dbPath ?? context.dbPath,
+  };
+}
 
 // ============================================================================
 // Legacy migration
@@ -264,17 +297,29 @@ export async function resolveBotContext(projectDir: string): Promise<BotContext>
     throw new Error(`Bot ${botId} not found in global config`);
   }
 
-  // 3. Check project .pi/teleg.json
   const projectCfg = readProjectConfig(projectDir);
+
+  // 3. Project .pi/teleg.json pin for this folder
   if (projectCfg.botToken) {
-    return resolveFromToken(projectCfg.botToken, projectDir, "project");
+    const context = await resolveFromToken(projectCfg.botToken, projectDir, "project");
+    if (projectCfg.botId && context.botId !== projectCfg.botId) {
+      throw new Error(`Project config botId ${projectCfg.botId} does not match bot token ${context.botId}`);
+    }
+    return applyProjectConfig(context, projectCfg, projectDir);
+  }
+  if (projectCfg.botId && projectCfg.botId > 0) {
+    const context = await resolveFromBotId(projectCfg.botId, projectDir);
+    if (!context) {
+      throw new Error(`Project config pins bot ${projectCfg.botId}, but it is not present in global config`);
+    }
+    return applyProjectConfig(context, projectCfg, projectDir);
   }
 
   // 4. Fall back to global config (try v2 first, then legacy v1)
   const globalCfg = await readGlobalConfig();
   if (globalCfg && globalCfg.defaultBotId) {
     const context = await resolveFromBotId(globalCfg.defaultBotId, projectDir);
-    if (context) return context;
+    if (context) return applyProjectConfig(context, projectCfg, projectDir);
   }
   // Try legacy v1 config (flat format with botToken at root)
   try {
@@ -292,7 +337,7 @@ export async function resolveBotContext(projectDir: string): Promise<BotContext>
       };
       // Migrate to v2 in background
       migrateToV2(legacy).catch(() => {});
-      return buildBotContext(entry, projectDir, false);
+      return applyProjectConfig(buildBotContext(entry, projectDir, false), projectCfg, projectDir);
     }
   } catch {
     // No legacy config either
@@ -350,9 +395,11 @@ async function resolveFromToken(
 }
 
 /**
- * Resolve from a botId in the global config.
+ * Resolve a full BotContext for a specific botId from the global config.
+ * Used by the bot-selection flow to activate a chosen bot without re-entering
+ * its token. Returns null if the bot is not registered.
  */
-async function resolveFromBotId(botId: number, projectDir: string): Promise<BotContext | null> {
+export async function resolveFromBotId(botId: number, projectDir: string): Promise<BotContext | null> {
   const globalCfg = await readGlobalConfig();
   if (!globalCfg) {
     // Try legacy v1 config
@@ -500,6 +547,17 @@ export async function listConfiguredBots(): Promise<Array<{ botId: number; botUs
 export async function getDefaultBotId(): Promise<number | null> {
   const cfg = await readGlobalConfig();
   return cfg?.defaultBotId ?? null;
+}
+
+/**
+ * Set the default bot ID in the global config (the bot used when no project
+ * pin or env override applies). Silently no-ops when no global config exists.
+ */
+export async function setDefaultBotId(botId: number): Promise<void> {
+  const cfg = await readGlobalConfig();
+  if (!cfg) return;
+  cfg.defaultBotId = botId;
+  await writeGlobalConfig(cfg);
 }
 
 /**

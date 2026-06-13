@@ -62,6 +62,21 @@ interface TelegramMessage {
   from?: TelegramUser;
   text?: string;
   caption?: string;
+  reply_to_message?: TelegramMessage;
+}
+
+interface TelegramReactionType {
+  type: string;
+  emoji: string;
+}
+
+interface TelegramMessageReactionUpdated {
+  chat: TelegramChat;
+  message_id: number;
+  user?: TelegramUser;
+  date: number;
+  old_reaction: TelegramReactionType[];
+  new_reaction: TelegramReactionType[];
 }
 
 interface TelegramUpdate {
@@ -70,6 +85,7 @@ interface TelegramUpdate {
   edited_message?: TelegramMessage;
   channel_post?: TelegramMessage;
   edited_channel_post?: TelegramMessage;
+  message_reaction?: TelegramMessageReactionUpdated;
 }
 
 type WorkerMessage =
@@ -80,6 +96,7 @@ type WorkerMessage =
 
 type MainMessage =
   | { type: "message"; update: TelegramUpdate; dbId: number }
+  | { type: "reaction"; update: TelegramUpdate }
   | { type: "health"; healthy: boolean; consecutiveErrors: number }
   | { type: "error"; error: string }
   | { type: "started" }
@@ -115,48 +132,11 @@ function getDb(): DatabaseSync {
     db = new DatabaseSync(DB_PATH);
     db.exec("PRAGMA journal_mode=WAL");
     db.exec("PRAGMA busy_timeout=5000");
-    // Initialize message_queue schema (migrations handled by main thread's db.ts)
-    db.exec(`CREATE TABLE IF NOT EXISTS message_queue (
-      id                INTEGER PRIMARY KEY AUTOINCREMENT,
-      bot_id            INTEGER NOT NULL DEFAULT 0,
-      chat_id           INTEGER NOT NULL,
-      message_id        INTEGER NOT NULL,
-      from_user_id      INTEGER NOT NULL,
-      from_username     TEXT,
-      text              TEXT NOT NULL DEFAULT '',
-      session_id        TEXT NOT NULL DEFAULT 'unassigned',
-      session_name      TEXT NOT NULL DEFAULT 'unknown',
-      status            TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
-      source            TEXT NOT NULL DEFAULT 'telegram' CHECK (source IN ('telegram', 'relay')),
-      source_session    TEXT,
-      created_at        INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000),
-      started_at        INTEGER,
-      completed_at      INTEGER,
-      error             TEXT,
-      response          TEXT
-    )`);
-    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_dedup ON message_queue(bot_id, chat_id, message_id)`);
-    db.exec(`CREATE INDEX IF NOT EXISTS idx_queue_status ON message_queue(status)`);
-    db.exec(`CREATE TABLE IF NOT EXISTS download_queue (
-      id                INTEGER PRIMARY KEY AUTOINCREMENT,
-      bot_id            INTEGER NOT NULL DEFAULT 0,
-      chat_id           INTEGER NOT NULL,
-      message_id        INTEGER NOT NULL,
-      url               TEXT NOT NULL,
-      source            TEXT NOT NULL DEFAULT 'twitter' CHECK (source IN ('twitter', 'youtube', 'reddit', 'gallery', 'other')),
-      session_name      TEXT NOT NULL DEFAULT 'data-scrapper',
-      status            TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
-      retry_count       INTEGER NOT NULL DEFAULT 0,
-      error             TEXT,
-      result            TEXT,
-      created_at        INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000),
-      started_at        INTEGER,
-      completed_at      INTEGER
-    )`);
-    db.exec("CREATE INDEX IF NOT EXISTS idx_dl_status ON download_queue(status)");
-    db.exec("CREATE INDEX IF NOT EXISTS idx_dl_session ON download_queue(session_name)");
-    db.exec("CREATE INDEX IF NOT EXISTS idx_dl_created ON download_queue(created_at)");
-    db.exec("CREATE INDEX IF NOT EXISTS idx_dl_url ON download_queue(url)");
+    // Schema is initialized by the main thread's db.ts migrations.
+    // We only ensure the tables exist so the worker can function if started
+    // before the main thread (e.g. during development).
+    db.exec(`CREATE TABLE IF NOT EXISTS message_queue (id INTEGER PRIMARY KEY AUTOINCREMENT)`);
+    db.exec(`CREATE TABLE IF NOT EXISTS download_queue (id INTEGER PRIMARY KEY AUTOINCREMENT)`);
   }
   return db;
 }
@@ -204,14 +184,15 @@ async function callTelegram<T>(
 function persistMessage(message: TelegramMessage): number {
   const d = getDb();
   const stmt = d.prepare(`
-    INSERT INTO message_queue (bot_id, chat_id, message_id, from_user_id, from_username, text, session_id, session_name, source)
-    VALUES (?, ?, ?, ?, ?, ?, 'unassigned', 'unknown', 'telegram')
+    INSERT INTO message_queue (bot_id, chat_id, message_id, reply_to_message_id, from_user_id, from_username, text, session_id, session_name, source)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'unassigned', 'unknown', 'telegram')
   `);
   try {
     stmt.run(
       botId,
       message.chat.id,
       message.message_id,
+      message.reply_to_message?.message_id ?? null,
       message.from?.id ?? 0,
       message.from?.username ?? null,
       message.text || message.caption || "",
@@ -252,14 +233,17 @@ async function pollLoop(): Promise<void> {
 
   post({ type: "started" });
 
-  // Drain stale processing messages before starting the poll loop.
-  // This ensures any messages that got stuck in 'processing' (e.g. from a crashed
-  // data-scrapper session) are returned to 'pending' so they can be reclaimed.
+  // Drain only STALE processing messages before starting the poll loop.
+  // A blanket reset here would steal in-flight work from other live sessions
+  // attached to the same bot (cross-session work stealing). Truly stale rows
+  // (started_at older than the cutoff, or NULL) are already recovered by
+  // runStartupRecovery on the main thread; this is a bot-scoped safety net for
+  // the same condition so a crashed worker's stuck rows can be reclaimed.
   try {
-    const recovered = getDb().prepare(
-      "UPDATE message_queue SET status = 'pending', started_at = NULL, session_id = 'unassigned', session_name = 'unknown' WHERE status = 'processing'"
-    ).run().changes;
-
+    const staleCutoff = Date.now() - 60000;
+    getDb().prepare(
+      "UPDATE message_queue SET status = 'pending', started_at = NULL, session_id = 'unassigned', session_name = 'unknown' WHERE status = 'processing' AND bot_id = ? AND (started_at IS NULL OR started_at < ?)"
+    ).run(botId, staleCutoff);
   } catch (e) {
     console.error("[teleg-poll] Recovery error:", e);
   }
@@ -270,7 +254,7 @@ async function pollLoop(): Promise<void> {
         offset: lastUpdateId !== undefined ? lastUpdateId + 1 : undefined,
         limit: 10,
         timeout: POLL_TIMEOUT,
-        allowed_updates: ["message", "edited_message", "channel_post", "edited_channel_post"],
+        allowed_updates: ["message", "edited_message", "channel_post", "edited_channel_post", "message_reaction"],
       });
 
       consecutiveErrors = 0;
@@ -280,6 +264,12 @@ async function pollLoop(): Promise<void> {
 
       for (const update of updates) {
         lastUpdateId = update.update_id;
+
+        // Handle reaction updates — forward to main thread without persisting
+        if (update.message_reaction) {
+          post({ type: "reaction", update });
+          continue;
+        }
 
         const message = update.message || update.edited_message || update.channel_post || update.edited_channel_post;
         if (!message || (message.from && message.from.is_bot)) {

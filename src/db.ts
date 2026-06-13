@@ -22,7 +22,7 @@ import { readGlobalConfigSync } from "./config.js";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // Schema version for migrations
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 // DB path: env override → shared default
 const DEFAULT_DB_PATH = join(process.env.HOME || "~", ".pi", "agent", "teleg-bridge.db");
@@ -37,6 +37,7 @@ export interface QueuedMessage {
   bot_id: number; // Telegram bot user ID that received this message
   chat_id: number;
   message_id: number;
+  reply_to_message_id: number | null;
   from_user_id: number;
   from_username: string | null;
   text: string;
@@ -134,6 +135,11 @@ function runMigrations(database: DatabaseSync): void {
     migrateToV2(database);
   }
 
+  // Migration from v2 to v3: Add reply_to_message_id column
+  if (currentVersion < 3) {
+    migrateToV3(database);
+  }
+
   initSchema(database);
   repairLegacyRelaySessionsSchema(database);
 
@@ -153,6 +159,7 @@ function migrateToV2(database: DatabaseSync): void {
   } catch {
     console.warn("[db] Could not read global config for default bot_id, using 0");
   }
+  if (!Number.isFinite(defaultBotId)) defaultBotId = 0;
 
   // Add bot_id column to message_queue if it doesn't exist
   try {
@@ -229,6 +236,18 @@ function migrateToV2(database: DatabaseSync): void {
 
 }
 
+function migrateToV3(database: DatabaseSync): void {
+  try {
+    const tableExists = (database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='message_queue'").get() as { name: string } | undefined) != null;
+    if (!tableExists) return; // initSchema will create the table with the column
+    database.exec(`ALTER TABLE message_queue ADD COLUMN reply_to_message_id INTEGER`);
+  } catch (err) {
+    if (!(err instanceof Error && (err.message.includes("duplicate column") || err.message.includes("no such table")))) {
+      console.error("[db] Error adding reply_to_message_id to message_queue:", err);
+    }
+  }
+}
+
 function repairLegacyRelaySessionsSchema(database: DatabaseSync): void {
   const row = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'relay_sessions'").get() as { sql?: string } | undefined;
   const createSql = row?.sql ?? "";
@@ -282,6 +301,7 @@ function initSchema(database: DatabaseSync): void {
       bot_id            INTEGER NOT NULL DEFAULT 0,
       chat_id           INTEGER NOT NULL,
       message_id        INTEGER NOT NULL,
+      reply_to_message_id INTEGER,
       from_user_id      INTEGER NOT NULL,
       from_username     TEXT,
       text              TEXT NOT NULL DEFAULT '',
@@ -407,6 +427,7 @@ export function enqueueMessage(params: {
   bot_id: number;
   chat_id: number;
   message_id: number;
+  reply_to_message_id?: number | null;
   from_user_id: number;
   from_username?: string | null;
   text: string;
@@ -417,13 +438,14 @@ export function enqueueMessage(params: {
 }): number {
   const d = getDb();
   const stmt = d.prepare(`
-    INSERT INTO message_queue (bot_id, chat_id, message_id, from_user_id, from_username, text, session_id, session_name, source, source_session)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO message_queue (bot_id, chat_id, message_id, reply_to_message_id, from_user_id, from_username, text, session_id, session_name, source, source_session)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   stmt.run(
     params.bot_id,
     params.chat_id,
     params.message_id,
+    params.reply_to_message_id ?? null,
     params.from_user_id,
     params.from_username || null,
     params.text,
@@ -478,40 +500,109 @@ export function claimNextMessage(
   }
 
   const normalizedName = normalizeSessionName(sessionName);
-  const args: (string | number)[] = onlyForSession 
-    ? [botId, normalizedName, `__session__:${normalizedName}`, `__session__:${normalizedName}`] 
+  const args: (string | number)[] = onlyForSession
+    ? [botId, normalizedName, `__session__:${normalizedName}`, `__session__:${normalizedName}`]
     : [botId, sessionId, sessionName];
-  const row = d.prepare(sql).get(...args) as unknown as QueuedMessage | undefined;
 
-  if (!row) return null;
+  d.exec("BEGIN IMMEDIATE");
+  try {
+    const row = d.prepare(sql).get(...args) as unknown as QueuedMessage | undefined;
+    if (!row) {
+      d.exec("COMMIT");
+      return null;
+    }
 
-  const now = Date.now();
-  d.prepare(`
-    UPDATE message_queue
-    SET status = 'processing', session_id = ?, session_name = ?, started_at = ?
-    WHERE id = ? AND status = 'pending'
-  `).run(sessionId, sessionName, now, row.id);
+    const now = Date.now();
+    const changes = d.prepare(`
+      UPDATE message_queue
+      SET status = 'processing', session_id = ?, session_name = ?, started_at = ?
+      WHERE id = ? AND status = 'pending'
+    `).run(sessionId, sessionName, now, row.id).changes;
 
-  row.session_id = sessionId;
-  row.session_name = sessionName;
-  row.status = "processing";
-  row.started_at = now;
-  return row;
+    d.exec("COMMIT");
+
+    if (changes === 0) return null; // Lost the race
+
+    row.session_id = sessionId;
+    row.session_name = sessionName;
+    row.status = "processing";
+    row.started_at = now;
+    return row;
+  } catch (err) {
+    try { d.exec("ROLLBACK"); } catch { /* ignore rollback errors */ }
+    throw err;
+  }
 }
 
-/**
- * Claim the next pending message strictly for this session.
- * Does NOT skip ahead to unassigned messages — strict session affinity.
- * @param botId - Scope to messages for this bot
- */
 export function claimNextMessageForSession(botId: number, sessionName: string): QueuedMessage | null {
   return claimNextMessage(botId, `__session__:${sessionName}`, sessionName, { onlyForSession: true });
 }
 
 /**
- * Get count of pending messages for a specific session.
- * @param botId - Scope to messages for this bot
+ * Claim the next pending message assigned to a *silent* session — one not in
+ * the supplied alive set — so a linked session on the same bot can respond on
+ * the silent session's behalf (fallback-claim policy).
+ *
+ * The queue is common but bot-scoped, so this never touches another bot's
+ * messages, never claims a message whose owner is still alive (that owner
+ * drains its own queue), and never claims unassigned messages (those flow
+ * through the dedicated unassigned-claim path). The caller must itself be a
+ * linked/alive session — index.ts enforces that before calling.
  */
+export function claimNextMessageForSilentSession(
+  botId: number,
+  sessionId: string,
+  sessionName: string,
+  aliveSessionNames: string[],
+): QueuedMessage | null {
+  const d = getDb();
+  const normalizedName = normalizeSessionName(sessionName);
+
+  // Exclude the caller's own queue (drained separately), every alive session
+  // (still draining itself), and the unassigned bucket (owned by another path).
+  const exclude = new Set<string>(aliveSessionNames);
+  exclude.add(normalizedName);
+  exclude.add("unknown");
+  const placeholders = Array.from(exclude).map(() => "?").join(", ");
+
+  const sql = `
+    SELECT * FROM message_queue
+    WHERE bot_id = ? AND status = 'pending'
+      AND session_name NOT IN (${placeholders})
+    ORDER BY created_at ASC
+    LIMIT 1
+  `;
+
+  d.exec("BEGIN IMMEDIATE");
+  try {
+    const row = d.prepare(sql).get(botId, ...exclude) as unknown as QueuedMessage | undefined;
+    if (!row) {
+      d.exec("COMMIT");
+      return null;
+    }
+
+    const now = Date.now();
+    const changes = d.prepare(`
+      UPDATE message_queue
+      SET status = 'processing', session_id = ?, session_name = ?, started_at = ?
+      WHERE id = ? AND status = 'pending'
+    `).run(sessionId, sessionName, now, row.id).changes;
+
+    d.exec("COMMIT");
+
+    if (changes === 0) return null; // Lost the race
+
+    row.session_id = sessionId;
+    row.session_name = sessionName;
+    row.status = "processing";
+    row.started_at = now;
+    return row;
+  } catch (err) {
+    try { d.exec("ROLLBACK"); } catch { /* ignore rollback errors */ }
+    throw err;
+  }
+}
+
 export function getPendingCountForSession(botId: number, sessionName: string): number {
   const normalizedName = normalizeSessionName(sessionName);
   const row = getDb().prepare(`
@@ -522,11 +613,6 @@ export function getPendingCountForSession(botId: number, sessionName: string): n
   return row.count;
 }
 
-/**
- * Reset ALL processing messages for a session back to pending.
- * Used for crash recovery when a session loses its active turns unexpectedly.
- * @param botId - Scope to messages for this bot
- */
 export function resetProcessingForSession(botId: number, sessionName: string): number {
   const normalizedName = normalizeSessionName(sessionName);
   const result = getDb().prepare(`
@@ -538,9 +624,6 @@ export function resetProcessingForSession(botId: number, sessionName: string): n
   return result.changes;
 }
 
-/**
- * Mark a message as completed with an optional response.
- */
 export function completeMessage(id: number, response?: string): void {
   getDb().prepare(`
     UPDATE message_queue
@@ -549,9 +632,6 @@ export function completeMessage(id: number, response?: string): void {
   `).run(Date.now(), response || null, id);
 }
 
-/**
- * Mark a message as failed with an error.
- */
 export function failMessage(id: number, error: string): void {
   getDb().prepare(`
     UPDATE message_queue
@@ -564,44 +644,91 @@ export function normalizeSessionName(sessionName: string): string {
   return sessionName.startsWith("__session__:") ? sessionName.slice("__session__:".length) : sessionName;
 }
 
+export function getRecentMessages(limit: number = 20, botId?: number): QueuedMessage[] {
+  const whereClause = botId !== undefined ? `WHERE bot_id = ${botId}` : "";
+  return getDb().prepare(`
+    SELECT * FROM message_queue ${whereClause} ORDER BY created_at DESC LIMIT ?
+  `).all(limit) as unknown as QueuedMessage[];
+}
+
+export function getPendingForChat(botId: number, chatId: number): QueuedMessage | null {
+  return getDb().prepare(`
+    SELECT * FROM message_queue
+    WHERE bot_id = ? AND chat_id = ? AND status IN ('pending', 'processing')
+    ORDER BY created_at ASC LIMIT 1
+  `).get(botId, chatId) as unknown as QueuedMessage | null;
+}
+
+export function getSessionProcessingChat(botId: number, chatId: number): string | null {
+  const row = getDb().prepare(`
+    SELECT session_name FROM message_queue
+    WHERE bot_id = ? AND chat_id = ? AND status = 'processing'
+    LIMIT 1
+  `).get(botId, chatId) as { session_name: string } | undefined;
+  return row?.session_name ?? null;
+}
+
+/**
+ * Find the most recent session that handled a message in a given chat on a
+ * given bot. Used for shared-bot group/channel context continuity: a follow-up
+ * message in a group/channel is routed to the session that already has context
+ * for that chat. Scoped to a single bot — never crosses bots.
+ * @returns The normalized session name, or null if no session has handled it.
+ */
+export function getLastSessionForChat(botId: number, chatId: number): string | null {
+  const row = getDb().prepare(`
+    SELECT session_name FROM message_queue
+    WHERE bot_id = ? AND chat_id = ?
+      AND session_name IS NOT NULL
+      AND session_name NOT IN ('unknown', 'unassigned')
+    ORDER BY id DESC LIMIT 1
+  `).get(botId, chatId) as { session_name: string } | undefined;
+  return row ? normalizeSessionName(row.session_name) : null;
+}
+
+export function recoverStaleMessages(olderThanMs: number = 60000, botId?: number): number {
+  const cutoff = Date.now() - olderThanMs;
+  const rows = botId !== undefined
+    ? getDb().prepare(`SELECT id FROM message_queue WHERE bot_id = ? AND status = 'processing' AND (started_at IS NULL OR started_at < ?)`).all(botId, cutoff) as Array<{ id: number }>
+    : getDb().prepare(`SELECT id FROM message_queue WHERE status = 'processing' AND (started_at IS NULL OR started_at < ?)`).all(cutoff) as Array<{ id: number }>;
+  if (rows.length === 0) return 0;
+  const ids = rows.map((row) => row.id);
+  const placeholders = ids.map(() => "?").join(",");
+  getDb().prepare(`UPDATE message_queue SET status = 'pending', started_at = NULL, session_id = 'unassigned', session_name = 'unknown' WHERE id IN (${placeholders})`).run(...ids);
+  return ids.length;
+}
+
 export function assignMessageToSession(id: number, sessionName: string): number {
   const normalizedName = normalizeSessionName(sessionName);
-  const result = getDb().prepare(`
-    UPDATE message_queue
-    SET session_name = ?, session_id = ?
-    WHERE id = ? AND status = 'pending'
-  `).run(normalizedName, `__session__:${normalizedName}`, id);
-  return result.changes;
+  return getDb().prepare(`UPDATE message_queue SET session_name = ?, session_id = ? WHERE id = ? AND status = 'pending'`).run(normalizedName, `__session__:${normalizedName}`, id).changes;
 }
 
 export function assignTelegramMessageToSession(botId: number, chatId: number, messageId: number, sessionName: string): number {
   const normalizedName = normalizeSessionName(sessionName);
-  const result = getDb().prepare(`
-    UPDATE message_queue
-    SET session_name = ?, session_id = ?
-    WHERE bot_id = ? AND chat_id = ? AND message_id = ? AND status = 'pending'
-  `).run(normalizedName, `__session__:${normalizedName}`, botId, chatId, messageId);
-  return result.changes;
+  return getDb().prepare(`UPDATE message_queue SET session_name = ?, session_id = ? WHERE bot_id = ? AND chat_id = ? AND message_id = ? AND status = 'pending'`).run(normalizedName, `__session__:${normalizedName}`, botId, chatId, messageId).changes;
 }
 
 export function markMessageProcessing(id: number, sessionId: string, sessionName: string): number {
   const normalizedName = normalizeSessionName(sessionName);
-  const result = getDb().prepare(`
-    UPDATE message_queue
-    SET status = 'processing', session_id = ?, session_name = ?, started_at = ?
-    WHERE id = ? AND status = 'pending'
-  `).run(sessionId, normalizedName, Date.now(), id);
-  return result.changes;
+  return getDb().prepare(`UPDATE message_queue SET status = 'processing', session_id = ?, session_name = ?, started_at = ? WHERE id = ? AND status = 'pending'`).run(sessionId, normalizedName, Date.now(), id).changes;
+}
+
+export function getQueueStats(botId?: number): QueueStats {
+  const rows = (botId !== undefined
+    ? getDb().prepare(`SELECT status, COUNT(*) as count FROM message_queue WHERE bot_id = ? GROUP BY status`).all(botId)
+    : getDb().prepare(`SELECT status, COUNT(*) as count FROM message_queue GROUP BY status`).all()) as Array<{ status: string; count: number }>;
+  const stats: QueueStats = { pending: 0, processing: 0, completed: 0, failed: 0, total: 0 };
+  for (const row of rows) {
+    const key = row.status as keyof QueueStats;
+    if (key in stats) stats[key] = row.count;
+    stats.total += row.count;
+  }
+  return stats;
 }
 
 export function getQueueStatsForSession(botId: number, sessionName: string): QueueStats {
   const normalizedName = normalizeSessionName(sessionName);
-  const rows = getDb().prepare(`
-    SELECT status, COUNT(*) as count FROM message_queue
-    WHERE bot_id = ? AND (session_name = ? OR session_id = ? OR session_name = ?)
-    GROUP BY status
-  `).all(botId, normalizedName, `__session__:${normalizedName}`, `__session__:${normalizedName}`) as Array<{ status: string; count: number }>;
-
+  const rows = getDb().prepare(`SELECT status, COUNT(*) as count FROM message_queue WHERE bot_id = ? AND (session_name = ? OR session_id = ? OR session_name = ?) GROUP BY status`).all(botId, normalizedName, `__session__:${normalizedName}`, `__session__:${normalizedName}`) as Array<{ status: string; count: number }>;
   const stats: QueueStats = { pending: 0, processing: 0, completed: 0, failed: 0, total: 0 };
   for (const row of rows) {
     const key = row.status as keyof QueueStats;
@@ -613,165 +740,30 @@ export function getQueueStatsForSession(botId: number, sessionName: string): Que
 
 export function normalizeLegacyBotIds(botId: number): number {
   if (!botId) return 0;
-  const result = getDb().prepare(`
-    UPDATE message_queue
-    SET bot_id = ?
-    WHERE bot_id = 0 AND status IN ('pending', 'processing')
-  `).run(botId);
-  const dlResult = getDb().prepare(`
-    UPDATE download_queue
-    SET bot_id = ?
-    WHERE bot_id = 0 AND status IN ('pending', 'processing')
-  `).run(botId);
+  const result = getDb().prepare(`UPDATE message_queue SET bot_id = ? WHERE bot_id = 0 AND status IN ('pending', 'processing')`).run(botId);
+  const dlResult = getDb().prepare(`UPDATE download_queue SET bot_id = ? WHERE bot_id = 0 AND status IN ('pending', 'processing')`).run(botId);
   return result.changes + dlResult.changes;
 }
 
-/**
- * Get the current queue depth (pending + processing) for a bot.
- * @param botId - Scope to this bot's queue
- */
 export function getQueueDepth(botId: number): number {
-  const row = getDb().prepare(`
-    SELECT COUNT(*) as count FROM message_queue WHERE bot_id = ? AND status IN ('pending', 'processing')
-  `).get(botId) as { count: number };
-  return row.count;
+  return (getDb().prepare(`SELECT COUNT(*) as count FROM message_queue WHERE bot_id = ? AND status IN ('pending', 'processing')`).get(botId) as { count: number }).count;
 }
 
-/**
- * Get queue statistics for a specific bot.
- * @param botId - Scope to this bot's queue (null for all bots)
- */
-export function getQueueStats(botId?: number): QueueStats {
-  const whereClause = botId !== undefined ? `WHERE bot_id = ${botId}` : "";
-  const rows = getDb().prepare(`
-    SELECT status, COUNT(*) as count FROM message_queue ${whereClause} GROUP BY status
-  `).all() as Array<{ status: string; count: number }>;
-
-  const stats: QueueStats = { pending: 0, processing: 0, completed: 0, failed: 0, total: 0 };
-  for (const row of rows) {
-    const key = row.status as keyof QueueStats;
-    if (key in stats) stats[key] = row.count;
-    stats.total += row.count;
-  }
-  return stats;
+export function resetAllProcessing(botId?: number): number {
+  return botId !== undefined
+    ? getDb().prepare(`UPDATE message_queue SET status = 'pending', started_at = NULL, session_id = 'unassigned', session_name = 'unknown' WHERE bot_id = ? AND status = 'processing'`).run(botId).changes
+    : getDb().prepare(`UPDATE message_queue SET status = 'pending', started_at = NULL, session_id = 'unassigned', session_name = 'unknown' WHERE status = 'processing'`).run().changes;
 }
 
-/**
- * Recover stale "processing" messages back to "pending".
- * Called on startup to handle messages that were being processed when a crash occurred.
- * Returns the number of recovered messages.
- * @param botId - Scope to this bot's queue (null for all bots)
- */
-export function recoverStaleMessages(olderThanMs: number = 60000, botId?: number): number {
-  const cutoff = Date.now() - olderThanMs;
-  let sql = `
-    UPDATE message_queue
-    SET status = 'pending', started_at = NULL, session_id = 'unassigned', session_name = 'unknown'
-    WHERE status = 'processing' AND (started_at IS NULL OR started_at < ?)
-  `;
-  const args: (number | undefined)[] = [cutoff];
-  
-  if (botId !== undefined) {
-    sql = `
-      UPDATE message_queue
-      SET status = 'pending', started_at = NULL, session_id = 'unassigned', session_name = 'unknown'
-      WHERE bot_id = ? AND status = 'processing' AND (started_at IS NULL OR started_at < ?)
-    `;
-    args.unshift(botId);
-  }
-
-  const result = getDb().prepare(sql).run(...args);
-  return result.changes;
-}
-
-/**
- * Get recent messages (for status display and debugging).
- * @param botId - Scope to this bot's queue (null for all bots)
- */
-export function getRecentMessages(limit: number = 20, botId?: number): QueuedMessage[] {
-  const whereClause = botId !== undefined ? `WHERE bot_id = ${botId}` : "";
-  return getDb().prepare(`
-    SELECT * FROM message_queue ${whereClause} ORDER BY created_at DESC LIMIT ?
-  `).all(limit) as unknown as QueuedMessage[];
-}
-
-/**
- * Get pending messages for a specific chat (used for session affinity).
- * @param botId - Scope to this bot
- */
-export function getPendingForChat(botId: number, chatId: number): QueuedMessage | null {
-  return getDb().prepare(`
-    SELECT * FROM message_queue
-    WHERE bot_id = ? AND chat_id = ? AND status IN ('pending', 'processing')
-    ORDER BY created_at ASC LIMIT 1
-  `).get(botId, chatId) as unknown as QueuedMessage | null;
-}
-
-/**
- * Get the session currently processing a message for a specific chat.
- * Used by routing to detect if a message is already being handled.
- * @param botId - Scope to this bot
- * @param chatId - The chat to check
- * @returns The session_name if a message is currently being processed, null otherwise
- */
-export function getSessionProcessingChat(botId: number, chatId: number): string | null {
-  const row = getDb().prepare(`
-    SELECT session_name FROM message_queue
-    WHERE bot_id = ? AND chat_id = ? AND status = 'processing'
-    LIMIT 1
-  `).get(botId, chatId) as { session_name: string } | undefined;
-  return row?.session_name ?? null;
-}
-
-/**
- * Purge old completed/failed messages (housekeeping).
- * Keeps the most recent `keepCount` items.
- * @param botId - Scope to this bot's queue (null for all bots)
- */
 export function purgeOldMessages(keepCount: number = 1000, botId?: number): number {
   const d = getDb();
-  const whereClause = botId !== undefined ? `AND bot_id = ${botId}` : "";
-  
-  // Find the ID threshold
-  const row = d.prepare(`
-    SELECT id FROM message_queue
-    WHERE status IN ('completed', 'failed') ${whereClause}
-    ORDER BY id DESC LIMIT 1 OFFSET ?
-  `).get(keepCount) as { id: number } | undefined;
-
+  const row = botId !== undefined
+    ? d.prepare(`SELECT id FROM message_queue WHERE status IN ('completed', 'failed') AND bot_id = ? ORDER BY id DESC LIMIT 1 OFFSET ?`).get(botId, keepCount) as { id: number } | undefined
+    : d.prepare(`SELECT id FROM message_queue WHERE status IN ('completed', 'failed') ORDER BY id DESC LIMIT 1 OFFSET ?`).get(keepCount) as { id: number } | undefined;
   if (!row) return 0;
-
-  const deleteSql = botId !== undefined
-    ? `DELETE FROM message_queue WHERE status IN ('completed', 'failed') AND bot_id = ? AND id < ?`
-    : `DELETE FROM message_queue WHERE status IN ('completed', 'failed') AND id < ?`;
   const result = botId !== undefined
-    ? d.prepare(deleteSql).run(botId, row.id)
-    : d.prepare(deleteSql).run(row.id);
-  return result.changes;
-}
-
-/**
- * Reset all processing messages to pending (for manual recovery).
- * @param botId - Scope to this bot's queue (null for all bots)
- */
-export function resetAllProcessing(botId?: number): number {
-  let sql = `
-    UPDATE message_queue
-    SET status = 'pending', started_at = NULL, session_id = 'unassigned', session_name = 'unknown'
-    WHERE status = 'processing'
-  `;
-  const args: number[] = [];
-  
-  if (botId !== undefined) {
-    sql = `
-      UPDATE message_queue
-      SET status = 'pending', started_at = NULL, session_id = 'unassigned', session_name = 'unknown'
-      WHERE bot_id = ? AND status = 'processing'
-    `;
-    args.push(botId);
-  }
-
-  const result = getDb().prepare(sql).run(...args);
+    ? d.prepare(`DELETE FROM message_queue WHERE status IN ('completed', 'failed') AND bot_id = ? AND id < ?`).run(botId, row.id)
+    : d.prepare(`DELETE FROM message_queue WHERE status IN ('completed', 'failed') AND id < ?`).run(row.id);
   return result.changes;
 }
 
@@ -795,8 +787,9 @@ export function registerRelaySession(params: {
   description?: string | null;
   role?: "active" | "drain";
 }): void {
-  try {
-    getDb().prepare(`
+  const d = getDb();
+  const upsert = (): void => {
+    d.prepare(`
     INSERT INTO relay_sessions (bot_id, session_name, session_id, pid, port, secret, project_dir, capabilities, description, role, registered_at, last_heartbeat)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(bot_id, session_name) DO UPDATE SET
@@ -810,53 +803,57 @@ export function registerRelaySession(params: {
       role = excluded.role,
       last_heartbeat = excluded.last_heartbeat
   `).run(
-    params.bot_id,
-    params.session_name,
-    params.session_id,
-    params.pid,
-    params.port,
-    params.secret,
-    params.project_dir || null,
-    params.capabilities || null,
-    params.description || null,
-    params.role || "drain",
-    Date.now(),
-    Date.now(),
-  );
+      params.bot_id,
+      params.session_name,
+      params.session_id,
+      params.pid,
+      params.port,
+      params.secret,
+      params.project_dir || null,
+      params.capabilities || null,
+      params.description || null,
+      params.role || "drain",
+      Date.now(),
+      Date.now(),
+    );
+  };
+
+  try {
+    d.exec("BEGIN IMMEDIATE");
+    if (params.pid > 0) {
+      d.prepare(`DELETE FROM relay_sessions WHERE session_name = ? AND pid = ? AND bot_id <> ?`).run(
+        params.session_name,
+        params.pid,
+        params.bot_id,
+      );
+    }
+    upsert();
+    d.exec("COMMIT");
   } catch (err) {
+    try { d.exec("ROLLBACK"); } catch { /* ignore rollback errors */ }
+
     // Fallback for DBs that still have the old auto-index (session_name UNIQUE) — drop it and retry
     if (err instanceof Error && err.message.includes("UNIQUE constraint failed: relay_sessions.session_name")) {
       try {
-        getDb().exec(`DROP INDEX IF EXISTS sqlite_autoindex_relay_sessions_1`);
-        getDb().exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_relay_name ON relay_sessions(bot_id, session_name)`);
+        d.exec(`DROP INDEX IF EXISTS sqlite_autoindex_relay_sessions_1`);
+        d.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_relay_name ON relay_sessions(bot_id, session_name)`);
       } catch { /* ignore if index already exists */ }
-      getDb().prepare(`
-    INSERT INTO relay_sessions (bot_id, session_name, session_id, pid, port, secret, project_dir, capabilities, description, role, registered_at, last_heartbeat)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(bot_id, session_name) DO UPDATE SET
-      session_id = excluded.session_id,
-      pid = excluded.pid,
-      port = excluded.port,
-      secret = excluded.secret,
-      project_dir = excluded.project_dir,
-      capabilities = excluded.capabilities,
-      description = excluded.description,
-      role = excluded.role,
-      last_heartbeat = excluded.last_heartbeat
-  `).run(
-        params.bot_id,
-        params.session_name,
-        params.session_id,
-        params.pid,
-        params.port,
-        params.secret,
-        params.project_dir || null,
-        params.capabilities || null,
-        params.description || null,
-        params.role || "drain",
-        Date.now(),
-        Date.now(),
-      );
+
+      d.exec("BEGIN IMMEDIATE");
+      try {
+        if (params.pid > 0) {
+          d.prepare(`DELETE FROM relay_sessions WHERE session_name = ? AND pid = ? AND bot_id <> ?`).run(
+            params.session_name,
+            params.pid,
+            params.bot_id,
+          );
+        }
+        upsert();
+        d.exec("COMMIT");
+      } catch (retryErr) {
+        try { d.exec("ROLLBACK"); } catch { /* ignore rollback errors */ }
+        throw retryErr;
+      }
     } else {
       throw err;
     }
@@ -890,10 +887,9 @@ export function unregisterRelaySession(botId: number, sessionName: string): void
  * @param botId - Scope to this bot (null for all bots)
  */
 export function getAliveRelaySessions(botId?: number): RelaySession[] {
-  const whereClause = botId !== undefined ? `WHERE bot_id = ${botId}` : "";
-  const sessions = getDb().prepare(`
-    SELECT * FROM relay_sessions ${whereClause} ORDER BY registered_at ASC
-  `).all() as unknown as RelaySession[];
+  const sessions = botId !== undefined
+    ? getDb().prepare(`SELECT * FROM relay_sessions WHERE bot_id = ? ORDER BY registered_at ASC`).all(botId) as unknown as RelaySession[]
+    : getDb().prepare(`SELECT * FROM relay_sessions ORDER BY registered_at ASC`).all() as unknown as RelaySession[];
 
   // Filter to only alive PIDs
   return sessions.filter(s => {
@@ -938,9 +934,7 @@ export function setPrimary(botId: number, sessionName: string): void {
   const d = getDb();
   d.exec("BEGIN IMMEDIATE");
   try {
-    // Clear existing primary
     d.prepare(`UPDATE relay_sessions SET is_primary = 0 WHERE bot_id = ?`).run(botId);
-    // Set new primary
     d.prepare(`UPDATE relay_sessions SET is_primary = 1 WHERE bot_id = ? AND session_name = ?`).run(botId, sessionName);
     d.exec("COMMIT");
   } catch {
@@ -948,17 +942,15 @@ export function setPrimary(botId: number, sessionName: string): void {
     throw new Error(`Failed to set primary session: ${sessionName} for bot ${botId}`);
   }
 }
-
 /**
  * Clean stale relay sessions (dead PIDs).
  * Returns the number of removed sessions.
  * @param botId - Scope to this bot (null for all bots)
  */
 export function cleanStaleRelaySessions(botId?: number): number {
-  const whereClause = botId !== undefined ? `WHERE bot_id = ${botId}` : "";
-  const sessions = getDb().prepare(`
-    SELECT bot_id, session_name, pid FROM relay_sessions ${whereClause}
-  `).all() as Array<{ session_name: string; pid: number; bot_id: number }>;
+  const sessions = botId !== undefined
+    ? getDb().prepare(`SELECT bot_id, session_name, pid FROM relay_sessions WHERE bot_id = ?`).all(botId) as Array<{ session_name: string; pid: number; bot_id: number }>
+    : getDb().prepare(`SELECT bot_id, session_name, pid FROM relay_sessions`).all() as Array<{ session_name: string; pid: number; bot_id: number }>;
 
   let removed = 0;
   for (const s of sessions) {
@@ -1382,20 +1374,27 @@ export function publish(botId: number, channel: string, publisher: string, paylo
 export function subscribe(botId: number, sessionName: string, channels: string[]): PubSubMessage[] {
   const db = getDb();
   const placeholders = channels.map(() => "?").join(",");
-  // Get unconsumed messages for our channels OR targeted at us
-  const rows = db.prepare(
-    `SELECT * FROM pubsub WHERE bot_id = ? AND consumed_at IS NULL AND (
-      channel IN (${placeholders}) AND (target_session IS NULL OR target_session = ?)
-    ) ORDER BY id ASC`
-  ).all(botId, ...channels, sessionName) as unknown as PubSubMessage[];
-  // Mark as consumed
-  if (rows.length > 0) {
-    const ids = rows.map(r => r.id);
-    db.prepare(
-      `UPDATE pubsub SET consumed_by = ?, consumed_at = ? WHERE id IN (${ids.map(() => "?").join(",")})`
-    ).run(sessionName, Date.now(), ...ids);
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    // Get unconsumed messages for our channels OR targeted at us
+    const rows = db.prepare(
+      `SELECT * FROM pubsub WHERE bot_id = ? AND consumed_at IS NULL AND (
+        channel IN (${placeholders}) AND (target_session IS NULL OR target_session = ?)
+      ) ORDER BY id ASC`
+    ).all(botId, ...channels, sessionName) as unknown as PubSubMessage[];
+    // Mark as consumed
+    if (rows.length > 0) {
+      const ids = rows.map(r => r.id);
+      db.prepare(
+        `UPDATE pubsub SET consumed_by = ?, consumed_at = ? WHERE id IN (${ids.map(() => "?").join(",")})`
+      ).run(sessionName, Date.now(), ...ids);
+    }
+    db.exec("COMMIT");
+    return rows;
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
   }
-  return rows;
 }
 
 /** Scan: like subscribe but doesn't consume — just peek */

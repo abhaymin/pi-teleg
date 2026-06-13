@@ -80,35 +80,42 @@ with open(settings_file, "w") as f:
 print(f"  Updated {len(deduped)} packages in settings.json")
 PYEOF
 
-# ── Update agent mcp.json (includes teleg-bridge as stdio MCP) ────────────────
+# ── Update agent mcp.json (teleg-bridge stdio MCP, non-clobbering) ───────────
 MCP_CONFIG_FILE="$AGENT_DIR/mcp.json"
 echo ""
-echo "[3] Updating $MCP_CONFIG_FILE (extension + stdio MCP servers)..."
+echo "[3] Updating $MCP_CONFIG_FILE (teleg-bridge stdio MCP)..."
 
-cat > "$MCP_CONFIG_FILE" << 'EOF'
-{
-  "imports": ["cursor", "claude-code", "opencode", "kilo"],
-  "mcpServers": {
-    "browserOS": {
-      "command": "npx",
-      "args": ["mcp-remote", "http://127.0.0.1:9000/mcp"]
-    },
-    "chrome-devtools": {
-      "command": "npx",
-      "args": ["-y", "chrome-devtools-mcp@latest"]
-    },
-    "browsermcp": {
-      "command": "npx",
-      "args": ["@browsermcp/mcp@latest"]
-    },
-    "teleg-bridge": {
-      "command": "node",
-      "args": ["/home/abhaym/Development/PTGD/teleg/mcp-server/index.js"]
-    }
-  }
+# Merge ONLY the teleg-bridge entry; leave imports + all other servers intact.
+# Path is derived from $SCRIPT_DIR (portable across cloned/dev checkouts).
+TELEG_MCP_PATH="$SCRIPT_DIR/mcp-server/index.js" \
+MCP_CONFIG_FILE="$MCP_CONFIG_FILE" \
+python3 << 'PYEOF'
+import json, os
+
+mcp_file = os.environ["MCP_CONFIG_FILE"]
+mcp_server = os.path.abspath(os.path.expandvars(os.environ["TELEG_MCP_PATH"]))
+
+try:
+    with open(mcp_file) as f:
+        mcp = json.load(f)
+except Exception:
+    mcp = {}
+
+if not isinstance(mcp, dict):
+    mcp = {}
+mcp.setdefault("mcpServers", {})
+
+# Set/replace only the teleg-bridge entry (dynamic, checkout-relative path).
+mcp["mcpServers"]["teleg-bridge"] = {
+    "command": "node",
+    "args": [mcp_server],
 }
-EOF
-echo "  browser MCPs + teleg-bridge stdio MCP configured"
+
+with open(mcp_file, "w") as f:
+    json.dump(mcp, f, indent=2)
+
+print(f"  teleg-bridge stdio MCP -> {mcp_server}")
+PYEOF
 
 echo ""
 echo "=== Deploy complete ==="

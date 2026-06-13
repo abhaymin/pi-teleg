@@ -66,9 +66,13 @@ Project config: `.pi/teleg.json`
 
 ```json
 {
+  "botId": 123456789,
   "botToken": "TOKEN",
+  "botUsername": "my_bot",
   "allowedUserIds": [987654321],
-  "allowedChatIds": [-1001234567890]
+  "allowedChatIds": [-1001234567890],
+  "lastUpdateId": 0,
+  "dbPath": "/path/to/teleg-bridge.db"
 }
 ```
 

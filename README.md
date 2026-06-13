@@ -437,9 +437,10 @@ Capability matching uses:
 |---|---|
 | `/teleg-setup` | Configure bot token and allowed user pairing. |
 | `/teleg-status` | Show teleg-bridge status. |
-| `/teleg-connect` | Start polling / connect bridge. |
+| `/teleg-connect` | Start polling / connect bridge (offers existing bots to pick from). |
 | `/teleg-disconnect` | Stop polling / disconnect bridge. |
-| `/teleg-reconnect` | Force reconnect. |
+| `/teleg-reconnect` | Force reconnect (offers existing bots to pick from). |
+| `/teleg-switch-bot` | Switch the active bot for this session without re-entering its token. |
 
 ## MCP Tools for Agents
 
@@ -487,6 +488,7 @@ Capability matching uses:
 |---|---:|---|
 | `TELEG_BOT_TOKEN` | — | Force token for the current process. |
 | `TELEG_BOT_ID` | — | Select a bot from global config. |
+| `TELEG_PROJECT_DIR` | `process.cwd()` | Project folder used to read `.pi/teleg.json` for the current process / MCP server. |
 | `TELEG_DB_PATH` | `~/.pi/agent/teleg-bridge.db` | SQLite DB path shared by sessions. |
 | `TELEG_LIVENESS_MS` | `300000` | Max heartbeat age before a session is stale. |
 | `TELEG_DRAIN_INTERVAL_MS` | `12000` | Idle queue drain interval. |
@@ -532,9 +534,13 @@ Important Telegram behavior:
 
 ```json
 {
+  "botId": 123456789,
   "botToken": "TOKEN",
+  "botUsername": "my_bot",
   "allowedUserIds": [987654321],
-  "allowedChatIds": [-1001234567890]
+  "allowedChatIds": [-1001234567890],
+  "lastUpdateId": 0,
+  "dbPath": "/path/to/teleg-bridge.db"
 }
 ```
 
@@ -546,8 +552,7 @@ Important Telegram behavior:
 | `~/.pi/agent/teleg-bridge.json` | Global multi-bot configuration. |
 | `~/.pi/agent/teleg-capabilities.json` | Runtime capability registry. |
 | `~/.pi/agent/tmp/teleg-bridge/polling-{botId}.lock` | Per-bot polling lock. |
-| `~/.pi/agent/tmp/teleg-relay/{sessionName}.json` | Relay endpoint info for a session. |
-| `.pi/teleg.json` | Optional project-local bot config. |
+| `.pi/teleg.json` | Optional project-local bot pin used by the extension and MCP server. |
 | `INFO_REL.md` | Project capability declaration. |
 
 ## Deployment Scenarios
@@ -611,13 +616,87 @@ Fix: add INFO_REL.md with capabilities and a concise description.
 
 ## Installation
 
+`teleg-bridge` ships a single `install.sh` dispatcher that handles the full
+git-based lifecycle: **install / update / uninstall / status / version**. Git
+operations are host-agnostic, so the same flow works for **GitHub, gitlab.com,
+and self-hosted GitLab** remotes.
+
+### One-liner (public)
+
+```bash
+# GitHub
+curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/HEAD/install.sh | bash
+
+# GitLab (gitlab.com OR self-hosted — same shape)
+curl -fsSL https://<host>/<owner>/<repo>/-/raw/HEAD/install.sh | bash
+```
+
+This clones the canonical upstream to **`~/.teleg-bridge`** (override with
+`TELEG_HOME`), runs `npm install` + build, wires `~/.pi/agent/settings.json` and
+`~/.pi/agent/mcp.json`, and installs a `teleg` shim at `~/.local/bin/teleg`.
+Re-running the one-liner is always safe — it acts as an update.
+
+To target a fork or another host, pass `--repo` and `--host`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/HEAD/install.sh | bash -s -- --repo myorg/myfork --host github.com
+```
+
+To review the script before running:
+
+```bash
+curl -fsSL https://<host>/<owner>/<repo>/-/raw/HEAD/install.sh -o install.sh && less install.sh && bash install.sh
+```
+
+### Lifecycle commands
+
+After install, the `teleg` shim is on your `PATH`:
+
+| Command | Description |
+|---|---|
+| `teleg status` | Show install path, remote, channel, ref, and whether an update is available. |
+| `teleg version` | Print `package.json` version + `git describe`. |
+| `teleg update` | `git fetch` → advance to the channel's latest ref → rebuild → re-wire config. |
+| `teleg update --channel stable` | Switch to the highest semver tag (falls back to edge with a warning if none are tagged yet). |
+| `teleg update --keep` | Stash (instead of discarding) any local edits in the managed checkout. |
+| `teleg uninstall` | Remove the checkout, prune Pi config keys, remove the shim — **preserve bot config + database**. |
+| `teleg uninstall --purge -y` | Also delete `~/.pi/agent/teleg-bridge.json` and `teleg-bridge.db`. |
+
+### Channels
+
+- **`edge`** (default): track the remote's default branch (discovered dynamically — never assumed to be `main`/`master`/`dev`).
+- **`stable`**: pin to the highest semver tag reachable from the default branch. Requires releases to be tagged; until then it falls back to `edge` with a one-time warning.
+
+### Private repositories
+
+For a private remote, the `curl` one-liner must carry a token, and the cloned
+`origin` should likewise be credentialed or use SSH:
+
+```bash
+# GitLab (self-hosted or gitlab.com)
+curl -fsSL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" https://<host>/<owner>/<repo>/-/raw/HEAD/install.sh | bash
+# GitHub
+curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" https://raw.githubusercontent.com/<owner>/<repo>/HEAD/install.sh | bash
+```
+
+If `teleg update` hits a 401/403 it prints a clear "private repo: configure a
+credentialed or SSH remote" message and exits non-zero without changing config.
+
+### Manual / development install
+
+From a clone (e.g. for hacking on the bridge itself):
+
 ```bash
 git clone <repository-url>
 cd pi-teleg
 npm install
 npm run build
-./deploy.sh
+./deploy.sh          # build + wire ~/.pi/agent config (portable, non-clobbering)
 ```
+
+`deploy.sh` resolves the MCP-server path relative to its own location (so it
+works from any checkout) and merges **only** the `teleg-bridge` key into
+`mcp.json` — your other `mcpServers` and `imports` are preserved.
 
 ## Development
 

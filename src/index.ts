@@ -3,9 +3,9 @@
  * 
  * Architecture:
  * - Per-bot polling via PollingManager (one manager per botId)
- * - Multiple Pi sessions share the same DB and polling infrastructure
+ * - Sessions are isolated by bot context and session scope
  * - Messages are queued and dispatched to sessions with active turns
- * - Each session has its own turn state but shares the polling infrastructure
+ * - Each session has its own turn state and its own session-scoped queue claims
  * 
  * File organization:
  * - src/config.ts: BotContext resolution, multi-bot config v2
@@ -35,12 +35,19 @@ import {
   cleanRelayFilesByPid,
 } from "./relay.js";
 import * as Db from "./db.js";
-import { resolveBotContext, detectSplitDb, updateAllowedUsers, type BotContext } from "./config.js";
+import { reconcileSessions, getSessionLivenessSummary, evictSession, electPrimary } from "./session-registry.js";
 import {
-  reconcileSessions,
-  getSessionLivenessSummary,
-  evictSession,
-} from "./session-registry.js";
+  resolveBotContext,
+  resolveFromBotId,
+  setDefaultBotId,
+  listConfiguredBots,
+  getDefaultBotId,
+  detectSplitDb,
+  updateAllowedUsers,
+  writeProjectConfig,
+  type BotContext,
+  type ProjectConfig,
+} from "./config.js";
 import {
   readConfig,
   writeConfig,
@@ -62,7 +69,7 @@ import {
   cleanStaleCapabilities,
   matchMessageToCapability,
 } from "./capabilities.js";
-import { getPollingManager, type PollState } from "./polling-manager.js";
+import { getPollingManager, getAllPollingManagers, type PollState } from "./polling-manager.js";
 
 // ============================================================================
 // Constants
@@ -96,6 +103,21 @@ interface TelegramMessage {
   from?: TelegramUser;
   text?: string;
   caption?: string;
+  reply_to_message?: TelegramMessage;
+}
+
+interface TelegramReactionType {
+  type: string;
+  emoji: string;
+}
+
+interface TelegramMessageReactionUpdated {
+  chat: TelegramChat;
+  message_id: number;
+  user?: TelegramUser;
+  date: number;
+  old_reaction: TelegramReactionType[];
+  new_reaction: TelegramReactionType[];
 }
 
 interface TelegramUpdate {
@@ -104,6 +126,7 @@ interface TelegramUpdate {
   edited_message?: TelegramMessage;
   channel_post?: TelegramMessage;
   edited_channel_post?: TelegramMessage;
+  message_reaction?: TelegramMessageReactionUpdated;
 }
 
 interface TelegramApiResponse<T> {
@@ -130,6 +153,7 @@ interface PendingTelegramTurn {
   queuedAttachments: QueuedAttachment[];
   content: Array<TextContent | ImageContent>;
   historyText: string;
+  replyChainText?: string;
   dbId?: number;
 }
 
@@ -327,6 +351,13 @@ async function verifyToken(token: string): Promise<TelegramUser | null> {
     return null;
   } catch { return null; }
 }
+async function selectBotForSession(projectDir: string): Promise<BotContext | undefined> {
+  try {
+    return await resolveBotContext(projectDir);
+  } catch {
+    return undefined;
+  }
+}
 
 // ============================================================================
 // Session State
@@ -394,9 +425,15 @@ export default function (pi: ExtensionAPI): void {
 
   function isAuthorizedTelegramMessage(message: TelegramMessage): boolean {
     const text = normalizeTelegramCommand((message.text || message.caption || "").toLowerCase());
+
+    // Initial pairing: only when no users are configured yet AND the message
+    // is a private /start or /help from a real (non-bot) user.  This is the
+    // one-time bootstrap window — once any user is registered, this path
+    // closes permanently for this bot.
     const allowInitialPrivatePairing =
       currentAllowedUserIds().length === 0 &&
       message.chat.type === "private" &&
+      message.from && !message.from.is_bot &&
       (text === "/start" || text === "/help");
 
     if (allowInitialPrivatePairing) return true;
@@ -408,17 +445,37 @@ export default function (pi: ExtensionAPI): void {
     return state.botContext?.dbPath ?? join(homedir(), ".pi", "agent", "teleg-bridge.db");
   }
 
-  function currentPollingManager(): ReturnType<typeof getPollingManager> | null {
+  function currentPollingManager(): import("./polling-manager.js").PollingManager | null {
     const botId = currentBotId();
     return botId ? getPollingManager(botId) : null;
   }
 
   async function refreshBotContext(): Promise<void> {
+    const previousBotId = state.botContext?.botId;
     state.botContext = await resolveBotContext(cwd);
+    // Enforce: one instance, one bot. Reject if the resolved bot changed.
+    if (previousBotId && state.botContext.botId !== previousBotId) {
+      throw new Error(
+        `Bot identity conflict: was ${previousBotId}, resolved ${state.botContext.botId}. ` +
+        `One instance must use a single bot. Check TELEG_BOT_TOKEN / .pi/teleg.json.`
+      );
+    }
     normalizeConfigFromBotContext(state.botContext);
     const pm = getPollingManager(state.botContext.botId);
     pm.setConfig(state.botContext.botToken, state.botContext.lastUpdateId);
     pm.setBotInfo({ username: state.botContext.botUsername, displayName: state.botContext.botUsername });
+  }
+
+  async function persistProjectConfig(patch: ProjectConfig): Promise<void> {
+    await writeProjectConfig(cwd, {
+      botId: patch.botId ?? currentBotId(),
+      botUsername: patch.botUsername ?? state.botContext?.botUsername ?? state.config.botUsername,
+      botToken: patch.botToken ?? currentBotToken(),
+      allowedUserIds: patch.allowedUserIds ?? currentAllowedUserIds(),
+      allowedChatIds: patch.allowedChatIds ?? currentAllowedChatIds(),
+      lastUpdateId: patch.lastUpdateId ?? state.botContext?.lastUpdateId ?? state.config.lastUpdateId ?? 0,
+      dbPath: patch.dbPath ?? currentDbPath(),
+    });
   }
 
   // ─── Status UI ────────────────────────────────────────────────────────
@@ -461,13 +518,6 @@ export default function (pi: ExtensionAPI): void {
     const queued = queueDepth > 0 ? ` +${queueDepth}` : "";
     const selfQ = selfQueue > 0 ? ` [${selfQueue}]` : "";
     ctx.ui.setStatus("teleg-bridge", `${label} ${activeIndicator}${queued}${selfQ}${errorIndicator}`);
-    return;
-    if (currentAllowedUserIds().length === 0) {
-      ctx.ui.setStatus("teleg-bridge", `${label} ${theme.fg("warning", "awaiting pairing")}`);
-      return;
-    }
-
-    // (status set above for all cases)
   }
 
   // ─── Session lifecycle ────────────────────────────────────────────────
@@ -592,26 +642,71 @@ export default function (pi: ExtensionAPI): void {
     // @sessionName prefix → queue the message for that session.
     // Queue-based delivery gives the target session reliable queue management,
     // service activeness, retries/recovery, and status visibility.
-    if (targetSessionName && targetSessionName !== sessionName) {
-      assignIncomingToSession(message, targetSessionName, dbId);
-      if (state.config.botToken) {
-        const pending = Db.getPendingCountForSession(currentBotId() || 0, targetSessionName);
-        await sendReply(state.config.botToken, String(message.chat.id), message.message_id,
-          `📥 Queued for @${targetSessionName} (${pending} pending)`);
+    if (targetSessionName) {
+      const myBotId = currentBotId();
+      const registry = await readSessionRegistry();
+      // Scope lookup to sessions under this bot first
+      const targetSession = registry.sessions.find(s => s.sessionName === targetSessionName && s.botId === myBotId);
+      if (targetSession) {
+        // Registered on this bot — but only queue if the target is actually
+        // alive and able to drain its queue. A dead-but-registered session
+        // would accept the message yet never process it, so reject explicitly
+        // instead of queueing indefinitely. Liveness reuses the same PID
+        // check the shared-chat tier relies on (Db.getAliveRelaySessions).
+        const aliveSessionNames = myBotId != null
+          ? Db.getAliveRelaySessions(myBotId).map(s => s.session_name)
+          : [];
+        if (aliveSessionNames.includes(targetSessionName)) {
+          assignIncomingToSession(message, targetSessionName, dbId);
+          if (state.config.botToken) {
+            const pending = Db.getPendingCountForSession(myBotId!, targetSessionName);
+            await sendReply(state.config.botToken, String(message.chat.id), message.message_id,
+              `📥 Queued for @${targetSessionName} (${pending} pending)`);
+          }
+          return;
+        }
+        // Registered on this bot but silent (not currently linked). Keep the
+        // message queued for it so the session drains it when it reconnects,
+        // or another linked session on this bot claims it via the
+        // fallback-claim path. Rejecting would lose the message; queuing keeps
+        // it recoverable while staying bot-scoped (no cross-bot routing).
+        assignIncomingToSession(message, targetSessionName, dbId);
+        if (state.config.botToken) {
+          const pending = Db.getPendingCountForSession(myBotId!, targetSessionName);
+          await sendReply(state.config.botToken, String(message.chat.id), message.message_id,
+            `📥 @${targetSessionName} is silent. Queued (${pending} pending) — a linked session may respond.\nLive: ${aliveSessionNames.join(", ") || "none"}`);
+        }
+        return;
       }
+      // Not found on this bot — check if it exists on another bot
+      const otherBotSession = registry.sessions.find(s => s.sessionName === targetSessionName);
+      if (otherBotSession && otherBotSession.botId !== myBotId) {
+        if (state.config.botToken) {
+          await sendReply(state.config.botToken, String(message.chat.id), message.message_id,
+            `❌ @${targetSessionName} is connected to a different bot. Cross-bot routing is not supported.`);
+        }
+        completeIncoming(dbId);
+        return;
+      }
+      // Session not found at all — reject explicitly, don't fall through
+      if (state.config.botToken) {
+        const activeSessions = registry.sessions.filter(s => s.botId === myBotId).map(s => s.sessionName);
+        await sendReply(state.config.botToken, String(message.chat.id), message.message_id,
+          `❌ @${targetSessionName} not found. Active: ${activeSessions.join(", ") || "none"}`);
+      }
+      completeIncoming(dbId);
       return;
     }
 
-    // No @mention → auto-route based on capabilities
     if (!targetSessionName) {
       const botId = state.botContext?.botId;
       if (botId) {
         const capReg = await readCapabilitiesRegistry();
-        // Only consider alive sessions that are NOT this session
         const aliveEntries = capReg.entries.filter(e => {
           if (e.sessionName === sessionName) return false;
           try { process.kill(e.pid, 0); return true; } catch { return false; }
-        });
+        }).filter(e => e.botId === botId);
+
         const match = matchMessageToCapability(cleanText, aliveEntries);
         if (match) {
           assignIncomingToSession(message, match.sessionName, dbId);
@@ -672,7 +767,9 @@ export default function (pi: ExtensionAPI): void {
     }
 
     if (lower === "/teleg-dc-all" || lower === "/teleg-disconnect-all") {
-      // Kill ALL sessions only. Do NOT clean queue DB or remove registry records here.
+      // Kill ALL sessions for THIS bot only. Do NOT clean queue DB or remove
+      // registry records here. Scoping to the current bot prevents a cross-bot
+      // blast radius where one bot's kill-switch terminates another bot's sessions.
       if (state.activeTurn) {
         completeTurn(state.activeTurn.dbId);
         deactivateTurn();
@@ -681,9 +778,12 @@ export default function (pi: ExtensionAPI): void {
       if (state.livenessTimer) { clearInterval(state.livenessTimer); state.livenessTimer = undefined; }
       const pm = currentPollingManager();
       if (pm && pm.isActive()) await pm.stop();
+      const botId = currentBotId();
       const registry = await readSessionRegistry();
-      for (const s of registry.sessions) {
-        if (s.sessionId === sessionId) continue;
+      const targets = botId
+        ? registry.sessions.filter((s) => s.botId === botId && s.sessionId !== sessionId)
+        : registry.sessions.filter((s) => s.sessionId !== sessionId);
+      for (const s of targets) {
         try { process.kill(s.pid, 9); } catch { /* already dead */ }
         cleanRelayFilesByPid(s.pid);
       }
@@ -693,18 +793,21 @@ export default function (pi: ExtensionAPI): void {
       await unregisterSession();
       const botToken = currentBotToken();
       if (botToken) {
-        await sendReply(botToken, String(message.chat.id), message.message_id, `🔌 Disconnected ALL sessions (${registry.sessions.length} signalled). DB unchanged.`);
+        await sendReply(botToken, String(message.chat.id), message.message_id, `🔌 Disconnected ${targets.length} session${targets.length === 1 ? "" : "s"} for bot ${botId ?? "?"}. DB unchanged.`);
       }
       updateStatus(ctx);
       return;
     }
 
     if (lower === "/teleg-clean-db") {
-      const reset = Db.resetAllProcessing();
-      const purged = Db.purgeOldMessages(500);
+      // Scope to the current bot so this cleanup can't reset another bot's
+      // in-flight work (cross-bot blast radius). No-op if no bot is bound here.
+      const botId = currentBotId();
+      const reset = botId ? Db.resetAllProcessing(botId) : 0;
+      const purged = botId ? Db.purgeOldMessages(500, botId) : 0;
       const botToken = currentBotToken();
       if (botToken) {
-        await sendReply(botToken, String(message.chat.id), message.message_id, `🧹 DB cleaned: ${reset} processing reset, ${purged} old messages purged.`);
+        await sendReply(botToken, String(message.chat.id), message.message_id, `🧹 DB cleaned (bot ${botId ?? "none"}): ${reset} processing reset, ${purged} old messages purged.`);
       }
       return;
     }
@@ -737,11 +840,15 @@ export default function (pi: ExtensionAPI): void {
       }
       if (currentAllowedUserIds().length === 0) {
         const ids = [message.from!.id];
+        const botId = currentBotId();
         state.config.allowedUserIds = ids;
         if (state.botContext) state.botContext.allowedUserIds = ids;
-        const botId = currentBotId();
-        if (botId) await updateAllowedUsers(botId, ids);
-        else await writeConfig(state.config);
+        if (botId) {
+          await updateAllowedUsers(botId, ids);
+          await persistProjectConfig({ allowedUserIds: ids });
+        } else {
+          await writeConfig(state.config);
+        }
       }
       return;
     }
@@ -824,16 +931,20 @@ export default function (pi: ExtensionAPI): void {
 
     if (lower === "/teleg-reconcile") {
       const botId = state.botContext?.botId;
-      const report = await reconcileSessions(botId);
+      const raw = await reconcileSessions(botId);
+      const reports = Array.isArray(raw) ? raw : [raw];
       if (state.config.botToken) {
-        await sendReply(state.config.botToken, String(message.chat.id), message.message_id, [
-          `<b>📊 Reconcile Report</b>`,
-          ``,
-          `Checked: ${report.checkedSessions} sessions`,
-          `Evicted: ${report.evictedSessions.length > 0 ? report.evictedSessions.join(", ") : "none"}`,
-          `New primary: ${report.newPrimary ?? "unchanged"}`,
-          ...(report.errors.length ? [`⚠️ Errors: ${report.errors.join("; ")}`] : []),
-        ].join("\n"));
+        const lines: string[] = [`<b>📊 Reconcile Report</b>`, ``];
+        for (const report of reports) {
+          if (reports.length > 1) lines.push(`<b>Bot ${report.botId}</b>`);
+          lines.push(
+            `Checked: ${report.checkedSessions} sessions`,
+            `Evicted: ${report.evictedSessions.length > 0 ? report.evictedSessions.join(", ") : "none"}`,
+            `New primary: ${report.newPrimary ?? "unchanged"}`,
+            ...(report.errors.length ? [`⚠️ Errors: ${report.errors.join("; ")}`] : []),
+          );
+        }
+        await sendReply(state.config.botToken, String(message.chat.id), message.message_id, lines.join("\n"));
       }
       return;
     }
@@ -902,6 +1013,38 @@ export default function (pi: ExtensionAPI): void {
       return;
     }
 
+    // ─── Shared-bot group/channel coordination ────────────────────────────
+    // For non-private chats, prefer the session on THIS bot that already has
+    // context for this chat, so a shared group/channel conversation stays with
+    // one session instead of fragmenting across sessions. This tier sits below
+    // explicit @session and capability routing, and above the current-session
+    // fallback. Every candidate is scoped to the current bot, so routing never
+    // crosses bots.
+    {
+      const botId = currentBotId();
+      const chatType = message.chat.type;
+      if (botId && (chatType === "group" || chatType === "supergroup" || chatType === "channel")) {
+        const ownerSession = Db.getLastSessionForChat(botId, message.chat.id);
+        if (ownerSession && ownerSession !== sessionName) {
+          // Only route to the owner if it is still alive and registered on this bot
+          const ownerAlive = Db.getAliveRelaySessions(botId).some(s => s.session_name === ownerSession);
+          if (ownerAlive) {
+            assignIncomingToSession(message, ownerSession, dbId);
+            if (state.config.botToken) {
+              const pending = Db.getPendingCountForSession(botId, ownerSession);
+              await sendReply(
+                state.config.botToken,
+                String(message.chat.id),
+                message.message_id,
+                `📥 Queued for @${ownerSession} (shared ${chatType} context${pending > 0 ? `; ${pending} pending` : ""})`,
+              );
+            }
+            return;
+          }
+        }
+      }
+    }
+
     // Regular message — queue if this session is already processing, otherwise send to the agent immediately.
     if (!ctx.isIdle() || state.activeTurn) {
       assignIncomingToSession(message, sessionName, dbId);
@@ -919,20 +1062,55 @@ export default function (pi: ExtensionAPI): void {
     }
 
     markIncomingProcessing(dbId);
+
+    // Build reply chain context from the nested reply_to_message and DB
+    const replyChainText = buildReplyChain(message);
+    const historyText = replyChainText ? `${replyChainText}\n${rawText || "(no text)"}` : (rawText || "(no text)");
     const turn: PendingTelegramTurn = {
       sessionId,
       sessionName,
       chatId: message.chat.id,
       replyToMessageId: message.message_id,
       queuedAttachments: [],
-      content: [{ type: "text", text: `${TELEGRAM_PREFIX} ${rawText}` }],
-      historyText: rawText || "(no text)",
+      content: [{ type: "text", text: `${TELEGRAM_PREFIX} ${historyText}` }],
+      historyText,
+      replyChainText,
       dbId,
     };
 
     activateTurn(turn as ActiveTelegramTurn);
     updateStatus(ctx);
     pi.sendUserMessage(turn.content);
+  }
+
+  /** Build reply chain context from the inline reply_to_message (from Telegram API) and DB history. */
+  function buildReplyChain(message: TelegramMessage): string {
+    if (!message.reply_to_message) return "";
+    const botId = currentBotId();
+    const chatId = message.chat.id;
+    const parts: string[] = [];
+
+    // Start with the inline reply_to_message from the Telegram API payload
+    const inline = message.reply_to_message;
+    parts.unshift(`[${inline.from?.username || inline.from?.first_name || "User"}]: ${inline.text || inline.caption || ""}`);
+
+    // Walk deeper chain from DB if there's a further reply
+    if (botId && inline.reply_to_message) {
+      let currentMsgId: number | undefined = inline.reply_to_message.message_id;
+      const MAX_CHAIN = 10;
+      let depth = 0;
+      while (currentMsgId && depth < MAX_CHAIN) {
+        const row = Db.getDb().prepare(
+          "SELECT message_id, from_username, text, reply_to_message_id FROM message_queue WHERE bot_id = ? AND chat_id = ? AND message_id = ?"
+        ).get(botId, chatId, currentMsgId) as { message_id: number; from_username: string | null; text: string; reply_to_message_id: number | null } | undefined;
+        if (!row) break;
+        parts.unshift(`[${row.from_username || "User"}]: ${row.text}`);
+        currentMsgId = row.reply_to_message_id ?? undefined;
+        depth++;
+      }
+    }
+
+    return parts.join("\n");
   }
 
   // ─── Command handlers ─────────────────────────────────────────────────
@@ -1046,7 +1224,11 @@ export default function (pi: ExtensionAPI): void {
       return;
     }
 
-    const botId = currentBotId() || 0;
+    const botId = currentBotId();
+    if (!botId) {
+      await sendReply(botToken, String(message.chat.id), message.message_id, `❌ No Telegram bot is configured for this session.`);
+      return;
+    }
     const d = Db.getDb();
     const normalizedTarget = Db.normalizeSessionName(targetName);
     const queueStats = Db.getQueueStatsForSession(botId, normalizedTarget);
@@ -1108,6 +1290,21 @@ export default function (pi: ExtensionAPI): void {
     return result as { turn: PendingTelegramTurn; update: TelegramUpdate; dbId: number };
   }
 
+  function claimNextTurnForSilentSession(): { turn: PendingTelegramTurn; update: TelegramUpdate; dbId: number } | null {
+    const pm = currentPollingManager();
+    if (!pm) return null;
+    const botId = currentBotId();
+    if (!botId) return null;
+    // Policy 3: the common queue is bot-scoped and may only be claimed by a
+    // linked (alive) session on this bot. An unlinked/unhealthy session must
+    // ignore it entirely — it only drains messages explicitly tagged for itself.
+    const aliveNames = Db.getAliveRelaySessions(botId).map(s => s.session_name);
+    if (!aliveNames.includes(sessionName)) return null;
+    const result = pm.claimNextTurnForSilentSession(sessionName, aliveNames);
+    if (!result) return null;
+    return result as { turn: PendingTelegramTurn; update: TelegramUpdate; dbId: number };
+  }
+
   // ─── Typing indicator ──────────────────────────────────────────────
 
   function startTyping(chatId: number): void {
@@ -1157,10 +1354,7 @@ export default function (pi: ExtensionAPI): void {
         removed.push(s.sessionName);
         cleanRelayFilesByPid(s.pid);
         Db.unregisterRelaySession(botId, s.sessionName);
-        // Reset any processing messages owned by the dead session
-        Db.getDb().prepare(
-          "UPDATE message_queue SET status = 'pending', session_id = 'unassigned', session_name = 'unknown', started_at = NULL WHERE session_name = ? AND status = 'processing'"
-        ).run(s.sessionName);
+        Db.resetProcessingForSession(botId, s.sessionName);
       }
     }
     if (removed.length > 0) {
@@ -1197,8 +1391,16 @@ export default function (pi: ExtensionAPI): void {
       pi.sendUserMessage(queued.turn.content, { deliverAs: "steer" });
       return true;
     }
+    // 3. Fallback: rescue messages whose owner session is silent/dead. Only a
+    //    linked session on this bot may claim the common queue (policy 3).
+    const fallback = claimNextTurnForSilentSession();
+    if (fallback) {
+      activateTurn(fallback.turn as ActiveTelegramTurn);
+      pi.sendUserMessage(fallback.turn.content, { deliverAs: "steer" });
+      return true;
+    }
 
-    // 3. Optional unassigned messages (cross-session help)
+    // 4. Optional unassigned messages (cross-session help)
     if (CLAIM_OTHERS) {
       const queueMsg = claimNextTurn();
       if (queueMsg) {
@@ -1220,6 +1422,15 @@ export default function (pi: ExtensionAPI): void {
       allowedUserIds: currentAllowedUserIds(),
     };
     await writeConfig(newConfig);
+    await persistProjectConfig({
+      botId: botInfo.id,
+      botUsername: botInfo.username,
+      botToken: token.trim(),
+      allowedUserIds: currentAllowedUserIds(),
+      allowedChatIds: currentAllowedChatIds(),
+      lastUpdateId: newConfig.lastUpdateId ?? 0,
+      dbPath: currentDbPath(),
+    });
     state.config = newConfig;
     await refreshBotContext().catch(() => {
       state.config = newConfig;
@@ -1246,6 +1457,104 @@ export default function (pi: ExtensionAPI): void {
     }
     updateStatus(ctx);
     ctx.ui.notify(message, "info");
+  }
+
+  // ─── Bot selection / activation ──────────────────────────────────────
+
+  /**
+   * Register a brand-new bot from a token entered by the user.
+   * Returns true when a bot is now active, false if the user cancelled or the
+   * token was invalid.
+   */
+  async function registerNewBot(ctx: ExtensionContext): Promise<boolean> {
+    const token = await ctx.ui.input("Telegram bot token", "123456:ABCDEF...");
+    if (!token) return false;
+    const botInfo = await verifyToken(token);
+    if (!botInfo) {
+      ctx.ui.notify("Invalid Telegram bot token", "error");
+      return false;
+    }
+    await saveVerifiedBotConfig(token, botInfo);
+    ctx.ui.notify(`Teleg-bridge connected: @${botInfo.username}`, "info");
+    ctx.ui.notify("Send /start to your bot in Telegram to pair.", "info");
+    return true;
+  }
+
+  /**
+   * Ask the user to pick from the already-registered bots.
+   * - No bots → null (caller falls back to token setup).
+   * - One bot, or headless session → that bot is used directly.
+   * - Several bots → a selector; the user may also opt to register a new bot.
+   */
+  async function promptForBot(
+    ctx: ExtensionContext
+  ): Promise<{ botId: number; botUsername: string } | "new" | null> {
+    const bots = await listConfiguredBots();
+    if (bots.length === 0) return null;
+    if (bots.length === 1 || !ctx.hasUI) {
+      // Single bot → use directly. Headless → can't show a selector, so prefer
+      // the configured default bot (falling back to the first registered one).
+      if (!ctx.hasUI) {
+        const defaultId = await getDefaultBotId();
+        const def = bots.find((b) => b.botId === defaultId);
+        if (def) return def;
+      }
+      return bots[0];
+    }
+
+    const options = bots.map((b) => `@${b.botUsername} (id: ${b.botId})`);
+    options.push("➕ Register a new bot");
+    const choice = await ctx.ui.select("Select a Telegram bot", options);
+    if (!choice) return null; // cancelled
+    if (choice === "➕ Register a new bot") return "new";
+    const idx = options.indexOf(choice);
+    return bots[idx] ?? null;
+  }
+
+  /**
+   * Make the chosen bot the active bot for this session: stop the previous
+   * bot's polling, switch the context, persist the selection (project pin +
+   * global default) and reconfigure the polling manager.
+   */
+  async function switchActiveBot(botId: number, ctx: ExtensionContext): Promise<boolean> {
+    const newContext = await resolveFromBotId(botId, cwd);
+    if (!newContext) {
+      ctx.ui.notify(`Bot ${botId} is not registered.`, "error");
+      return false;
+    }
+    const oldBotId = currentBotId();
+    if (oldBotId && oldBotId !== botId) {
+      const oldPm = getPollingManager(oldBotId);
+      if (oldPm.isActive()) await oldPm.stop();
+    }
+    state.botContext = newContext;
+    normalizeConfigFromBotContext(newContext);
+    await persistProjectConfig({
+      botId: newContext.botId,
+      botUsername: newContext.botUsername,
+      botToken: newContext.botToken,
+      allowedUserIds: newContext.allowedUserIds,
+      allowedChatIds: newContext.allowedChatIds,
+      lastUpdateId: newContext.lastUpdateId,
+      dbPath: newContext.dbPath,
+    });
+    await setDefaultBotId(newContext.botId);
+    const pm = getPollingManager(newContext.botId);
+    pm.setConfig(newContext.botToken, newContext.lastUpdateId);
+    pm.setBotInfo({ username: newContext.botUsername, displayName: newContext.botUsername });
+    updateStatus(ctx);
+    ctx.ui.notify(`Active bot: @${newContext.botUsername}`, "info");
+    return true;
+  }
+
+  /**
+   * Ensure a bot is active for this session, selecting from existing bots or
+   * falling back to token setup. Returns true when a bot is now active.
+   */
+  async function ensureBotSelected(ctx: ExtensionContext): Promise<boolean> {
+    const choice = await promptForBot(ctx);
+    if (choice === null || choice === "new") return registerNewBot(ctx);
+    return switchActiveBot(choice.botId, ctx);
   }
 
   // ─── Commands ──────────────────────────────────────────────────────────
@@ -1293,13 +1602,7 @@ export default function (pi: ExtensionAPI): void {
     description: "Start teleg-bridge polling",
     handler: async (_args, ctx) => {
       if (!currentBotToken()) {
-        const token = await ctx.ui.input("Telegram bot token", "123456:ABCDEF...");
-        if (!token) return;
-        const botInfo = await verifyToken(token);
-        if (!botInfo) { ctx.ui.notify("Invalid Telegram bot token", "error"); return; }
-        await saveVerifiedBotConfig(token, botInfo);
-        ctx.ui.notify(`Teleg-bridge connected: @${botInfo.username}`, "info");
-        ctx.ui.notify("Send /start to your bot in Telegram to pair.", "info");
+        if (!(await ensureBotSelected(ctx))) return;
       }
       await startCurrentPolling(ctx, "Polling started.");
     },
@@ -1323,16 +1626,7 @@ export default function (pi: ExtensionAPI): void {
     description: "Force reconnection to Telegram",
     handler: async (_args, ctx) => {
       if (!currentBotToken()) {
-        const token = await ctx.ui.input("Telegram bot token", "123456:ABCDEF...");
-        if (!token) return;
-        const botInfo = await verifyToken(token);
-        if (!botInfo) {
-          ctx.ui.notify("Invalid Telegram bot token", "error");
-          return;
-        }
-        await saveVerifiedBotConfig(token, botInfo);
-        ctx.ui.notify(`Teleg-bridge connected: @${botInfo.username}`, "info");
-        ctx.ui.notify("Send /start to your bot in Telegram to pair.", "info");
+        if (!(await ensureBotSelected(ctx))) return;
       }
       const pm = currentPollingManager();
       if (!pm || !currentBotToken()) {
@@ -1342,6 +1636,24 @@ export default function (pi: ExtensionAPI): void {
       }
       await pm.stop();
       await startCurrentPolling(ctx, "Reconnecting to Telegram...");
+    },
+  });
+
+  pi.registerCommand("teleg-switch-bot", {
+    description: "Switch the active Telegram bot for this session",
+    handler: async (_args, ctx) => {
+      const choice = await promptForBot(ctx);
+      if (choice === null) {
+        ctx.ui.notify("No bots registered yet. Use /teleg-setup or /teleg-connect to add one.", "info");
+        return;
+      }
+      if (choice === "new") {
+        if (await registerNewBot(ctx)) await startCurrentPolling(ctx, "Polling started.");
+        return;
+      }
+      if (await switchActiveBot(choice.botId, ctx)) {
+        await startCurrentPolling(ctx, "Switched bot — polling started.");
+      }
     },
   });
 
@@ -1450,9 +1762,12 @@ export default function (pi: ExtensionAPI): void {
     description: "Get full queue statistics for messages and downloads",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params) {
-      const botId = state.botContext?.botId;
-      const stats = botId ? Db.getQueueStats(botId) : Db.getQueueStats();
-      const dlStats = botId ? Db.getDownloadStats(botId) : Db.getDownloadStats();
+      const botId = currentBotId();
+      if (!botId) {
+        return { content: [{ type: "text", text: "No Telegram bot is configured for this session." }], details: { messages: { pending: 0, processing: 0, completed: 0, failed: 0, total: 0 }, downloads: { pending: 0, processing: 0, completed: 0, failed: 0, total: 0 } } };
+      }
+      const stats = Db.getQueueStats(botId);
+      const dlStats = Db.getDownloadStats(botId);
       const text = `Messages: ${stats.pending} pending · ${stats.processing} processing · ${stats.completed} completed · ${stats.failed} failed\nDownloads: ${dlStats.pending} pending · ${dlStats.processing} processing · ${dlStats.completed} completed · ${dlStats.failed} failed`;
       return { content: [{ type: "text", text }], details: { messages: stats, downloads: dlStats } };
     },
@@ -1468,11 +1783,12 @@ export default function (pi: ExtensionAPI): void {
     }),
     async execute(_toolCallId, params) {
       const limit = params.limit ?? 20;
+      const botId = currentBotId();
       let rows;
       if (params.status) {
-        rows = Db.getDb().prepare(`SELECT * FROM message_queue WHERE status = ? ORDER BY created_at DESC LIMIT ?`).all(params.status, limit);
+        rows = Db.getDb().prepare(`SELECT * FROM message_queue WHERE bot_id = ? AND status = ? ORDER BY created_at DESC LIMIT ?`).all(botId, params.status, limit);
       } else {
-        rows = Db.getRecentMessages(limit);
+        rows = Db.getRecentMessages(limit, botId);
       }
       return { content: [{ type: "text", text: JSON.stringify(rows, null, 2) }], details: { rows } };
     },
@@ -1484,7 +1800,11 @@ export default function (pi: ExtensionAPI): void {
     description: "Get a specific queue message by its ID",
     parameters: Type.Object({ id: Type.Number({ description: "Queue message ID" }) }),
     async execute(_toolCallId, params) {
-      const row = Db.getDb().prepare(`SELECT * FROM message_queue WHERE id = ?`).get(params.id) as Record<string, unknown> | undefined;
+      const botId = currentBotId();
+      if (!botId) {
+        return { content: [{ type: "text", text: `No message found with id ${params.id}` }], details: { row: null } };
+      }
+      const row = Db.getDb().prepare(`SELECT * FROM message_queue WHERE id = ? AND bot_id = ?`).get(params.id, botId) as Record<string, unknown> | undefined;
       return { content: [{ type: "text", text: row ? JSON.stringify(row, null, 2) : `No message found with id ${params.id}` }], details: { row: row ?? null } };
     },
   });
@@ -1501,9 +1821,10 @@ export default function (pi: ExtensionAPI): void {
       error: Type.Optional(Type.String({ description: "Error message if status is 'failed'" })),
     }),
     async execute(_toolCallId, params) {
+      const botId = currentBotId();
       const now = Date.now();
       let query = `UPDATE message_queue SET status = ?`;
-      const args: (string | number)[] = [params.status];
+      const args: (string | number | undefined)[] = [params.status];
       if (params.status === "completed") {
         query += `, completed_at = ?`;
         args.push(now);
@@ -1513,9 +1834,9 @@ export default function (pi: ExtensionAPI): void {
       } else if (params.status === "pending") {
         query += `, started_at = NULL, session_id = 'unassigned', session_name = 'unknown'`;
       }
-      query += ` WHERE id = ?`;
-      args.push(params.id);
-      const result = Db.getDb().prepare(query).run(...args);
+      query += ` WHERE id = ? AND bot_id = ?`;
+      args.push(params.id, botId);
+      const result = Db.getDb().prepare(query).run(...args as (string | number)[]);
       return { content: [{ type: "text", text: `Updated ${result.changes} message(s) to status '${params.status}'` }], details: { changes: result.changes } };
     },
   });
@@ -1654,9 +1975,12 @@ export default function (pi: ExtensionAPI): void {
       if (state.livenessTimer) { clearInterval(state.livenessTimer); state.livenessTimer = undefined; }
       const pm = currentPollingManager();
       if (pm && pm.isActive()) await pm.stop();
+      const botId = currentBotId();
       const registry = await readSessionRegistry();
       const killed: string[] = [];
+      // Scope to the current bot to avoid a cross-bot blast radius.
       for (const s of registry.sessions) {
+        if (botId && s.botId !== botId) continue;
         killed.push(s.sessionName);
         if (s.sessionId === sessionId) continue;
         try { process.kill(s.pid, 9); } catch { /* already dead */ }
@@ -1678,9 +2002,10 @@ export default function (pi: ExtensionAPI): void {
       keep_count: Type.Optional(Type.Number({ description: "How many completed/failed messages to keep (default 500)" })),
     }),
     async execute(_toolCallId, params) {
-      const reset = Db.resetAllProcessing();
-      const purged = Db.purgeOldMessages(params.keep_count ?? 500);
-      return { content: [{ type: "text", text: `DB cleaned: ${reset} processing reset, ${purged} old messages purged.` }], details: { reset, purged } };
+      const botId = currentBotId();
+      const reset = botId ? Db.resetAllProcessing(botId) : 0;
+      const purged = botId ? Db.purgeOldMessages(params.keep_count ?? 500, botId) : 0;
+      return { content: [{ type: "text", text: `DB cleaned (bot ${botId ?? "none"}): ${reset} processing reset, ${purged} old messages purged.` }], details: { reset, purged } };
     },
   });
 
@@ -1721,16 +2046,19 @@ export default function (pi: ExtensionAPI): void {
     }),
     async execute(_toolCallId, params) {
       const botId = params.bot_id ?? state.botContext?.botId;
-      const report = await reconcileSessions(botId);
-      const lines = [
-        `📊 Reconcile Report${botId ? ` (bot ${botId})` : ""}`,
-        ``,
-        `Checked: ${report.checkedSessions} sessions`,
-        `Evicted: ${report.evictedSessions.length > 0 ? report.evictedSessions.join(", ") : "none"}`,
-        `New primary: ${report.newPrimary ?? "unchanged"}`,
-        ...(report.errors.length ? [`Errors: ${report.errors.join("; ")}`] : []),
-      ];
-      return { content: [{ type: "text", text: lines.join("\n") }], details: report };
+      const raw = await reconcileSessions(botId);
+      const reports = Array.isArray(raw) ? raw : [raw];
+      const lines: string[] = [`📊 Reconcile Report${botId ? ` (bot ${botId})` : ""}`, ``];
+      for (const report of reports) {
+        if (reports.length > 1) lines.push(`Bot ${report.botId}:`);
+        lines.push(
+          `Checked: ${report.checkedSessions} sessions`,
+          `Evicted: ${report.evictedSessions.length > 0 ? report.evictedSessions.join(", ") : "none"}`,
+          `New primary: ${report.newPrimary ?? "unchanged"}`,
+          ...(report.errors.length ? [`Errors: ${report.errors.join("; ")}`] : []),
+        );
+      }
+      return { content: [{ type: "text", text: lines.join("\n") }], details: reports.length === 1 ? reports[0] : reports };
     },
   });
 
@@ -1838,17 +2166,57 @@ export default function (pi: ExtensionAPI): void {
   registerCleanupHandlers();
 
   pi.on("session_start", async (_event, ctx) => {
-    // Run SQLite startup recovery
-    const recovery = Db.runStartupRecovery();
-    if (recovery.recoveredMessages > 0 || recovery.cleanedSessions > 0 || (recovery.mergedFromLocal ?? 0) > 0) {
-
-    }
-
-    // Phase 1: Resolve bot context
     try {
-      state.botContext = await resolveBotContext(cwd);
+      if (!state.botContext) {
+        state.botContext = await selectBotForSession(cwd);
+      }
 
-      // Check for split DB warning
+      // No preconfigured bot — try interactive setup if UI is available
+      if (!state.botContext && ctx.hasUI && !state.setupInProgress) {
+        state.setupInProgress = true;
+        try {
+          const token = await ctx.ui.input("No Telegram bot configured. Enter bot token to set up", "123456:ABCDEF...");
+          if (token) {
+            const botInfo = await verifyToken(token);
+            if (botInfo) {
+              await saveVerifiedBotConfig(token, botInfo);
+              state.botContext = await resolveBotContext(cwd);
+              ctx.ui.notify(`Teleg-bridge connected: @${botInfo.username}`, "info");
+              ctx.ui.notify("Send /start to your bot in Telegram to pair.", "info");
+            } else {
+              ctx.ui.notify("Invalid Telegram bot token", "error");
+            }
+          }
+        } finally {
+          state.setupInProgress = false;
+        }
+      }
+
+      if (!state.botContext) {
+        console.error(`[teleg:${sessionName}] No Telegram bot selected or configured.`);
+        return;
+      }
+      // Enforce: one instance, one bot. If another polling manager is active for a
+      // different botId in this process, refuse to proceed — mixing bots in one
+      // process causes queue/polling cross-contamination.
+      const existingManagers = getAllPollingManagers();
+      const conflictingBot = existingManagers.find(m => m.isActive() && m.botId !== state.botContext!.botId);
+      if (conflictingBot) {
+        console.error(
+          `[teleg:${sessionName}] Bot conflict: bot ${conflictingBot.botId} is already polling in this process. ` +
+          `Cannot also serve bot ${state.botContext!.botId}. Use separate processes per bot.`
+        );
+        ctx.ui.notify(
+          `Cannot start: bot ${state.botContext!.botId} conflicts with active bot ${conflictingBot.botId}. ` +
+          `Each process must serve only one bot.`,
+          "error"
+        );
+        return;
+      }
+
+      state.config = await readConfig();
+      normalizeConfigFromBotContext(state.botContext);
+
       const splitDbWarning = await detectSplitDb(state.botContext.botId, state.botContext.dbPath);
       if (splitDbWarning) console.warn(`[teleg:${sessionName}] ${splitDbWarning}`);
     } catch (err) {
@@ -1861,7 +2229,15 @@ export default function (pi: ExtensionAPI): void {
 
     const botId = currentBotId();
     const botToken = currentBotToken();
-    if (botId) Db.normalizeLegacyBotIds(botId);
+
+    // Run scoped startup recovery for this bot
+    if (botId) {
+      const recovery = Db.runStartupRecovery(botId);
+      if (recovery.recoveredMessages > 0 || recovery.cleanedSessions > 0 || (recovery.mergedFromLocal ?? 0) > 0) {
+        console.log(`[teleg:${sessionName}] Startup recovery (bot ${botId}): ${recovery.recoveredMessages} messages, ${recovery.cleanedSessions} sessions recovered`);
+      }
+      Db.normalizeLegacyBotIds(botId);
+    }
     if (botId && botToken) {
       const pm = getPollingManager(botId);
       pm.setConfig(botToken, state.botContext?.lastUpdateId ?? state.config.lastUpdateId ?? 0);
@@ -1899,7 +2275,7 @@ export default function (pi: ExtensionAPI): void {
     // Register session capabilities
     await cleanStaleCapabilities();
     const { capabilities: detectedCaps, description: detectedDesc } = detectProjectCapabilities(cwd);
-    await registerSessionCapabilities(sessionId, sessionName, process.pid, cwd).catch(
+    await registerSessionCapabilities(sessionId, sessionName, process.pid, cwd, botId).catch(
       (err: unknown) => console.error(`[teleg:${sessionName}] Failed to register capabilities:`, err)
     );
     // Also store capabilities in SQLite relay_sessions for cross-session routing
@@ -1908,11 +2284,11 @@ export default function (pi: ExtensionAPI): void {
     }
 
     // Start relay server
-    await startRelayServer(sessionName, 9798, botId).catch(console.error);
+    const relayInfo = await startRelayServer(sessionName, 9798, botId);
 
-    // Register in SQLite relay_sessions table
+    // Register in SQLite relay_sessions table with actual port and secret
     if (botId) {
-      Db.registerRelaySession({ bot_id: botId, session_name: sessionName, session_id: sessionId, pid: process.pid, port: 9798, secret: "" });
+      Db.registerRelaySession({ bot_id: botId, session_name: sessionName, session_id: sessionId, pid: process.pid, port: relayInfo.port, secret: relayInfo.secret });
     }
 
     setCommandHandler(async (text, meta) => {
@@ -1933,22 +2309,27 @@ export default function (pi: ExtensionAPI): void {
 
     setCompleteHandler((id, sourceSession) => {
       if (!sourceSession || sourceSession === "unknown") return;
+      const handlerBotId = currentBotId();
       try {
         const db = Db.getDb();
-        const row = db.prepare("SELECT id FROM message_queue WHERE session_name = ? AND id = ?").get(sourceSession, id) as { id: number } | undefined;
-        if (row) db.prepare(`UPDATE message_queue SET status = 'completed', completed_at = ? WHERE id = ?`).run(Date.now(), row.id);
+        const row = db.prepare(
+          "SELECT id FROM message_queue WHERE bot_id = ? AND (session_name = ? OR session_id = ? OR session_id = ?) AND id = ?"
+        ).get(handlerBotId, sourceSession, sourceSession, `__session__:${sourceSession}`, id) as { id: number } | undefined;
+        if (row) db.prepare(`UPDATE message_queue SET status = 'completed', completed_at = ? WHERE id = ? AND bot_id = ?`).run(Date.now(), row.id, handlerBotId);
       } catch (err) {
         console.error("[teleg] complete handler error:", err);
       }
     });
 
     // Handle shutdown signal from other sessions (PUB-SUB /teleg-dc-all)
-    setShutdownHandler(() => {
+    setShutdownHandler(async () => {
       console.log(`[teleg:${sessionName}] Received shutdown signal`);
       if (state.drainTimer) { clearInterval(state.drainTimer); state.drainTimer = undefined; }
       if (state.livenessTimer) { clearInterval(state.livenessTimer); state.livenessTimer = undefined; }
       stopTyping();
       deactivateTurn();
+      const pm = botId ? getPollingManager(botId) : null;
+      if (pm?.isActive()) await pm.stop();
       stopRelayServer();
       void unregisterSessionCapabilities(sessionId);
       void unregisterSession();
@@ -1973,6 +2354,17 @@ export default function (pi: ExtensionAPI): void {
       const activeSessionId = state.activeTurn?.sessionId;
       if (activeSessionId && activeSessionId !== sessionId && activeSessionId !== "unassigned") return;
       await handleAuthorizedTelegramMessage(message, ctx, dbId);
+    });
+
+    // Wire up polling reaction handler
+    pm?.onReaction((update) => {
+      if (!update.message_reaction) return;
+      const reaction = update.message_reaction;
+      const userId = reaction.user?.id;
+      const emojis = reaction.new_reaction.map(r => r.emoji).join(", ");
+      if (!emojis) return;
+      // Surface reaction event as a log message — it does not create a turn but is visible
+      console.log(`[teleg:${sessionName}] Reaction on msg ${reaction.message_id} in chat ${reaction.chat.id}: ${emojis} by ${reaction.user?.username || userId || "unknown"}`);
     });
 
     // Periodic tasks: heartbeat, reconcile, polling restart
@@ -2044,10 +2436,13 @@ export default function (pi: ExtensionAPI): void {
             const text = unassigned.text || "";
             const match = matchMessageToCapability(text, [myCaps]);
             if (match) {
-              // Claim it
-              Db.getDb().prepare(
+              // Atomically claim; honor the UPDATE result so two
+              // capability-matched sessions can't both steer the same
+              // message (duplicate turn) when they race on the same row.
+              const claimed = Db.getDb().prepare(
                 "UPDATE message_queue SET status = 'processing', session_id = ?, session_name = ?, started_at = ? WHERE id = ? AND status = 'pending'"
-              ).run(sessionId, sessionName, Date.now(), unassigned.id);
+              ).run(sessionId, sessionName, Date.now(), unassigned.id).changes;
+              if (claimed === 0) continue;
               const turn: PendingTelegramTurn = {
                 sessionId,
                 sessionName,
@@ -2065,7 +2460,19 @@ export default function (pi: ExtensionAPI): void {
           }
         }
 
-        // Priority 3: Optional cross-session help for truly unowned messages.
+        // Priority 3: Fallback — rescue messages whose owner session is
+        // silent/dead. Capability matching (purpose) already ran above
+        // (policy 4); a linked session on this bot may now claim the common
+        // queue on the silent session's behalf (policy 2). The wrapper itself
+        // enforces that this session is linked, else the queue is ignored (policy 3).
+        const fallback = claimNextTurnForSilentSession();
+        if (fallback) {
+          activateTurn(fallback.turn as ActiveTelegramTurn);
+          pi.sendUserMessage(fallback.turn.content, { deliverAs: "steer" });
+          return;
+        }
+
+        // Priority 4: Optional cross-session help for truly unowned messages.
         // Disabled by default so a bridge/session cannot steal data-scrapper work.
         if (CLAIM_OTHERS) {
           const queueMsg = claimNextTurn();
@@ -2083,7 +2490,10 @@ export default function (pi: ExtensionAPI): void {
     // Don't wait for the first drain interval — check queue immediately
     if (botId && !state.activeTurn) {
       try {
-        const queued = claimNextTurnForSession();
+        // Own queue first; then, if this session is linked, rescue messages
+        // whose owner session is silent/dead so they don't wait for the first
+        // drain tick (policy 2/3; the wrapper enforces the linked guard).
+        const queued = claimNextTurnForSession() || claimNextTurnForSilentSession();
         if (queued) {
           activateTurn(queued.turn as ActiveTelegramTurn);
           pi.sendUserMessage(queued.turn.content, { deliverAs: "steer" });
@@ -2099,9 +2509,13 @@ export default function (pi: ExtensionAPI): void {
       const { removed } = await monitorDeadSessions();
       if (removed.length > 0) {
         console.log(`[teleg:${sessionName}] Removed dead sessions: ${removed.join(", ")}`);
-        // After removing dead sessions, try to claim their orphaned messages
-        if (!state.activeTurn && botId && CLAIM_OTHERS) {
-          const queued = claimNextTurn();
+        // The silent sessions' queued messages are now orphaned — a linked
+        // session on this bot may claim them (policy 2). This is always-on
+        // (not gated by CLAIM_OTHERS) because the owner is provably gone, so
+        // the work would otherwise be lost. Unlinked sessions ignore the
+        // common queue (policy 3, enforced inside the wrapper).
+        if (!state.activeTurn && botId) {
+          const queued = claimNextTurnForSilentSession();
           if (queued) {
             activateTurn(queued.turn as ActiveTelegramTurn);
             pi.sendUserMessage(queued.turn.content, { deliverAs: "steer" });
@@ -2144,7 +2558,10 @@ export default function (pi: ExtensionAPI): void {
     await unregisterSession();
 
     const botId = currentBotId();
-    if (botId) Db.unregisterRelaySession(botId, sessionName);
+    if (botId) {
+      Db.unregisterRelaySession(botId, sessionName);
+      electPrimary(botId);
+    }
 
     const registry = await readSessionRegistry();
     if (registry.sessions.length === 0) {
@@ -2170,7 +2587,7 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("agent_start", async (_event, ctx) => {
     if (!state.activeTurn) {
-      const queued = claimNextTurnForSession() || (CLAIM_OTHERS ? claimNextTurn() : null);
+      const queued = claimNextTurnForSession() || claimNextTurnForSilentSession() || (CLAIM_OTHERS ? claimNextTurn() : null);
       if (queued) activateTurn(queued.turn as ActiveTelegramTurn);
     }
     updateStatus(ctx);
