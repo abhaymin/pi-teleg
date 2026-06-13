@@ -76,7 +76,7 @@ flowchart LR
   Poller --> Worker[Poll Worker Thread]
   Worker --> Queue[(SQLite message_queue)]
   Queue --> Router[Routing Decision]
-  Router --> Direct[@sessionName]
+  Router --> Direct[Session Route]
   Router --> Caps[Capability Match]
   Router --> Primary[Primary Fallback]
   Direct --> Relay[Authenticated HTTP Relay]
@@ -145,6 +145,9 @@ flowchart TD
 
 ```mermaid
 erDiagram
+  BOT {
+    text logical_parent
+  }
   BOT ||--o{ MESSAGE_QUEUE : scopes
   BOT ||--o{ DOWNLOAD_QUEUE : scopes
   BOT ||--o{ RELAY_SESSIONS : scopes
@@ -228,7 +231,7 @@ erDiagram
     integer created_at
     integer consumed_at
   }
-}
+```
 
 > `BOT` is a logical parent from global/project configuration, not a physical SQLite table. Relationships are enforced by query patterns and indexes rather than foreign-key constraints.
 
@@ -253,8 +256,7 @@ stateDiagram-v2
   processing --> pending: recoverStaleMessages / resetProcessingForSession
   failed --> [*]
   completed --> [*]
-}
-
+```
 ### Main database flows
 
 | Flow | Read / Write Path |
