@@ -1,99 +1,11 @@
-# pi-teleg
-
-
-
-## Getting started
-
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
-
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
-
-```
-cd existing_repo
-git remote add origin https://gitlab.abhaymenon.com/abhaymin/pi-teleg.git
-git branch -M main
-git push -uf origin main
-```
-
-## Integrate with your tools
-
-* [Set up project integrations](http://gitlab.abhaymenon.com/abhaymin/pi-teleg/-/settings/integrations)
-
-## Collaborate with your team
-
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
-
-## Test and Deploy
-
-Use the built-in continuous integration in GitLab.
-
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
-
-***
-
-# Editing this README
-
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
-
-## Suggestions for a good README
-
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
 # pi-teleg / teleg-bridge
 
 **Telegram Bridge Extension for Pi** — a multi-bot, multi-session Telegram bridge that connects Telegram chats to Pi agent sessions and routes messages to the best available project session by explicit address, declared capabilities, or primary-session fallback.
+
+## Repository
+
+- Public install/update: see [Installation](#installation)
+
 
 ## Intent
 
@@ -316,7 +228,7 @@ erDiagram
     integer created_at
     integer consumed_at
   }
-```
+}
 
 > `BOT` is a logical parent from global/project configuration, not a physical SQLite table. Relationships are enforced by query patterns and indexes rather than foreign-key constraints.
 
@@ -341,7 +253,7 @@ stateDiagram-v2
   processing --> pending: recoverStaleMessages / resetProcessingForSession
   failed --> [*]
   completed --> [*]
-```
+}
 
 ### Main database flows
 
@@ -514,128 +426,11 @@ Capability matching uses:
 | `/health` | Test connection. |
 | `/healthfull` | Full diagnostic. |
 | `/compact` | Compact Pi memory. |
-| `/teleg-reconcile` | Reconcile sessions and evict ghosts. |
-| `/teleg-sessions` | List sessions with liveness state. |
-| `/teleg-set-primary <name>` | Set the primary session for the current bot. |
-| `/teleg-bots` | List configured bots. |
-| `/teleg-dc` or `/teleg-disconnect` | Disconnect this session. |
-| `/teleg-dc-all` or `/teleg-disconnect-all` | Disconnect all sessions without cleaning DB state. |
-| `/teleg-clean-db` | Reset processing queue and purge old entries. |
-| `/teleg-remove-sessions` | Remove dead session registry records. |
 | `stop` | Abort current turn. |
-
-## Pi Commands
-
-| Command | Description |
-|---|---|
-| `/teleg-setup` | Configure bot token and allowed user pairing. |
-| `/teleg-status` | Show teleg-bridge status. |
-| `/teleg-connect` | Start polling / connect bridge (offers existing bots to pick from). |
-| `/teleg-disconnect` | Stop polling / disconnect bridge. |
-| `/teleg-reconnect` | Force reconnect (offers existing bots to pick from). |
-| `/teleg-switch-bot` | Switch the active bot for this session without re-entering its token. |
-
-## MCP Tools for Agents
-
-### Telegram I/O
-
-| Tool | Description |
-|---|---|
-| `teleg-send_message` | Send text to Telegram. |
-| `teleg-send_photo` | Send a local image file as a Telegram photo. |
-| `teleg-send_video` | Send a local video file as a Telegram video. |
-| `teleg-attach` | Queue one or more local files for the active Telegram reply. |
-| `get_me` | Get bot identity information. |
-
-### Queue and backlog operations
-
-| Tool | Description |
-|---|---|
-| `get_queue_count` | Get pending/processing queue depth. |
-| `get_queue_stats` | Get message and download queue stats. |
-| `get_queue_data` | Inspect recent queue rows, optionally by status. |
-| `get_queue_data_id` | Inspect a specific queue row. |
-| `set_queue_status` | Manually set queue row status. |
-| `teleg-clear_backlog` | Reset, purge, complete, fail, or delete queue rows. |
-
-### Session, relay, and bot operations
-
-| Tool | Description |
-|---|---|
-| `teleg-publish` | Publish a task to a capability channel or target session. |
-| `teleg-disconnect` | Disconnect this Pi session. |
-| `teleg-disconnect-all` | Disconnect all sessions connected to the bridge. |
-| `teleg-clean-db` | Reset processing rows and purge old completed/failed rows. |
-| `teleg-remove-sessions` | Remove dead or unwanted session registry records. |
-| `teleg-reconcile` | Check liveness and evict ghost sessions. |
-| `teleg-list_sessions` | List relay sessions with liveness state. |
-| `teleg-evict_session` | Evict a session and optionally reset its queue / kill PID. |
-| `teleg-list_bots` | List configured Telegram bots. |
-| `teleg-set_primary` | Set a primary session for a bot. |
-
-## Configuration
-
-### Environment Variables
-
-| Variable | Default | Purpose |
-|---|---:|---|
-| `TELEG_BOT_TOKEN` | — | Force token for the current process. |
-| `TELEG_BOT_ID` | — | Select a bot from global config. |
-| `TELEG_PROJECT_DIR` | `process.cwd()` | Project folder used to read `.pi/teleg.json` for the current process / MCP server. |
-| `TELEG_DB_PATH` | `~/.pi/agent/teleg-bridge.db` | SQLite DB path shared by sessions. |
-| `TELEG_LIVENESS_MS` | `300000` | Max heartbeat age before a session is stale. |
-| `TELEG_DRAIN_INTERVAL_MS` | `12000` | Idle queue drain interval. |
-| `TELEG_CLAIM_OTHERS` | `0` | Allow a session to claim messages assigned to other sessions. |
-
-### Group, Supergroup, and Channel Support
-
-The bridge can process requests made outside private chats:
-
-| Chat type | Authorization model | Notes |
-|---|---|---|
-| Private chat | `from.id` must be in `allowedUserIds`, except first `/start` or `/help` pairing when no users are configured. | Replies go to the private chat. |
-| Group / supergroup | `from.id` must be in `allowedUserIds`. | The same configured user can request work from another chat; replies are sent back to that group thread/message. Bot privacy mode may limit which group messages Telegram delivers. |
-| Channel | `chat.id` must be in `allowedChatIds`. | Telegram channel posts usually do not expose an author user ID to bots, so channel authorization must be chat-based. The bot must be an admin or otherwise permitted to read/respond. |
-
-Use `/chatid` from an authorized group/supergroup user to discover the current chat ID. For channels, configure the channel ID manually in `allowedChatIds` because user identity is normally unavailable in channel posts.
-
-Important Telegram behavior:
-
-- In groups with BotFather privacy mode enabled, bots generally receive commands, replies to the bot, and mentions, not every message.
-- To receive normal group messages, disable bot privacy mode in BotFather or ask users to command/mention the bot.
-- Channel posts are authorized by `allowedChatIds`, not `allowedUserIds`, because Telegram does not reliably provide the posting admin identity to bots.
-
-### Global Config: `~/.pi/agent/teleg-bridge.json`
-
-```json
-{
-  "version": 2,
-  "defaultBotId": 123456789,
-  "bots": {
-    "123456789": {
-      "botToken": "TOKEN",
-      "botUsername": "my_bot",
-      "allowedUserIds": [987654321],
-      "allowedChatIds": [-1001234567890],
-      "lastUpdateId": 0
-    }
-  }
-}
-```
-
-### Project Config: `.pi/teleg.json`
-
-```json
-{
-  "botId": 123456789,
-  "botToken": "TOKEN",
-  "botUsername": "my_bot",
-  "allowedUserIds": [987654321],
-  "allowedChatIds": [-1001234567890],
-  "lastUpdateId": 0,
-  "dbPath": "/path/to/teleg-bridge.db"
-}
-```
+| `/teleg-setup` | Register or switch Telegram bots, with picker if multiple are configured. |
+| `/teleg-connect` | Connect / choose bot and start polling. |
+| `/teleg-reconnect` | Reconnect polling, optionally choosing a bot. |
+| `/teleg-switch-bot` | Switch the active bot for this session. |
 
 ## State and Data Files
 
@@ -762,60 +557,19 @@ After install, the `teleg` shim is on your `PATH`:
 
 ### Private repositories
 
-For a private remote, the `curl` one-liner must carry a token, and the cloned
-`origin` should likewise be credentialed or use SSH:
+If your GitLab/GitHub repo is private, use either:
 
-```bash
-# GitLab (self-hosted or gitlab.com)
-curl -fsSL -H "PRIVATE-TOKEN: $GITLAB_TOKEN" https://<host>/<owner>/<repo>/-/raw/HEAD/install.sh | bash
-# GitHub
-curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" https://raw.githubusercontent.com/<owner>/<repo>/HEAD/install.sh | bash
-```
+- an SSH remote (`git@host:owner/repo.git`), or
+- a tokenized HTTPS remote / credential helper available to `git`.
 
-If `teleg update` hits a 401/403 it prints a clear "private repo: configure a
-credentialed or SSH remote" message and exits non-zero without changing config.
-
-### Manual / development install
-
-From a clone (e.g. for hacking on the bridge itself):
-
-```bash
-git clone <repository-url>
-cd pi-teleg
-npm install
-npm run build
-./deploy.sh          # build + wire ~/.pi/agent config (portable, non-clobbering)
-```
-
-`deploy.sh` resolves the MCP-server path relative to its own location (so it
-works from any checkout) and merges **only** the `teleg-bridge` key into
-`mcp.json` — your other `mcpServers` and `imports` are preserved.
-
-## Development
-
-```bash
-npm run build      # compile TypeScript
-npm run dev        # watch compile
-npm run deploy     # deploy extension
-npm run deploy:watch
-```
-
-## Related Documentation
-
-- Interactive architecture page: [`README.html`](./README.html)
-- Phase plan: [`docs/PLAN_ACTION.md`](./docs/PLAN_ACTION.md)
-- Integration notes: [`docs/PHASE3_INTEGRATION.md`](./docs/PHASE3_INTEGRATION.md)
-- Group/channel support: [`docs/GROUP_CHANNEL_SUPPORT.md`](./docs/GROUP_CHANNEL_SUPPORT.md)
-- Graph report: [`graphify-out/GRAPH_REPORT.md`](./graphify-out/GRAPH_REPORT.md)
-
-## Recent Graphify Snapshot
-
-The project graph was refreshed after group/channel support changes:
-
-- Graph report: [`graphify-out/GRAPH_REPORT.md`](./graphify-out/GRAPH_REPORT.md)
-- Interactive graph: [`graphify-out/graph.html`](./graphify-out/graph.html)
-- Graph JSON: [`graphify-out/graph.json`](./graphify-out/graph.json)
+The installer runs with `GIT_TERMINAL_PROMPT=0`, so it will fail fast rather than prompting interactively.
 
 ## License
 
 MIT
+
+## Status
+
+This repository is actively maintained and tracks the current Pi-facing local deployment workflow plus the git-based public install/update path.
+
+
