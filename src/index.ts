@@ -1628,19 +1628,29 @@ export default function (pi: ExtensionAPI): void {
       if (!ctx.hasUI || state.setupInProgress) return;
       state.setupInProgress = true;
       try {
-        const token = await ctx.ui.input("Telegram bot token", "123456:ABCDEF...");
-        if (!token) return;
-
-        const botInfo = await verifyToken(token);
-        if (!botInfo) {
-          ctx.ui.notify("Invalid Telegram bot token", "error");
+        const choice = await promptForBot(ctx);
+        if (choice && choice !== "new") {
+          if (await switchActiveBot(choice.botId, ctx)) {
+            await startCurrentPolling(ctx, "Polling started.");
+          }
           return;
         }
 
-        await saveVerifiedBotConfig(token, botInfo);
-        ctx.ui.notify(`Teleg-bridge connected: @${botInfo.username}`, "info");
-        ctx.ui.notify("Send /start to your bot in Telegram to pair.", "info");
-        await startCurrentPolling(ctx, "Polling started.");
+        if (choice === null || choice === "new") {
+          const token = await ctx.ui.input("Telegram bot token", "123456:ABCDEF...");
+          if (!token) return;
+
+          const botInfo = await verifyToken(token);
+          if (!botInfo) {
+            ctx.ui.notify("Invalid Telegram bot token", "error");
+            return;
+          }
+
+          await saveVerifiedBotConfig(token, botInfo);
+          ctx.ui.notify(`Teleg-bridge connected: @${botInfo.username}`, "info");
+          ctx.ui.notify("Send /start to your bot in Telegram to pair.", "info");
+          await startCurrentPolling(ctx, "Polling started.");
+        }
       } finally {
         state.setupInProgress = false;
       }
