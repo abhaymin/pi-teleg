@@ -580,3 +580,7 @@ MIT
 This repository is actively maintained and tracks the current Pi-facing local deployment workflow plus the git-based public install/update path.
 
 
+
+## Credit
+
+Original idea inspired by [badlogic/pi-telegram](https://github.com/badlogic/pi-telegram).
