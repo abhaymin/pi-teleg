@@ -1,6 +1,6 @@
 {
     "name": "teleg-bridge",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "description": "Pi Extension: Telegram bridge with Twitter/X media download support",
     "type": "module",
     "main": "dist/index.js",

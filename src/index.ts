@@ -1474,6 +1474,16 @@ export default function (pi: ExtensionAPI): void {
   }
 
   async function saveVerifiedBotConfig(token: string, botInfo: TelegramUser): Promise<void> {
+    const projectCfg: ProjectConfig = {
+      botId: botInfo.id,
+      botUsername: botInfo.username,
+      botToken: token.trim(),
+      allowedUserIds: currentAllowedUserIds(),
+      allowedChatIds: currentAllowedChatIds(),
+      lastUpdateId: state.config.lastUpdateId ?? 0,
+      dbPath: currentDbPath(),
+    };
+
     const newConfig: TelegramConfig = {
       ...state.config,
       botToken: token.trim(),
@@ -1481,16 +1491,9 @@ export default function (pi: ExtensionAPI): void {
       botId: botInfo.id,
       allowedUserIds: currentAllowedUserIds(),
     };
+
     await writeConfig(newConfig);
-    await persistProjectConfig({
-      botId: botInfo.id,
-      botUsername: botInfo.username,
-      botToken: token.trim(),
-      allowedUserIds: currentAllowedUserIds(),
-      allowedChatIds: currentAllowedChatIds(),
-      lastUpdateId: newConfig.lastUpdateId ?? 0,
-      dbPath: currentDbPath(),
-    });
+    await writeProjectConfig(cwd, projectCfg);
     state.config = newConfig;
     await refreshBotContext().catch(() => {
       state.config = newConfig;
@@ -2227,11 +2230,15 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => {
     try {
-      if (!state.botContext) {
-        state.botContext = await selectBotForSession(cwd);
+      state.botContext = await selectBotForSession(cwd);
+      if (!state.botContext && cwd !== process.cwd()) {
+        state.botContext = await selectBotForSession(process.cwd());
       }
 
-      // No preconfigured bot — try interactive setup if UI is available
+      // No preconfigured bot — try interactive setup if UI is available.
+
+      // No preconfigured bot — try interactive setup if UI is available.
+      // Important: only prompt when there is truly no project or global bot pin.
       if (!state.botContext && ctx.hasUI && !state.setupInProgress) {
         state.setupInProgress = true;
         try {
@@ -2497,11 +2504,12 @@ export default function (pi: ExtensionAPI): void {
       if (state.activeTurn) return;
       if (!botId) return;
       try {
-        // Priority 0: Check PUB-SUB for inter-session tasks
+        const defaultBotId = await getDefaultBotId();
+        const isDefaultBot = defaultBotId === botId;
+
         if (detectedCaps.length > 0) {
           const pubsubMsgs = Db.subscribe(botId, sessionName, detectedCaps);
           for (const msg of pubsubMsgs) {
-            // Route PUB-SUB message as a turn
             const turn: PendingTelegramTurn = {
               sessionId,
               sessionName,
@@ -2518,15 +2526,13 @@ export default function (pi: ExtensionAPI): void {
           }
         }
 
-        // Priority 1: Messages explicitly tagged for this session
-        const queued = claimNextTurnForSession();
+        const queued = isDefaultBot ? claimNextTurn() : claimNextTurnForSession();
         if (queued) {
           activateTurn(queued.turn as ActiveTelegramTurn);
           pi.sendUserMessage(queued.turn.content, { deliverAs: "steer" });
           return;
         }
 
-        // Priority 2: Unassigned messages matching our capabilities
         const capReg = await readCapabilitiesRegistry();
         const myCaps = capReg.entries.find(e => e.sessionId === sessionId);
         if (myCaps && myCaps.capabilities.length > 0) {
@@ -2537,9 +2543,6 @@ export default function (pi: ExtensionAPI): void {
             const text = unassigned.text || "";
             const match = matchMessageToCapability(text, [myCaps]);
             if (match) {
-              // Atomically claim; honor the UPDATE result so two
-              // capability-matched sessions can't both steer the same
-              // message (duplicate turn) when they race on the same row.
               const claimed = Db.getDb().prepare(
                 "UPDATE message_queue SET status = 'processing', session_id = ?, session_name = ?, started_at = ? WHERE id = ? AND status = 'pending'"
               ).run(sessionId, sessionName, Date.now(), unassigned.id).changes;
@@ -2562,11 +2565,6 @@ export default function (pi: ExtensionAPI): void {
           }
         }
 
-        // Priority 3: Fallback — rescue messages whose owner session is
-        // silent/dead. Capability matching (purpose) already ran above
-        // (policy 4); a linked session on this bot may now claim the common
-        // queue on the silent session's behalf (policy 2). The wrapper itself
-        // enforces that this session is linked, else the queue is ignored (policy 3).
         const fallback = claimNextTurnForSilentSession();
         if (fallback) {
           activateTurn(fallback.turn as ActiveTelegramTurn);
@@ -2574,8 +2572,6 @@ export default function (pi: ExtensionAPI): void {
           return;
         }
 
-        // Priority 4: Optional cross-session help for truly unowned messages.
-        // Disabled by default so a bridge/session cannot steal data-scrapper work.
         if (CLAIM_OTHERS) {
           const queueMsg = claimNextTurn();
           if (queueMsg) {
@@ -2588,14 +2584,11 @@ export default function (pi: ExtensionAPI): void {
       }
     }, DRAIN_INTERVAL_MS);
 
-    // ─── Immediate startup queue drain ─────────────────────────────────
-    // Don't wait for the first drain interval — check queue immediately
     if (botId && !state.activeTurn) {
       try {
-        // Own queue first; then, if this session is linked, rescue messages
-        // whose owner session is silent/dead so they don't wait for the first
-        // drain tick (policy 2/3; the wrapper enforces the linked guard).
-        const queued = claimNextTurnForSession() || claimNextTurnForSilentSession();
+        const defaultBotId = await getDefaultBotId();
+        const isDefaultBot = defaultBotId === botId;
+        const queued = isDefaultBot ? claimNextTurn() : claimNextTurnForSession() || claimNextTurnForSilentSession();
         if (queued) {
           activateTurn(queued.turn as ActiveTelegramTurn);
           pi.sendUserMessage(queued.turn.content, { deliverAs: "steer" });
@@ -2604,18 +2597,10 @@ export default function (pi: ExtensionAPI): void {
         console.error(`[teleg:${sessionName}] Startup drain error:`, err);
       }
     }
-
-    // ─── Liveness monitor (fast dead-session detection) ────────────────
-    // Check every 5s for crashed sessions and clean up immediately
     state.livenessTimer = setInterval(async () => {
       const { removed } = await monitorDeadSessions();
       if (removed.length > 0) {
         console.log(`[teleg:${sessionName}] Removed dead sessions: ${removed.join(", ")}`);
-        // The silent sessions' queued messages are now orphaned — a linked
-        // session on this bot may claim them (policy 2). This is always-on
-        // (not gated by CLAIM_OTHERS) because the owner is provably gone, so
-        // the work would otherwise be lost. Unlinked sessions ignore the
-        // common queue (policy 3, enforced inside the wrapper).
         if (!state.activeTurn && botId) {
           const queued = claimNextTurnForSilentSession();
           if (queued) {
