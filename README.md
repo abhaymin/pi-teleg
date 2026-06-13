@@ -321,7 +321,7 @@ flowchart TD
   Auth -- yes --> Command{Bridge command?}
   Command -- yes --> Cmd[Run command handler]
   Command -- no --> Persist[Persist to SQLite queue]
-  Persist --> Direct{Starts with @sessionName?}
+  Persist --> Direct[Session-name route?]
   Direct -- yes --> LiveTarget{Target live?}
   LiveTarget -- yes --> Relay[Forward via HTTP relay]
   LiveTarget -- no --> Fallback[Primary fallback]
