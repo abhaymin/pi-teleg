@@ -1,0 +1,41 @@
+node_modules/
+
+# Build output
+dist/
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temp files
+tmp/
+temp/
+*.tmp
+
+# pi-teleg specific
+teleg-bridge.json
+.teleg-*
+
+# SQLite database (runtime)
+teleg-bridge.db
+teleg-bridge.db-shm
+teleg-bridge.db-wal
+
+# Lock files
+package-lock.json
+yarn.lock
+archive/

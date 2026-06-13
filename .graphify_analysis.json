@@ -1,0 +1,478 @@
+{
+  "communities": {
+    "0": [
+      "db_ts",
+      "src_config_readglobalconfigsync",
+      "src_db_claimnextdownload",
+      "src_db_claimnextmessage",
+      "src_db_claimnextmessageforsession",
+      "src_db_cleanstalerelaysessions",
+      "src_db_closedb",
+      "src_db_completedownload",
+      "src_db_completemessage",
+      "src_db_default_db_path",
+      "src_db_dirname",
+      "src_db_downloaditem",
+      "src_db_enqueuedownload",
+      "src_db_enqueuedownloads",
+      "src_db_enqueuemessage",
+      "src_db_faildownload",
+      "src_db_failmessage",
+      "src_db_getaliverelaysessions",
+      "src_db_getdb",
+      "src_db_getdownloaddepth",
+      "src_db_getdownloadstats",
+      "src_db_getpendingcountforsession",
+      "src_db_getpendingforchat",
+      "src_db_getprimarysession",
+      "src_db_getqueuedepth",
+      "src_db_getqueuestats",
+      "src_db_getrecentdownloads",
+      "src_db_getrecentmessages",
+      "src_db_getrecentrelayhistory",
+      "src_db_getrelaysession",
+      "src_db_getsessionprocessingchat",
+      "src_db_heartbeatrelaysession",
+      "src_db_initschema",
+      "src_db_logrelayforward",
+      "src_db_mergelocalsessionnames",
+      "src_db_migratetov2",
+      "src_db_purgeoldmessages",
+      "src_db_queuedmessage",
+      "src_db_queuestats",
+      "src_db_recoverstaledownloads",
+      "src_db_recoverstalemessages",
+      "src_db_registerrelaysession",
+      "src_db_relaysession",
+      "src_db_repairlegacyrelaysessionsschema",
+      "src_db_resetallfaileddownloads",
+      "src_db_resetallprocessing",
+      "src_db_resetdownload",
+      "src_db_resetprocessingforsession",
+      "src_db_runmigrations",
+      "src_db_runstartuprecovery",
+      "src_db_setprimary",
+      "src_db_unregisterrelaysession",
+      "src_db_updaterelaycapabilities",
+      "src_db_updaterelayrole"
+    ],
+    "1": [
+      "index_ts",
+      "src_index_activetelegramturn",
+      "src_index_announcetoken",
+      "src_index_archiveroot",
+      "src_index_botid",
+      "src_index_botinfo",
+      "src_index_bottoken",
+      "src_index_calltelegram",
+      "src_index_createsessionstate",
+      "src_index_cwd",
+      "src_index_db",
+      "src_index_drain_interval_ms",
+      "src_index_dying",
+      "src_index_ext",
+      "src_index_form",
+      "src_index_health",
+      "src_index_isimage",
+      "src_index_istelegramprompt",
+      "src_index_msg",
+      "src_index_pendingforward",
+      "src_index_pendingforwards",
+      "src_index_pendingtelegramturn",
+      "src_index_pm",
+      "src_index_pm2",
+      "src_index_queued",
+      "src_index_queuedattachment",
+      "src_index_queuemsg",
+      "src_index_recovery",
+      "src_index_registercleanuphandlers",
+      "src_index_row",
+      "src_index_sessinfo",
+      "src_index_sessionid",
+      "src_index_state",
+      "src_index_suffix",
+      "src_index_telegramapiresponse",
+      "src_index_telegramchat",
+      "src_index_telegrammessage",
+      "src_index_telegramsentmessage",
+      "src_index_telegramupdate",
+      "src_index_telegramuser",
+      "src_index_turn",
+      "src_index_verifytoken"
+    ],
+    "2": [
+      "config_ts",
+      "src_config_botentry",
+      "src_config_buildbotcontext",
+      "src_config_config_dir",
+      "src_config_config_file",
+      "src_config_default_db_path",
+      "src_config_detectsplitdb",
+      "src_config_getconfigversion",
+      "src_config_getdefaultbotid",
+      "src_config_getmefromtoken",
+      "src_config_globalconfigv2",
+      "src_config_loadbotconfig",
+      "src_config_migratelegacyconfig",
+      "src_config_migratetov2",
+      "src_config_projectconfig",
+      "src_config_readglobalconfig",
+      "src_config_readprojectconfig",
+      "src_config_resolvebotcontext",
+      "src_config_resolvefrombotid",
+      "src_config_resolvefromtoken",
+      "src_config_savelastupdateid",
+      "src_config_telegramconfigv1",
+      "src_config_telegramgetmeresponse",
+      "src_config_updateallowedusers",
+      "src_config_writeglobalconfig",
+      "src_polling_manager_pollingmanager_handleworkermessage"
+    ],
+    "3": [
+      "src_polling_manager_pollingmanager",
+      "src_polling_manager_pollingmanager_acquirelock",
+      "src_polling_manager_pollingmanager_claimnextturn",
+      "src_polling_manager_pollingmanager_claimnextturnforsession",
+      "src_polling_manager_pollingmanager_completeturn",
+      "src_polling_manager_pollingmanager_constructor",
+      "src_polling_manager_pollingmanager_getbotinfo",
+      "src_polling_manager_pollingmanager_getconfig",
+      "src_polling_manager_pollingmanager_getpendingcountforsession",
+      "src_polling_manager_pollingmanager_getprocessingmessageids",
+      "src_polling_manager_pollingmanager_getqueuedepth",
+      "src_polling_manager_pollingmanager_getsessionprocessingchat",
+      "src_polling_manager_pollingmanager_getstate",
+      "src_polling_manager_pollingmanager_hasactiveturnfor",
+      "src_polling_manager_pollingmanager_hasactiveturnindb",
+      "src_polling_manager_pollingmanager_isactive",
+      "src_polling_manager_pollingmanager_isheldbyother",
+      "src_polling_manager_pollingmanager_onerror",
+      "src_polling_manager_pollingmanager_onhealth",
+      "src_polling_manager_pollingmanager_onmessage",
+      "src_polling_manager_pollingmanager_refreshlock",
+      "src_polling_manager_pollingmanager_releaselock",
+      "src_polling_manager_pollingmanager_setbotinfo",
+      "src_polling_manager_pollingmanager_setconfig",
+      "src_polling_manager_pollingmanager_start",
+      "src_polling_manager_pollingmanager_stop"
+    ],
+    "4": [
+      "relay_ts",
+      "src_relay_cleanrelayfilesbypid",
+      "src_relay_cleanstalerelayfiles",
+      "src_relay_commandhandler",
+      "src_relay_completehandler",
+      "src_relay_completemessageonsource",
+      "src_relay_dirname",
+      "src_relay_ensurerelaydir",
+      "src_relay_forwardtosession",
+      "src_relay_generatesecret",
+      "src_relay_getalivesessionnames",
+      "src_relay_getrelaypath",
+      "src_relay_getrelaystatus",
+      "src_relay_relay_dir",
+      "src_relay_relayinfo",
+      "src_relay_setcommandhandler",
+      "src_relay_setcompletehandler",
+      "src_relay_startrelayoptions",
+      "src_relay_startrelayserver",
+      "src_relay_stoprelayserver"
+    ],
+    "5": [
+      "session_config_ts",
+      "src_index_heartbeatsession",
+      "src_index_registersession",
+      "src_index_unregistersession",
+      "src_session_config_botentryconfig",
+      "src_session_config_config_dir",
+      "src_session_config_default_archive_root",
+      "src_session_config_flattenv2config",
+      "src_session_config_getarchiveroot",
+      "src_session_config_getsessionid",
+      "src_session_config_globalconfigv2",
+      "src_session_config_isalloweduser",
+      "src_session_config_readconfig",
+      "src_session_config_readsessionregistry",
+      "src_session_config_session_registry_file",
+      "src_session_config_sessioninfo",
+      "src_session_config_sessionregistry",
+      "src_session_config_writesessionregistry"
+    ],
+    "6": [
+      "session_registry_ts",
+      "src_session_registry_checksessionliveness",
+      "src_session_registry_cleanstalerelayfiles",
+      "src_session_registry_clearprimary",
+      "src_session_registry_dirname",
+      "src_session_registry_electprimary",
+      "src_session_registry_evictsession",
+      "src_session_registry_getlinkedsessions",
+      "src_session_registry_getrelaypath",
+      "src_session_registry_getrelaysessionsforbot",
+      "src_session_registry_getsessionlivenesssummary",
+      "src_session_registry_issessionlinked",
+      "src_session_registry_livenesscheckresult",
+      "src_session_registry_reconcilereport",
+      "src_session_registry_reconcilesessions",
+      "src_session_registry_relay_dir",
+      "src_session_registry_relayinfo",
+      "src_session_registry_sessionliveness"
+    ],
+    "7": [
+      "poll_worker_ts",
+      "src_poll_worker_calltelegram",
+      "src_poll_worker_default_db_path",
+      "src_poll_worker_getdb",
+      "src_poll_worker_lastsuccessfulpoll",
+      "src_poll_worker_mainmessage",
+      "src_poll_worker_persistmessage",
+      "src_poll_worker_pollloop",
+      "src_poll_worker_pollworkerdata",
+      "src_poll_worker_post",
+      "src_poll_worker_starthealthchecks",
+      "src_poll_worker_telegramapiresponse",
+      "src_poll_worker_telegramchat",
+      "src_poll_worker_telegrammessage",
+      "src_poll_worker_telegramupdate",
+      "src_poll_worker_telegramuser",
+      "src_poll_worker_workermessage"
+    ],
+    "8": [
+      "polling_manager_ts",
+      "src_polling_manager_botinfo",
+      "src_polling_manager_getallpollingmanagers",
+      "src_polling_manager_getpollingmanagerstats",
+      "src_polling_manager_managers",
+      "src_polling_manager_noop_manager",
+      "src_polling_manager_pendingtelegramturn",
+      "src_polling_manager_pollstate",
+      "src_polling_manager_pollworkerdata",
+      "src_polling_manager_telegramchat",
+      "src_polling_manager_telegrammessage",
+      "src_polling_manager_telegramupdate",
+      "src_polling_manager_telegramuser",
+      "src_polling_manager_temp_dir",
+      "src_polling_manager_turnqueueitem",
+      "src_polling_manager_workermessage"
+    ],
+    "9": [
+      "capabilities_ts",
+      "src_capabilities_capabilities_file",
+      "src_capabilities_capabilitiesentry",
+      "src_capabilities_capabilitiesregistry",
+      "src_capabilities_cleanstalecapabilities",
+      "src_capabilities_config_dir",
+      "src_capabilities_detectprojectcapabilities",
+      "src_capabilities_matchmessagetocapability",
+      "src_capabilities_parsecapabilitiesmd",
+      "src_capabilities_readcapabilitiesregistry",
+      "src_capabilities_registersessioncapabilities",
+      "src_capabilities_tryreadfile",
+      "src_capabilities_unregistersessioncapabilities",
+      "src_capabilities_writecapabilitiesregistry"
+    ],
+    "10": [
+      "src_config_listconfiguredbots",
+      "src_index_currentalloweduserids",
+      "src_index_currentbotid",
+      "src_index_currentbottoken",
+      "src_index_execute",
+      "src_index_handleauthorizedtelegrammessage",
+      "src_index_handlequeuecommand",
+      "src_index_handlestatuscommand",
+      "src_index_sendfile",
+      "src_index_sendreply",
+      "src_index_updatestatus"
+    ],
+    "11": [
+      "src_index_claimnextturn",
+      "src_index_claimnextturnforsession",
+      "src_index_completeturn",
+      "src_index_currentdbpath",
+      "src_index_currentpollingmanager",
+      "src_index_drainone",
+      "src_index_startcurrentpolling"
+    ],
+    "12": [
+      "src_index_normalizeconfigfrombotcontext",
+      "src_index_refreshbotcontext",
+      "src_index_saveverifiedbotconfig",
+      "src_polling_manager_getpollingmanager",
+      "src_session_config_writeconfig"
+    ],
+    "13": [
+      "node_sqlite_d_ts",
+      "src_node_sqlite_d_databasesync",
+      "src_node_sqlite_d_databasesyncoptions",
+      "src_node_sqlite_d_statementsync"
+    ],
+    "14": [
+      "src_config_botcontext",
+      "src_index_sessionstate",
+      "src_session_config_telegramconfig"
+    ]
+  },
+  "cohesion": {
+    "0": 0.07127882599580712,
+    "1": 0.047619047619047616,
+    "2": 0.16,
+    "3": 0.08615384615384615,
+    "4": 0.1368421052631579,
+    "5": 0.13725490196078433,
+    "6": 0.1895424836601307,
+    "7": 0.15441176470588236,
+    "8": 0.125,
+    "9": 0.24175824175824176,
+    "10": 0.4,
+    "11": 0.3333333333333333,
+    "12": 0.4,
+    "13": 0.5,
+    "14": 0.6666666666666666
+  },
+  "gods": [
+    {
+      "id": "src_db_getdb",
+      "label": "getDb()",
+      "degree": 40
+    },
+    {
+      "id": "src_polling_manager_pollingmanager",
+      "label": "PollingManager",
+      "degree": 27
+    },
+    {
+      "id": "src_index_handleauthorizedtelegrammessage",
+      "label": "handleAuthorizedTelegramMessage()",
+      "degree": 17
+    },
+    {
+      "id": "src_config_readglobalconfig",
+      "label": "readGlobalConfig()",
+      "degree": 12
+    },
+    {
+      "id": "src_index_execute",
+      "label": "execute()",
+      "degree": 12
+    },
+    {
+      "id": "src_index_currentpollingmanager",
+      "label": "currentPollingManager()",
+      "degree": 11
+    },
+    {
+      "id": "src_index_handlestatuscommand",
+      "label": "handleStatusCommand()",
+      "degree": 11
+    },
+    {
+      "id": "src_config_resolvebotcontext",
+      "label": "resolveBotContext()",
+      "degree": 9
+    },
+    {
+      "id": "src_session_registry_reconcilesessions",
+      "label": "reconcileSessions()",
+      "degree": 8
+    },
+    {
+      "id": "src_index_currentbottoken",
+      "label": "currentBotToken()",
+      "degree": 7
+    }
+  ],
+  "surprises": [
+    {
+      "source": "unregisterSession()",
+      "target": "cleanRelayFilesByPid()",
+      "source_files": [
+        "index.ts",
+        "relay.ts"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "calls",
+      "why": "connects across different repos/directories; bridges separate communities"
+    },
+    {
+      "source": "handleAuthorizedTelegramMessage()",
+      "target": "forwardToSession()",
+      "source_files": [
+        "index.ts",
+        "relay.ts"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "calls",
+      "why": "connects across different repos/directories; bridges separate communities"
+    },
+    {
+      "source": "refreshBotContext()",
+      "target": "resolveBotContext()",
+      "source_files": [
+        "index.ts",
+        "config.ts"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "calls",
+      "why": "connects across different repos/directories; bridges separate communities"
+    },
+    {
+      "source": "handleAuthorizedTelegramMessage()",
+      "target": "updateAllowedUsers()",
+      "source_files": [
+        "index.ts",
+        "config.ts"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "calls",
+      "why": "connects across different repos/directories; bridges separate communities"
+    },
+    {
+      "source": "currentPollingManager()",
+      "target": "getPollingManager()",
+      "source_files": [
+        "index.ts",
+        "polling-manager.ts"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "calls",
+      "why": "connects across different repos/directories; bridges separate communities"
+    }
+  ],
+  "questions": [
+    {
+      "type": "bridge_node",
+      "question": "Why does `PollingManager` connect `Community 3` to `Community 8`, `Community 2`?",
+      "why": "High betweenness centrality (0.158) - this node is a cross-community bridge."
+    },
+    {
+      "type": "bridge_node",
+      "question": "Why does `resolveBotContext()` connect `Community 2` to `Community 1`, `Community 12`?",
+      "why": "High betweenness centrality (0.010) - this node is a cross-community bridge."
+    },
+    {
+      "type": "isolated_nodes",
+      "question": "What connects `__dirname`, `RELAY_DIR`, `RelayInfo` to the rest of the system?",
+      "why": "97 weakly-connected nodes found - possible documentation gaps or missing edges."
+    },
+    {
+      "type": "low_cohesion",
+      "question": "Should `Community 0` be split into smaller, more focused modules?",
+      "why": "Cohesion score 0.07127882599580712 - nodes in this community are weakly interconnected."
+    },
+    {
+      "type": "low_cohesion",
+      "question": "Should `Community 1` be split into smaller, more focused modules?",
+      "why": "Cohesion score 0.047619047619047616 - nodes in this community are weakly interconnected."
+    },
+    {
+      "type": "low_cohesion",
+      "question": "Should `Community 3` be split into smaller, more focused modules?",
+      "why": "Cohesion score 0.08615384615384615 - nodes in this community are weakly interconnected."
+    },
+    {
+      "type": "low_cohesion",
+      "question": "Should `Community 4` be split into smaller, more focused modules?",
+      "why": "Cohesion score 0.1368421052631579 - nodes in this community are weakly interconnected."
+    }
+  ]
+}

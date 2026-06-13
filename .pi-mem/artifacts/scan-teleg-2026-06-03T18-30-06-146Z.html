@@ -1,0 +1,774 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Scan .</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #020617;
+      --panel: #0f172a;
+      --panel-2: #111827;
+      --line: #1f2a44;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --accent-2: #22c55e;
+      --warn: #f59e0b;
+      --danger: #ef4444;
+      --chip: #172033;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: radial-gradient(circle at top, #0f172a 0, #020617 48%, #020617 100%);
+      color: var(--text);
+      font: 14px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .wrap { display: grid; gap: 16px; padding: 20px; }
+    .header, .panel {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: rgba(15, 23, 42, 0.92);
+      box-shadow: 0 18px 60px rgba(2, 6, 23, 0.45);
+      backdrop-filter: blur(12px);
+    }
+    .header { padding: 18px 20px; }
+    .title { margin: 0 0 6px; font-size: 22px; letter-spacing: -0.02em; }
+    .subtitle { color: var(--muted); margin: 0; }
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 12px;
+      margin-top: 16px;
+    }
+    .metric {
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgba(17, 24, 39, 0.72);
+    }
+    .metric .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; }
+    .metric .value { margin-top: 4px; font-size: 18px; font-weight: 700; }
+    .grid { display: grid; grid-template-columns: minmax(0, 1.65fr) minmax(320px, 1fr); gap: 16px; }
+    .panel { padding: 16px; }
+    .panel h2 { margin: 0 0 10px; font-size: 16px; }
+    .graph-shell { overflow: hidden; }
+    .graph-box {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: linear-gradient(180deg, rgba(15, 23, 42, 0.6), rgba(2, 6, 23, 0.7));
+      padding: 12px;
+      min-height: 620px;
+    }
+    .node-list { display: grid; gap: 10px; }
+    .node-card {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgba(2, 6, 23, 0.54);
+      padding: 12px;
+    }
+    .node-card.focus { border-color: rgba(56, 189, 248, 0.7); box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.25) inset; }
+    .node-card .name { font-weight: 700; margin: 0 0 4px; }
+    .node-card .meta { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+    .chip-row { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0 0; }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: var(--chip);
+      border: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .section { margin-top: 14px; }
+    .section h3 { margin: 0 0 8px; font-size: 14px; color: #bfdbfe; }
+    .section ul { margin: 0; padding-left: 18px; color: var(--text); }
+    .section li { margin: 4px 0; }
+    .muted { color: var(--muted); }
+    .legend { display: flex; gap: 12px; flex-wrap: wrap; color: var(--muted); font-size: 12px; margin-top: 10px; }
+    .legend span { display: inline-flex; align-items: center; gap: 6px; }
+    .dot { width: 10px; height: 10px; border-radius: 999px; display: inline-block; }
+    svg { width: 100%; height: 100%; display: block; }
+    .node { cursor: default; }
+    .node rect { fill: rgba(15, 23, 42, 0.94); stroke: rgba(148, 163, 184, 0.45); stroke-width: 1.5; rx: 14; }
+    .node.root rect { stroke: rgba(56, 189, 248, 0.95); fill: rgba(8, 47, 73, 0.92); }
+    .node.focus rect { stroke: rgba(34, 197, 94, 0.95); fill: rgba(6, 78, 59, 0.92); }
+    .node text { fill: var(--text); font-size: 12px; }
+    .node .sub { fill: var(--muted); font-size: 10px; }
+    .edge { stroke: rgba(148, 163, 184, 0.38); stroke-width: 1.5; fill: none; }
+    .edge.imports { stroke: rgba(59, 130, 246, 0.55); }
+    .edge.defines { stroke: rgba(34, 197, 94, 0.55); }
+    .edge.contains { stroke: rgba(148, 163, 184, 0.35); }
+    .edge.uses { stroke: rgba(245, 158, 11, 0.55); }
+    .footer-note { color: var(--muted); font-size: 12px; margin-top: 10px; }
+    pre {
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: rgba(2, 6, 23, 0.7);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px;
+      overflow: auto;
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <header class="header">
+      <h1 class="title">Scan .</h1>
+      <p class="subtitle">Repository scan for /home/abhaym/Development/PTGD/teleg</p>
+      <div class="summary-grid">
+        
+    <div class="metric">
+      <div class="label">Files</div>
+      <div class="value">27</div>
+    </div>
+        
+    <div class="metric">
+      <div class="label">Code files</div>
+      <div class="value">27</div>
+    </div>
+        
+    <div class="metric">
+      <div class="label">Imports</div>
+      <div class="value">20</div>
+    </div>
+        
+    <div class="metric">
+      <div class="label">Symbols</div>
+      <div class="value">207</div>
+    </div>
+        
+    <div class="metric">
+      <div class="label">Tokens</div>
+      <div class="value">278</div>
+    </div>
+        
+    <div class="metric">
+      <div class="label">Focus</div>
+      <div class="value">teleg</div>
+    </div>
+      </div>
+      <div class="legend">
+        <span><i class="dot" style="background:#38bdf8"></i>workspace</span>
+        <span><i class="dot" style="background:#22c55e"></i>focus</span>
+        <span><i class="dot" style="background:#94a3b8"></i>file</span>
+        <span><i class="dot" style="background:#f59e0b"></i>symbol</span>
+      </div>
+    </header>
+
+    <section class="grid">
+      <div class="panel graph-shell">
+        <h2>Graph</h2>
+        <div class="graph-box">
+    <svg viewBox="-600 -380 1200 760" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Memory graph">
+      
+    <defs>
+      <marker id="arrow" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="rgba(148, 163, 184, 0.7)" />
+      </marker>
+    </defs>
+      
+    <line class="edge contains" x1="0" y1="0" x2="8.572527594031473e-15" y2="-140" marker-end="url(#arrow)" />
+  
+    <line class="edge contains" x1="0" y1="0" x2="32.28622190394164" y2="-136.22628188117534" marker-end="url(#arrow)" />
+  
+    <line class="edge contains" x1="0" y1="0" x2="62.83188522806472" y2="-125.1085696452777" marker-end="url(#arrow)" />
+  
+    <line class="edge contains" x1="0" y1="0" x2="89.99026535611551" y2="-107.24622203665692" marker-end="url(#arrow)" />
+  
+    <line class="edge contains" x1="0" y1="0" x2="112.29724698570614" y2="-83.60220283839007" marker-end="url(#arrow)" />
+  
+    <line class="edge contains" x1="0" y1="0" x2="128.55025496323836" y2="-55.451167245481955" marker-end="url(#arrow)" />
+  
+    <line class="edge contains" x1="0" y1="0" x2="137.87308542170913" y2="-24.31074487337025" marker-end="url(#arrow)" />
+  
+    <line class="edge contains" x1="0" y1="0" x2="139.76314215797754" y2="8.140276047466617" marker-end="url(#arrow)" />
+  
+    <line class="edge contains" x1="0" y1="0" x2="134.11853172416843" y2="40.15245257955264" marker-end="url(#arrow)" />
+  
+    <line class="edge contains" x1="0" y1="0" x2="121.24355652982142" y2="69.99999999999997" marker-end="url(#arrow)" />
+  
+    <line class="edge contains" x1="0" y1="0" x2="101.83230982022683" y2="96.0738293016227" marker-end="url(#arrow)" />
+  
+    <line class="edge contains" x1="0" y1="0" x2="76.93125692991286" y2="116.9682935978111" marker-end="url(#arrow)" />
+  
+    <line class="edge contains" x1="0" y1="0" x2="47.882820065593634" y2="131.55696691002717" marker-end="url(#arrow)" />
+  
+    <line class="edge contains" x1="0" y1="0" x2="16.253007977532242" y2="139.053370083872" marker-end="url(#arrow)" />
+  
+    <line class="edge contains" x1="0" y1="0" x2="-16.253007977532224" y2="139.053370083872" marker-end="url(#arrow)" />
+  
+    <line class="edge contains" x1="0" y1="0" x2="-47.88282006559362" y2="131.55696691002717" marker-end="url(#arrow)" />
+  
+    <line class="edge contains" x1="0" y1="0" x2="-76.93125692991285" y2="116.9682935978111" marker-end="url(#arrow)" />
+  
+    <line class="edge contains" x1="0" y1="0" x2="-101.83230982022683" y2="96.07382930162271" marker-end="url(#arrow)" />
+  
+    <line class="edge contains" x1="0" y1="0" x2="-121.24355652982139" y2="70.00000000000004" marker-end="url(#arrow)" />
+  
+    <line class="edge contains" x1="0" y1="0" x2="-134.11853172416843" y2="40.15245257955268" marker-end="url(#arrow)" />
+  
+    <line class="edge contains" x1="0" y1="0" x2="-139.76314215797754" y2="8.140276047466665" marker-end="url(#arrow)" />
+  
+    <line class="edge contains" x1="0" y1="0" x2="-137.87308542170913" y2="-24.310744873370204" marker-end="url(#arrow)" />
+  
+    <line class="edge contains" x1="0" y1="0" x2="-128.5502549632384" y2="-55.45116724548192" marker-end="url(#arrow)" />
+  
+    <line class="edge contains" x1="0" y1="0" x2="-112.29724698570615" y2="-83.60220283839003" marker-end="url(#arrow)" />
+  
+    <line class="edge contains" x1="0" y1="0" x2="-89.99026535611553" y2="-107.2462220366569" marker-end="url(#arrow)" />
+  
+    <line class="edge contains" x1="0" y1="0" x2="-62.831885228064735" y2="-125.1085696452777" marker-end="url(#arrow)" />
+  
+    <line class="edge contains" x1="0" y1="0" x2="-32.28622190394165" y2="-136.22628188117534" marker-end="url(#arrow)" />
+  
+    <line class="edge imports" x1="-121.24355652982139" y1="70.00000000000004" x2="-101.83230982022683" y2="96.07382930162271" marker-end="url(#arrow)" />
+  
+    <line class="edge imports" x1="-134.11853172416843" y1="40.15245257955268" x2="-112.29724698570615" y2="-83.60220283839003" marker-end="url(#arrow)" />
+  
+    <line class="edge imports" x1="-134.11853172416843" y1="40.15245257955268" x2="-121.24355652982139" y2="70.00000000000004" marker-end="url(#arrow)" />
+  
+    <line class="edge imports" x1="-134.11853172416843" y1="40.15245257955268" x2="-101.83230982022683" y2="96.07382930162271" marker-end="url(#arrow)" />
+  
+    <line class="edge imports" x1="-134.11853172416843" y1="40.15245257955268" x2="-62.831885228064735" y2="-125.1085696452777" marker-end="url(#arrow)" />
+  
+    <line class="edge imports" x1="-134.11853172416843" y1="40.15245257955268" x2="-89.99026535611553" y2="-107.2462220366569" marker-end="url(#arrow)" />
+  
+    <line class="edge imports" x1="-134.11853172416843" y1="40.15245257955268" x2="-76.93125692991285" y2="116.9682935978111" marker-end="url(#arrow)" />
+  
+    <line class="edge imports" x1="-134.11853172416843" y1="40.15245257955268" x2="-128.5502549632384" y2="-55.45116724548192" marker-end="url(#arrow)" />
+  
+    <line class="edge imports" x1="-128.5502549632384" y1="-55.45116724548192" x2="-121.24355652982139" y2="70.00000000000004" marker-end="url(#arrow)" />
+  
+    <line class="edge imports" x1="-62.831885228064735" y1="-125.1085696452777" x2="-121.24355652982139" y2="70.00000000000004" marker-end="url(#arrow)" />
+  
+      
+      <g class="node workspace active" transform="translate(0, 0)">
+        <rect x="-65.10000000000001" y="-46.2" width="130.20000000000002" height="92.4" rx="14" />
+        <circle cx="0" cy="-6" r="42" fill="#0ea5e9" opacity="0.18" />
+        <text text-anchor="middle" y="-1">teleg</text>
+        <text class="sub" text-anchor="middle" y="14">.</text>
+      </g>
+      <g class="node file active" transform="translate(8.572527594031473e-15, -140)">
+        <rect x="-55.800000000000004" y="-39.6" width="111.60000000000001" height="79.2" rx="14" />
+        <circle cx="0" cy="-6" r="36" fill="#94a3b8" opacity="0.18" />
+        <text text-anchor="middle" y="-1">INFO_REL.md</text>
+        <text class="sub" text-anchor="middle" y="14">INFO_REL.md — no obvious symbols; no local im…</text>
+      </g>
+      <g class="node file active" transform="translate(32.28622190394164, -136.22628188117534)">
+        <rect x="-55.800000000000004" y="-39.6" width="111.60000000000001" height="79.2" rx="14" />
+        <circle cx="0" cy="-6" r="36" fill="#94a3b8" opacity="0.18" />
+        <text text-anchor="middle" y="-1">README.html</text>
+        <text class="sub" text-anchor="middle" y="14">README.html — no obvious symbols; no local im…</text>
+      </g>
+      <g class="node file active" transform="translate(62.83188522806472, -125.1085696452777)">
+        <rect x="-55.800000000000004" y="-39.6" width="111.60000000000001" height="79.2" rx="14" />
+        <circle cx="0" cy="-6" r="36" fill="#94a3b8" opacity="0.18" />
+        <text text-anchor="middle" y="-1">README.md</text>
+        <text class="sub" text-anchor="middle" y="14">README.md — no obvious symbols; no local impo…</text>
+      </g>
+      <g class="node file active" transform="translate(89.99026535611551, -107.24622203665692)">
+        <rect x="-55.800000000000004" y="-39.6" width="111.60000000000001" height="79.2" rx="14" />
+        <circle cx="0" cy="-6" r="36" fill="#94a3b8" opacity="0.18" />
+        <text text-anchor="middle" y="-1">TASKS.md</text>
+        <text class="sub" text-anchor="middle" y="14">TASKS.md — no obvious symbols; no local impor…</text>
+      </g>
+      <g class="node file active" transform="translate(112.29724698570614, -83.60220283839007)">
+        <rect x="-55.800000000000004" y="-39.6" width="111.60000000000001" height="79.2" rx="14" />
+        <circle cx="0" cy="-6" r="36" fill="#94a3b8" opacity="0.18" />
+        <text text-anchor="middle" y="-1">deploy.sh</text>
+        <text class="sub" text-anchor="middle" y="14">deploy.sh — no obvious symbols; no local impo…</text>
+      </g>
+      <g class="node file active" transform="translate(128.55025496323836, -55.451167245481955)">
+        <rect x="-55.800000000000004" y="-39.6" width="111.60000000000001" height="79.2" rx="14" />
+        <circle cx="0" cy="-6" r="36" fill="#94a3b8" opacity="0.18" />
+        <text text-anchor="middle" y="-1">package.json</text>
+        <text class="sub" text-anchor="middle" y="14">package.json — json_key name, json_key versio…</text>
+      </g>
+      <g class="node file active" transform="translate(137.87308542170913, -24.31074487337025)">
+        <rect x="-55.800000000000004" y="-39.6" width="111.60000000000001" height="79.2" rx="14" />
+        <circle cx="0" cy="-6" r="36" fill="#94a3b8" opacity="0.18" />
+        <text text-anchor="middle" y="-1">tsconfig.json</text>
+        <text class="sub" text-anchor="middle" y="14">tsconfig.json — json_key compilerOptions, jso…</text>
+      </g>
+      <g class="node file active" transform="translate(139.76314215797754, 8.140276047466617)">
+        <rect x="-55.800000000000004" y="-39.6" width="111.60000000000001" height="79.2" rx="14" />
+        <circle cx="0" cy="-6" r="36" fill="#94a3b8" opacity="0.18" />
+        <text text-anchor="middle" y="-1">GROUP_CHANNEL_SUPPORT.md</text>
+        <text class="sub" text-anchor="middle" y="14">docs/GROUP_CHANNEL_SUPPORT.md — no obvious sy…</text>
+      </g>
+      <g class="node file active" transform="translate(134.11853172416843, 40.15245257955264)">
+        <rect x="-55.800000000000004" y="-39.6" width="111.60000000000001" height="79.2" rx="14" />
+        <circle cx="0" cy="-6" r="36" fill="#94a3b8" opacity="0.18" />
+        <text text-anchor="middle" y="-1">PHASE3_INTEGRATION.md</text>
+        <text class="sub" text-anchor="middle" y="14">docs/PHASE3_INTEGRATION.md — no obvious symbo…</text>
+      </g>
+      <g class="node file active" transform="translate(121.24355652982142, 69.99999999999997)">
+        <rect x="-55.800000000000004" y="-39.6" width="111.60000000000001" height="79.2" rx="14" />
+        <circle cx="0" cy="-6" r="36" fill="#94a3b8" opacity="0.18" />
+        <text text-anchor="middle" y="-1">PLAN_ACTION.md</text>
+        <text class="sub" text-anchor="middle" y="14">docs/PLAN_ACTION.md — no obvious symbols; no …</text>
+      </g>
+      <g class="node file active" transform="translate(101.83230982022683, 96.0738293016227)">
+        <rect x="-55.800000000000004" y="-39.6" width="111.60000000000001" height="79.2" rx="14" />
+        <circle cx="0" cy="-6" r="36" fill="#94a3b8" opacity="0.18" />
+        <text text-anchor="middle" y="-1">GRAPH_REPORT.md</text>
+        <text class="sub" text-anchor="middle" y="14">graphify-out/GRAPH_REPORT.md — no obvious sym…</text>
+      </g>
+      <g class="node file active" transform="translate(76.93125692991286, 116.9682935978111)">
+        <rect x="-55.800000000000004" y="-39.6" width="111.60000000000001" height="79.2" rx="14" />
+        <circle cx="0" cy="-6" r="36" fill="#94a3b8" opacity="0.18" />
+        <text text-anchor="middle" y="-1">graph.html</text>
+        <text class="sub" text-anchor="middle" y="14">graphify-out/graph.html — function esc, funct…</text>
+      </g>
+      <g class="node file active" transform="translate(47.882820065593634, 131.55696691002717)">
+        <rect x="-55.800000000000004" y="-39.6" width="111.60000000000001" height="79.2" rx="14" />
+        <circle cx="0" cy="-6" r="36" fill="#94a3b8" opacity="0.18" />
+        <text text-anchor="middle" y="-1">graph.json</text>
+        <text class="sub" text-anchor="middle" y="14">graphify-out/graph.json — json_key directed, …</text>
+      </g>
+      <g class="node file active" transform="translate(16.253007977532242, 139.053370083872)">
+        <rect x="-55.800000000000004" y="-39.6" width="111.60000000000001" height="79.2" rx="14" />
+        <circle cx="0" cy="-6" r="36" fill="#94a3b8" opacity="0.18" />
+        <text text-anchor="middle" y="-1">manifest.json</text>
+        <text class="sub" text-anchor="middle" y="14">graphify-out/manifest.json — json_key /home/a…</text>
+      </g>
+      <g class="node file active" transform="translate(-16.253007977532224, 139.053370083872)">
+        <rect x="-55.800000000000004" y="-39.6" width="111.60000000000001" height="79.2" rx="14" />
+        <circle cx="0" cy="-6" r="36" fill="#94a3b8" opacity="0.18" />
+        <text text-anchor="middle" y="-1">index.js</text>
+        <text class="sub" text-anchor="middle" y="14">mcp-server/index.js — function loadConfig, fu…</text>
+      </g>
+      <g class="node file active" transform="translate(-47.88282006559362, 131.55696691002717)">
+        <rect x="-55.800000000000004" y="-39.6" width="111.60000000000001" height="79.2" rx="14" />
+        <circle cx="0" cy="-6" r="36" fill="#94a3b8" opacity="0.18" />
+        <text text-anchor="middle" y="-1">package.json</text>
+        <text class="sub" text-anchor="middle" y="14">mcp-server/package.json — json_key name, json…</text>
+      </g>
+      <g class="node file active" transform="translate(-76.93125692991285, 116.9682935978111)">
+        <rect x="-55.800000000000004" y="-39.6" width="111.60000000000001" height="79.2" rx="14" />
+        <circle cx="0" cy="-6" r="36" fill="#94a3b8" opacity="0.18" />
+        <text text-anchor="middle" y="-1">capabilities.ts</text>
+        <text class="sub" text-anchor="middle" y="14">src/capabilities.ts — function parseCapabilit…</text>
+      </g>
+      <g class="node file active" transform="translate(-101.83230982022683, 96.07382930162271)">
+        <rect x="-55.800000000000004" y="-39.6" width="111.60000000000001" height="79.2" rx="14" />
+        <circle cx="0" cy="-6" r="36" fill="#94a3b8" opacity="0.18" />
+        <text text-anchor="middle" y="-1">config.ts</text>
+        <text class="sub" text-anchor="middle" y="14">src/config.ts — function getMeFromToken, func…</text>
+      </g>
+      <g class="node file active" transform="translate(-121.24355652982139, 70.00000000000004)">
+        <rect x="-55.800000000000004" y="-39.6" width="111.60000000000001" height="79.2" rx="14" />
+        <circle cx="0" cy="-6" r="36" fill="#94a3b8" opacity="0.18" />
+        <text text-anchor="middle" y="-1">db.ts</text>
+        <text class="sub" text-anchor="middle" y="14">src/db.ts — function getDb, function runMigra…</text>
+      </g>
+      <g class="node file active" transform="translate(-134.11853172416843, 40.15245257955268)">
+        <rect x="-55.800000000000004" y="-39.6" width="111.60000000000001" height="79.2" rx="14" />
+        <circle cx="0" cy="-6" r="36" fill="#94a3b8" opacity="0.18" />
+        <text text-anchor="middle" y="-1">index.ts</text>
+        <text class="sub" text-anchor="middle" y="14">src/index.ts — function callTelegram, functio…</text>
+      </g>
+      <g class="node file active" transform="translate(-139.76314215797754, 8.140276047466665)">
+        <rect x="-55.800000000000004" y="-39.6" width="111.60000000000001" height="79.2" rx="14" />
+        <circle cx="0" cy="-6" r="36" fill="#94a3b8" opacity="0.18" />
+        <text text-anchor="middle" y="-1">node-sqlite.d.ts</text>
+        <text class="sub" text-anchor="middle" y="14">src/node-sqlite.d.ts — no obvious symbols; no…</text>
+      </g>
+      <g class="node file active" transform="translate(-137.87308542170913, -24.310744873370204)">
+        <rect x="-55.800000000000004" y="-39.6" width="111.60000000000001" height="79.2" rx="14" />
+        <circle cx="0" cy="-6" r="36" fill="#94a3b8" opacity="0.18" />
+        <text text-anchor="middle" y="-1">poll-worker.ts</text>
+        <text class="sub" text-anchor="middle" y="14">src/poll-worker.ts — function getDb, function…</text>
+      </g>
+      <g class="node file active" transform="translate(-128.5502549632384, -55.45116724548192)">
+        <rect x="-55.800000000000004" y="-39.6" width="111.60000000000001" height="79.2" rx="14" />
+        <circle cx="0" cy="-6" r="36" fill="#94a3b8" opacity="0.18" />
+        <text text-anchor="middle" y="-1">polling-manager.ts</text>
+        <text class="sub" text-anchor="middle" y="14">src/polling-manager.ts — class PollingManager…</text>
+      </g>
+      <g class="node file active" transform="translate(-112.29724698570615, -83.60220283839003)">
+        <rect x="-55.800000000000004" y="-39.6" width="111.60000000000001" height="79.2" rx="14" />
+        <circle cx="0" cy="-6" r="36" fill="#94a3b8" opacity="0.18" />
+        <text text-anchor="middle" y="-1">relay.ts</text>
+        <text class="sub" text-anchor="middle" y="14">src/relay.ts — function ensureRelayDir, funct…</text>
+      </g>
+      <g class="node file active" transform="translate(-89.99026535611553, -107.2462220366569)">
+        <rect x="-55.800000000000004" y="-39.6" width="111.60000000000001" height="79.2" rx="14" />
+        <circle cx="0" cy="-6" r="36" fill="#94a3b8" opacity="0.18" />
+        <text text-anchor="middle" y="-1">session-config.ts</text>
+        <text class="sub" text-anchor="middle" y="14">src/session-config.ts — function getSessionId…</text>
+      </g>
+      <g class="node file active" transform="translate(-62.831885228064735, -125.1085696452777)">
+        <rect x="-55.800000000000004" y="-39.6" width="111.60000000000001" height="79.2" rx="14" />
+        <circle cx="0" cy="-6" r="36" fill="#94a3b8" opacity="0.18" />
+        <text text-anchor="middle" y="-1">session-registry.ts</text>
+        <text class="sub" text-anchor="middle" y="14">src/session-registry.ts — function getRelayPa…</text>
+      </g>
+      <g class="node file active" transform="translate(-32.28622190394165, -136.22628188117534)">
+        <rect x="-55.800000000000004" y="-39.6" width="111.60000000000001" height="79.2" rx="14" />
+        <circle cx="0" cy="-6" r="36" fill="#94a3b8" opacity="0.18" />
+        <text text-anchor="middle" y="-1">polling0-fix.md</text>
+        <text class="sub" text-anchor="middle" y="14">worker/polling0-fix.md — no obvious symbols; …</text>
+      </g>
+    </svg></div>
+        <p class="footer-note">Saved at <code>/home/abhaym/Development/PTGD/teleg/.pi-mem/artifacts/scan-teleg-2026-06-03T18-30-06-146Z.html</code></p>
+      </div>
+
+      <aside class="panel">
+        <h2>Nodes</h2>
+        <div class="node-list">
+    <article class="node-card ">
+      <p class="name">teleg</p>
+      <div class="meta">workspace · /home/abhaym/Development/PTGD/teleg · active</div>
+      <div>.</div>
+      <div class="chip-row">
+        <span class="chip">bytes 0 B</span>
+        <span class="chip">lines 0</span>
+        <span class="chip">score 1.00</span>
+      </div>
+      <div class="chip-row"><span class="chip">workspace</span></div>
+    </article>
+    <article class="node-card ">
+      <p class="name">INFO_REL.md</p>
+      <div class="meta">file · INFO_REL.md · active</div>
+      <div>INFO_REL.md — no obvious symbols; no local imports; 8 lines; 253 B # INFO_REL</div>
+      <div class="chip-row">
+        <span class="chip">bytes 253 B</span>
+        <span class="chip">lines 8</span>
+        <span class="chip">score 1.00</span>
+      </div>
+      <div class="chip-row"><span class="chip">md</span><span class="chip">INFO_REL.md</span><span class="chip">docs</span></div>
+    </article>
+    <article class="node-card ">
+      <p class="name">README.html</p>
+      <div class="meta">file · README.html · active</div>
+      <div>README.html — no obvious symbols; no local imports; 571 lines; 36 KB const root; const storedTheme; const themeToggle; const setThemeLabel; const tab; const card</div>
+      <div class="chip-row">
+        <span class="chip">bytes 36 KB</span>
+        <span class="chip">lines 571</span>
+        <span class="chip">score 6.00</span>
+      </div>
+      <div class="chip-row"><span class="chip">html</span><span class="chip">README.html</span><span class="chip">source</span></div>
+    </article>
+    <article class="node-card ">
+      <p class="name">README.md</p>
+      <div class="meta">file · README.md · active</div>
+      <div>README.md — no obvious symbols; no local imports; 650 lines; 24 KB # pi-teleg / teleg-bridge</div>
+      <div class="chip-row">
+        <span class="chip">bytes 24 KB</span>
+        <span class="chip">lines 650</span>
+        <span class="chip">score 5.00</span>
+      </div>
+      <div class="chip-row"><span class="chip">md</span><span class="chip">README.md</span><span class="chip">docs</span></div>
+    </article>
+    <article class="node-card ">
+      <p class="name">TASKS.md</p>
+      <div class="meta">file · TASKS.md · active</div>
+      <div>TASKS.md — no obvious symbols; no local imports; 67 lines; 2.6 KB # Multi-bot Polling Implementation Tasks</div>
+      <div class="chip-row">
+        <span class="chip">bytes 2.6 KB</span>
+        <span class="chip">lines 67</span>
+        <span class="chip">score 2.00</span>
+      </div>
+      <div class="chip-row"><span class="chip">md</span><span class="chip">TASKS.md</span><span class="chip">docs</span></div>
+    </article>
+    <article class="node-card ">
+      <p class="name">deploy.sh</p>
+      <div class="meta">file · deploy.sh · active</div>
+      <div>deploy.sh — no obvious symbols; no local imports; 123 lines; 3.6 KB #!/bin/bash</div>
+      <div class="chip-row">
+        <span class="chip">bytes 3.6 KB</span>
+        <span class="chip">lines 123</span>
+        <span class="chip">score 3.00</span>
+      </div>
+      <div class="chip-row"><span class="chip">sh</span><span class="chip">deploy.sh</span><span class="chip">source</span></div>
+    </article>
+    <article class="node-card ">
+      <p class="name">package.json</p>
+      <div class="meta">file · package.json · active</div>
+      <div>package.json — json_key name, json_key version, json_key description, json_key type; no local imports; 45 lines; 1.2 KB {</div>
+      <div class="chip-row">
+        <span class="chip">bytes 1.2 KB</span>
+        <span class="chip">lines 45</span>
+        <span class="chip">score 6.00</span>
+      </div>
+      <div class="chip-row"><span class="chip">json</span><span class="chip">package.json</span><span class="chip">config</span></div>
+    </article>
+    <article class="node-card ">
+      <p class="name">tsconfig.json</p>
+      <div class="meta">file · tsconfig.json · active</div>
+      <div>tsconfig.json — json_key compilerOptions, json_key target, json_key module, json_key moduleResolution; no local imports; 23 lines; 571 B {</div>
+      <div class="chip-row">
+        <span class="chip">bytes 571 B</span>
+        <span class="chip">lines 23</span>
+        <span class="chip">score 5.00</span>
+      </div>
+      <div class="chip-row"><span class="chip">json</span><span class="chip">tsconfig.json</span><span class="chip">config</span></div>
+    </article>
+    <article class="node-card ">
+      <p class="name">GROUP_CHANNEL_SUPPORT.md</p>
+      <div class="meta">file · docs/GROUP_CHANNEL_SUPPORT.md · active</div>
+      <div>docs/GROUP_CHANNEL_SUPPORT.md — no obvious symbols; no local imports; 141 lines; 4.5 KB # Telegram Groups, Supergroups, Channels, and Saved Messages</div>
+      <div class="chip-row">
+        <span class="chip">bytes 4.5 KB</span>
+        <span class="chip">lines 141</span>
+        <span class="chip">score 3.00</span>
+      </div>
+      <div class="chip-row"><span class="chip">md</span><span class="chip">docs</span><span class="chip">GROUP_CHANNEL_SUPPORT.md</span></div>
+    </article>
+    <article class="node-card ">
+      <p class="name">PHASE3_INTEGRATION.md</p>
+      <div class="meta">file · docs/PHASE3_INTEGRATION.md · active</div>
+      <div>docs/PHASE3_INTEGRATION.md — no obvious symbols; 1 imports; 86 lines; 3.1 KB class with; class doesn; const pm</div>
+      <div class="chip-row">
+        <span class="chip">bytes 3.1 KB</span>
+        <span class="chip">lines 86</span>
+        <span class="chip">score 3.00</span>
+      </div>
+      <div class="chip-row"><span class="chip">md</span><span class="chip">docs</span><span class="chip">PHASE3_INTEGRATION.md</span></div>
+    </article>
+    <article class="node-card ">
+      <p class="name">PLAN_ACTION.md</p>
+      <div class="meta">file · docs/PLAN_ACTION.md · active</div>
+      <div>docs/PLAN_ACTION.md — no obvious symbols; no local imports; 348 lines; 14 KB # Plan Action Document: Multi-bot polling, active workers, session eviction</div>
+      <div class="chip-row">
+        <span class="chip">bytes 14 KB</span>
+        <span class="chip">lines 348</span>
+        <span class="chip">score 5.00</span>
+      </div>
+      <div class="chip-row"><span class="chip">md</span><span class="chip">docs</span><span class="chip">PLAN_ACTION.md</span></div>
+    </article>
+    <article class="node-card ">
+      <p class="name">GRAPH_REPORT.md</p>
+      <div class="meta">file · graphify-out/GRAPH_REPORT.md · active</div>
+      <div>graphify-out/GRAPH_REPORT.md — no obvious symbols; no local imports; 132 lines; 6.3 KB # Graph Report - src (2026-05-29)</div>
+      <div class="chip-row">
+        <span class="chip">bytes 6.3 KB</span>
+        <span class="chip">lines 132</span>
+        <span class="chip">score 3.00</span>
+      </div>
+      <div class="chip-row"><span class="chip">md</span><span class="chip">graphify-out</span><span class="chip">GRAPH_REPORT.md</span><span class="chip">docs</span></div>
+    </article>
+    <article class="node-card ">
+      <p class="name">graph.html</p>
+      <div class="meta">file · graphify-out/graph.html · active</div>
+      <div>graphify-out/graph.html — function esc, function showInfo, function focusNode; no local imports; 195 lines; 248 KB const RAW_NODES; const RAW_EDGES; const LEGEND; function esc; const nodesDS; const edgesDS</div>
+      <div class="chip-row">
+        <span class="chip">bytes 248 KB</span>
+        <span class="chip">lines 195</span>
+        <span class="chip">score 8.00</span>
+      </div>
+      <div class="chip-row"><span class="chip">html</span><span class="chip">graphify-out</span><span class="chip">graph.html</span><span class="chip">source</span></div>
+    </article>
+    <article class="node-card ">
+      <p class="name">graph.json</p>
+      <div class="meta">file · graphify-out/graph.json · active</div>
+      <div>graphify-out/graph.json — json_key directed, json_key multigraph, json_key graph, json_key nodes; no local imports; 8949 lines; 243 KB {</div>
+      <div class="chip-row">
+        <span class="chip">bytes 243 KB</span>
+        <span class="chip">lines 8949</span>
+        <span class="chip">score 12.00</span>
+      </div>
+      <div class="chip-row"><span class="chip">json</span><span class="chip">graphify-out</span><span class="chip">graph.json</span><span class="chip">config</span></div>
+    </article>
+    <article class="node-card ">
+      <p class="name">manifest.json</p>
+      <div class="meta">file · graphify-out/manifest.json · active</div>
+      <div>graphify-out/manifest.json — json_key /home/abhaym/Development/PTGD/teleg/src/relay.ts, json_key mtime, json_key ast_hash, json_key semantic_hash; no local imports; 52 lines; 1.7 KB {</div>
+      <div class="chip-row">
+        <span class="chip">bytes 1.7 KB</span>
+        <span class="chip">lines 52</span>
+        <span class="chip">score 6.00</span>
+      </div>
+      <div class="chip-row"><span class="chip">json</span><span class="chip">graphify-out</span><span class="chip">manifest.json</span><span class="chip">config</span></div>
+    </article>
+    <article class="node-card ">
+      <p class="name">index.js</p>
+      <div class="meta">file · mcp-server/index.js · active</div>
+      <div>mcp-server/index.js — function loadConfig, function tg, function sendMessage, function streamUpload; 3 imports; 851 lines; 31 KB const __dirname; const CONFIG_PATH; function loadConfig; const config; const BOT_TOKEN; const BASE_URL</div>
+      <div class="chip-row">
+        <span class="chip">bytes 31 KB</span>
+        <span class="chip">lines 851</span>
+        <span class="chip">score 11.00</span>
+      </div>
+      <div class="chip-row"><span class="chip">js</span><span class="chip">mcp-server</span><span class="chip">index.js</span><span class="chip">source</span></div>
+    </article>
+    <article class="node-card ">
+      <p class="name">package.json</p>
+      <div class="meta">file · mcp-server/package.json · active</div>
+      <div>mcp-server/package.json — json_key name, json_key version, json_key description, json_key main; no local imports; 15 lines; 366 B {</div>
+      <div class="chip-row">
+        <span class="chip">bytes 366 B</span>
+        <span class="chip">lines 15</span>
+        <span class="chip">score 5.00</span>
+      </div>
+      <div class="chip-row"><span class="chip">json</span><span class="chip">mcp-server</span><span class="chip">package.json</span><span class="chip">config</span></div>
+    </article>
+    <article class="node-card ">
+      <p class="name">capabilities.ts</p>
+      <div class="meta">file · src/capabilities.ts · active</div>
+      <div>src/capabilities.ts — function parseCapabilitiesMd, function tryReadFile, function detectProjectCapabilities, function readCapabilitiesRegistry; no local imports; 197 lines; 7.1 KB const CONFIG_DIR; const CAPABILITIES_FILE; function parseCapabilitiesMd; const result; const lines; const line</div>
+      <div class="chip-row">
+        <span class="chip">bytes 7.1 KB</span>
+        <span class="chip">lines 197</span>
+        <span class="chip">score 8.00</span>
+      </div>
+      <div class="chip-row"><span class="chip">ts</span><span class="chip">src</span><span class="chip">capabilities.ts</span><span class="chip">source</span></div>
+    </article>
+    <article class="node-card ">
+      <p class="name">config.ts</p>
+      <div class="meta">file · src/config.ts · active</div>
+      <div>src/config.ts — function getMeFromToken, function readGlobalConfig, function readGlobalConfigSync, function writeGlobalConfig; no local imports; 522 lines; 16 KB const CONFIG_DIR; const CONFIG_FILE; const DEFAULT_DB_PATH; const CURRENT_VERSION; async function getMeFromToken; const res</div>
+      <div class="chip-row">
+        <span class="chip">bytes 16 KB</span>
+        <span class="chip">lines 522</span>
+        <span class="chip">score 10.00</span>
+      </div>
+      <div class="chip-row"><span class="chip">ts</span><span class="chip">src</span><span class="chip">config.ts</span><span class="chip">source</span></div>
+    </article>
+    <article class="node-card ">
+      <p class="name">db.ts</p>
+      <div class="meta">file · src/db.ts · active</div>
+      <div>src/db.ts — function getDb, function runMigrations, function migrateToV2, function repairLegacyRelaySessionsSchema; 1 imports; 1416 lines; 49 KB const __dirname; const SCHEMA_VERSION; const DEFAULT_DB_PATH; const DB_PATH; function getDb; const dir</div>
+      <div class="chip-row">
+        <span class="chip">bytes 49 KB</span>
+        <span class="chip">lines 1416</span>
+        <span class="chip">score 11.00</span>
+      </div>
+      <div class="chip-row"><span class="chip">ts</span><span class="chip">src</span><span class="chip">db.ts</span><span class="chip">source</span></div>
+    </article>
+    <article class="node-card ">
+      <p class="name">index.ts</p>
+      <div class="meta">file · src/index.ts · active</div>
+      <div>src/index.ts — function callTelegram, function sendReply, function sendFile, function verifyToken; 10 imports; 2251 lines; 93 KB const DRAIN_INTERVAL_MS; const CLAIM_OTHERS; const TELEGRAM_PREFIX; const MAX_MESSAGE_LENGTH; const MAX_ATTACHMENTS_PER_TURN; const SYSTEM_PROMPT_SUFFIX</div>
+      <div class="chip-row">
+        <span class="chip">bytes 93 KB</span>
+        <span class="chip">lines 2251</span>
+        <span class="chip">score 12.00</span>
+      </div>
+      <div class="chip-row"><span class="chip">ts</span><span class="chip">src</span><span class="chip">index.ts</span><span class="chip">source</span></div>
+    </article>
+    <article class="node-card ">
+      <p class="name">node-sqlite.d.ts</p>
+      <div class="meta">file · src/node-sqlite.d.ts · active</div>
+      <div>src/node-sqlite.d.ts — no obvious symbols; no local imports; 22 lines; 612 B export class DatabaseSync</div>
+      <div class="chip-row">
+        <span class="chip">bytes 612 B</span>
+        <span class="chip">lines 22</span>
+        <span class="chip">score 2.00</span>
+      </div>
+      <div class="chip-row"><span class="chip">ts</span><span class="chip">src</span><span class="chip">node-sqlite.d.ts</span><span class="chip">source</span></div>
+    </article>
+    <article class="node-card ">
+      <p class="name">poll-worker.ts</p>
+      <div class="meta">file · src/poll-worker.ts · active</div>
+      <div>src/poll-worker.ts — function getDb, function post, function callTelegram, function persistMessage; no local imports; 380 lines; 13 KB const DEFAULT_DB_PATH; const DB_PATH; const POLL_TIMEOUT; const HEALTH_CHECK_MS; const MAX_ERRORS; const INITIAL_RECONNECT</div>
+      <div class="chip-row">
+        <span class="chip">bytes 13 KB</span>
+        <span class="chip">lines 380</span>
+        <span class="chip">score 9.00</span>
+      </div>
+      <div class="chip-row"><span class="chip">ts</span><span class="chip">src</span><span class="chip">poll-worker.ts</span><span class="chip">source</span></div>
+    </article>
+    <article class="node-card ">
+      <p class="name">polling-manager.ts</p>
+      <div class="meta">file · src/polling-manager.ts · active</div>
+      <div>src/polling-manager.ts — class PollingManager, function getPollingManager, function getAllPollingManagers, function getPollingManagerStats; 1 imports; 515 lines; 16 KB const TEMP_DIR; const POLLING_LOCK_REFRESH_MS; class PollingManager; const existing; const parts; const oldPid</div>
+      <div class="chip-row">
+        <span class="chip">bytes 16 KB</span>
+        <span class="chip">lines 515</span>
+        <span class="chip">score 8.00</span>
+      </div>
+      <div class="chip-row"><span class="chip">ts</span><span class="chip">src</span><span class="chip">polling-manager.ts</span><span class="chip">source</span></div>
+    </article>
+    <article class="node-card ">
+      <p class="name">relay.ts</p>
+      <div class="meta">file · src/relay.ts · active</div>
+      <div>src/relay.ts — function ensureRelayDir, function getRelayPath, function generateSecret, function cleanStaleRelayFiles; 3 imports; 432 lines; 15 KB const __dirname; const RELAY_DIR; function ensureRelayDir; function getRelayPath; function generateSecret; const chars</div>
+      <div class="chip-row">
+        <span class="chip">bytes 15 KB</span>
+        <span class="chip">lines 432</span>
+        <span class="chip">score 11.00</span>
+      </div>
+      <div class="chip-row"><span class="chip">ts</span><span class="chip">src</span><span class="chip">relay.ts</span><span class="chip">source</span></div>
+    </article>
+    <article class="node-card ">
+      <p class="name">session-config.ts</p>
+      <div class="meta">file · src/session-config.ts · active</div>
+      <div>src/session-config.ts — function getSessionId, function flattenV2Config, function readConfig, function writeConfig; no local imports; 207 lines; 6.9 KB const CONFIG_DIR; const SESSION_REGISTRY_FILE; const SESSION_ID_KEY; export function getSessionId; const g; function flattenV2Config</div>
+      <div class="chip-row">
+        <span class="chip">bytes 6.9 KB</span>
+        <span class="chip">lines 207</span>
+        <span class="chip">score 8.00</span>
+      </div>
+      <div class="chip-row"><span class="chip">ts</span><span class="chip">src</span><span class="chip">session-config.ts</span><span class="chip">source</span></div>
+    </article>
+    <article class="node-card ">
+      <p class="name">session-registry.ts</p>
+      <div class="meta">file · src/session-registry.ts · active</div>
+      <div>src/session-registry.ts — function getRelayPath, function checkSessionLiveness, function getRelaySessionsForBot, function reconcileSessions; 1 imports; 436 lines; 13 KB const DEFAULT_LIVENESS_MS; const __dirname; const RELAY_DIR; function getRelayPath; export async function checkSessionLiveness; const failedChecks</div>
+      <div class="chip-row">
+        <span class="chip">bytes 13 KB</span>
+        <span class="chip">lines 436</span>
+        <span class="chip">score 10.00</span>
+      </div>
+      <div class="chip-row"><span class="chip">ts</span><span class="chip">src</span><span class="chip">session-registry.ts</span><span class="chip">source</span></div>
+    </article>
+    <article class="node-card ">
+      <p class="name">polling0-fix.md</p>
+      <div class="meta">file · worker/polling0-fix.md · active</div>
+      <div>worker/polling0-fix.md — no obvious symbols; no local imports; 31 lines; 2.4 KB # polling:0 fix implementation</div>
+      <div class="chip-row">
+        <span class="chip">bytes 2.4 KB</span>
+        <span class="chip">lines 31</span>
+        <span class="chip">score 1.00</span>
+      </div>
+      <div class="chip-row"><span class="chip">md</span><span class="chip">worker</span><span class="chip">polling0-fix.md</span><span class="chip">docs</span></div>
+    </article></div>
+      </aside>
+    </section>
+
+    <section class="panel">
+      <h2>Analysis</h2>
+      
+    <div class="section">
+      <h3>Overview</h3>
+      <ul>
+        <li>Mode: scan</li><li>Focus: auto</li><li>Workspace: /home/abhaym/Development/PTGD/teleg</li>
+      </ul>
+    </div>
+
+    <div class="section">
+      <h3>Priority files</h3>
+      <ul>
+        <li>graphify-out/graph.json — graphify-out/graph.json — json_key directed, json_key multigraph, json_key graph, json_key nodes; no local imports; 8949 lines; 243 KB {</li><li>src/index.ts — src/index.ts — function callTelegram, function sendReply, function sendFile, function verifyToken; 10 imports; 2251 lines; 93 KB const DRAIN_INTERVAL_MS; const CLAIM_OTHERS; const TELEGRAM_PREFIX; const MAX_MESSAGE_LENGTH; const MAX_ATTACHMENTS_PER_TURN; const SYSTEM_PROMPT_SUFFIX</li><li>mcp-server/index.js — mcp-server/index.js — function loadConfig, function tg, function sendMessage, function streamUpload; 3 imports; 851 lines; 31 KB const __dirname; const CONFIG_PATH; function loadConfig; const config; const BOT_TOKEN; const BASE_URL</li><li>src/db.ts — src/db.ts — function getDb, function runMigrations, function migrateToV2, function repairLegacyRelaySessionsSchema; 1 imports; 1416 lines; 49 KB const __dirname; const SCHEMA_VERSION; const DEFAULT_DB_PATH; const DB_PATH; function getDb; const dir</li><li>src/relay.ts — src/relay.ts — function ensureRelayDir, function getRelayPath, function generateSecret, function cleanStaleRelayFiles; 3 imports; 432 lines; 15 KB const __dirname; const RELAY_DIR; function ensureRelayDir; function getRelayPath; function generateSecret; const chars</li><li>src/config.ts — src/config.ts — function getMeFromToken, function readGlobalConfig, function readGlobalConfigSync, function writeGlobalConfig; no local imports; 522 lines; 16 KB const CONFIG_DIR; const CONFIG_FILE; const DEFAULT_DB_PATH; const CURRENT_VERSION; async function getMeFromToken; const res</li><li>src/session-registry.ts — src/session-registry.ts — function getRelayPath, function checkSessionLiveness, function getRelaySessionsForBot, function reconcileSessions; 1 imports; 436 lines; 13 KB const DEFAULT_LIVENESS_MS; const __dirname; const RELAY_DIR; function getRelayPath; export async function checkSessionLiveness; const failedChecks</li><li>src/poll-worker.ts — src/poll-worker.ts — function getDb, function post, function callTelegram, function persistMessage; no local imports; 380 lines; 13 KB const DEFAULT_DB_PATH; const DB_PATH; const POLL_TIMEOUT; const HEALTH_CHECK_MS; const MAX_ERRORS; const INITIAL_RECONNECT</li>
+      </ul>
+    </div>
+
+    <div class="section">
+      <h3>Symbols</h3>
+      <ul>
+        <li>package.json :: json_key name</li><li>package.json :: json_key version</li><li>package.json :: json_key description</li><li>package.json :: json_key type</li><li>tsconfig.json :: json_key compilerOptions</li><li>tsconfig.json :: json_key target</li><li>tsconfig.json :: json_key module</li><li>tsconfig.json :: json_key moduleResolution</li><li>graphify-out/graph.html :: function esc</li><li>graphify-out/graph.html :: function showInfo</li><li>graphify-out/graph.html :: function focusNode</li><li>graphify-out/graph.json :: json_key directed</li><li>graphify-out/graph.json :: json_key multigraph</li><li>graphify-out/graph.json :: json_key graph</li><li>graphify-out/graph.json :: json_key nodes</li><li>graphify-out/manifest.json :: json_key /home/abhaym/Development/PTGD/teleg/src/relay.ts</li><li>graphify-out/manifest.json :: json_key mtime</li><li>graphify-out/manifest.json :: json_key ast_hash</li><li>graphify-out/manifest.json :: json_key semantic_hash</li><li>mcp-server/index.js :: function loadConfig</li><li>mcp-server/index.js :: function tg</li><li>mcp-server/index.js :: function sendMessage</li><li>mcp-server/index.js :: function streamUpload</li><li>mcp-server/package.json :: json_key name</li><li>mcp-server/package.json :: json_key version</li><li>mcp-server/package.json :: json_key description</li><li>mcp-server/package.json :: json_key main</li><li>src/capabilities.ts :: function parseCapabilitiesMd</li><li>src/capabilities.ts :: function tryReadFile</li><li>src/capabilities.ts :: function detectProjectCapabilities</li><li>src/capabilities.ts :: function readCapabilitiesRegistry</li><li>src/config.ts :: function getMeFromToken</li><li>src/config.ts :: function readGlobalConfig</li><li>src/config.ts :: function readGlobalConfigSync</li><li>src/config.ts :: function writeGlobalConfig</li><li>src/db.ts :: function getDb</li><li>src/db.ts :: function runMigrations</li><li>src/db.ts :: function migrateToV2</li><li>src/db.ts :: function repairLegacyRelaySessionsSchema</li><li>src/index.ts :: function callTelegram</li><li>src/index.ts :: function sendReply</li><li>src/index.ts :: function sendFile</li><li>src/index.ts :: function verifyToken</li><li>src/poll-worker.ts :: function getDb</li><li>src/poll-worker.ts :: function post</li><li>src/poll-worker.ts :: function callTelegram</li><li>src/poll-worker.ts :: function persistMessage</li><li>src/polling-manager.ts :: class PollingManager</li><li>src/polling-manager.ts :: function getPollingManager</li><li>src/polling-manager.ts :: function getAllPollingManagers</li><li>src/polling-manager.ts :: function getPollingManagerStats</li><li>src/relay.ts :: function ensureRelayDir</li><li>src/relay.ts :: function getRelayPath</li><li>src/relay.ts :: function generateSecret</li><li>src/relay.ts :: function cleanStaleRelayFiles</li><li>src/session-config.ts :: function getSessionId</li><li>src/session-config.ts :: function flattenV2Config</li><li>src/session-config.ts :: function readConfig</li><li>src/session-config.ts :: function writeConfig</li><li>src/session-registry.ts :: function getRelayPath</li><li>src/session-registry.ts :: function checkSessionLiveness</li><li>src/session-registry.ts :: function getRelaySessionsForBot</li><li>src/session-registry.ts :: function reconcileSessions</li>
+      </ul>
+    </div>
+
+    <div class="section">
+      <h3>Imports</h3>
+      <ul>
+        <li>src/db.ts → src/config.ts</li><li>src/index.ts → src/relay.ts</li><li>src/index.ts → src/db.ts</li><li>src/index.ts → src/config.ts</li><li>src/index.ts → src/session-registry.ts</li><li>src/index.ts → src/session-config.ts</li><li>src/index.ts → src/capabilities.ts</li><li>src/index.ts → src/polling-manager.ts</li><li>src/polling-manager.ts → src/db.ts</li><li>src/session-registry.ts → src/db.ts</li>
+      </ul>
+    </div>
+      <div class="section">
+        <h3>Graph summary</h3>
+        <pre>Nodes: 28, Edges: 37, Files: 27, Imports: 20, Symbols: 207</pre>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

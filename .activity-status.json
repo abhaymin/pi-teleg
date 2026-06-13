@@ -1,0 +1,16 @@
+{
+  "bot": {
+    "online": true,
+    "username": "mySourceAM2_bot",
+    "checked_at": "2026-05-19T07:55:01.981Z"
+  },
+  "queue": {
+    "pending": 0,
+    "processing": 0,
+    "completed": 0,
+    "failed": 0
+  },
+  "recent_messages": [],
+  "recent_downloads": [],
+  "last_updated": "2026-05-19T07:55:01.981Z"
+}
