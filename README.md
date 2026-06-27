@@ -31,7 +31,7 @@ The project is especially useful when you keep multiple specialized Pi sessions 
 | Chat media retrieval | The poll worker downloads photos, videos, animations, documents, audio, voice, and stickers from chat messages into a per-bot local media cache and surfaces their file paths to the agent (Telegram's ~20 MB `getFile` limit applies). |
 | Telegram poll support | Poll messages are stored with their question and numbered options; poll-answer votes are forwarded to the polling session as ephemeral steer turns. |
 | Chunked text replies | Handles Telegram message length constraints. |
-| Photo and video sending | `teleg-send_photo` and `teleg-send_video` send local media files. |
+| Photo, video and document sending | `teleg-send_photo`, `teleg-send_video`, and `teleg-send_document` send local media files. |
 | File attachments | `teleg-attach` queues local files to send with the next Telegram reply. |
 | Typing indicator | Keeps Telegram chat informed while a turn is being processed. |
 
@@ -103,8 +103,33 @@ flowchart LR
 | Session registry | `src/session-registry.ts` | Checks liveness, reconciles sessions, evicts ghosts, elects primary. |
 | Session config | `src/session-config.ts` | Reads/writes session registry and user allowlist/archive settings. |
 | Capability registry | `src/capabilities.ts` | Detects capabilities from project docs and matches messages to sessions. |
-| MCP helper server | `mcp-server/index.js` | Exposes bridge operations as MCP tools. |
+| Standalone MCP server | `mcp-server/index.js` | Stdio MCP exposing the IDENTICAL toolset as the extension, for third-party clients (omp, opencode, Claude Code, Kilo Code). Shares the same SQLite DB + config. |
 | Build output | `dist/` | Compiled JavaScript and TypeScript declarations. |
+
+
+### Extension and MCP parity
+
+The native Pi extension and the standalone MCP server expose the **same toolset** and honour the **same recorded state**. Loading either one gives identical capabilities:
+
+| Surface | Tools | Polling | Shared state |
+|---|---|---|---|
+| Pi extension (`src/index.ts` → `dist/`) | All 22 tools via `pi.registerTool()` | Yes (owns the per-bot polling lock) | `~/.pi/agent/teleg-bridge.{json,db}`, `.pi/teleg.json` |
+| Standalone MCP (`mcp-server/index.js`) | Same 22 tools over stdio JSON-RPC | No (tools only) | Same files |
+
+Shared toolset: `teleg-send_message`, `teleg-send_photo`, `teleg-send_video`, `teleg-send_document`, `teleg-attach`, `get_me`, `get_queue_count`, `get_queue_stats`, `get_queue_data`, `get_queue_data_id`, `set_queue_status`, `teleg-clear_backlog`, `teleg-publish`, `teleg-reconcile`, `teleg-list_sessions`, `teleg-evict_session`, `teleg-list_bots`, `teleg-set_primary`, `teleg-disconnect`, `teleg-disconnect-all`, `teleg-clean-db`, `teleg-remove-sessions`.
+
+In Pi, **only the native extension is loaded** — it is a package in `settings.json` and is the sole tool surface. The standalone MCP is deliberately **not** loaded in Pi: both register identical tool names, so loading both made the agent route calls through `mcp({ tool: "teleg-reconcile" })`, which Pi then redirected to the native tool with a warning. The extension is a strict superset (it also owns polling), so the MCP adds nothing in Pi. deploy.sh actively removes any stale `teleg-bridge` entry from `mcp.json`. The extension additionally validates the recorded config (bot token/id, DB path, allowlist) at `session_start` so it never disagrees with what the MCP resolves. To opt the MCP back into Pi explicitly: `teleg mcp --app pi --write`.
+
+For **other apps** (omp, opencode, Claude Code, Kilo Code, …), wire the standalone MCP without touching Pi:
+
+```bash
+teleg mcp                                 # print the standard mcpServers block
+teleg mcp --app claude --write            # merge into ~/.claude.json
+teleg mcp --app pi                        # merge into ~/.pi/agent/mcp.json
+teleg mcp --app opencode                  # print opencode-format snippet
+teleg mcp --app kilo                      # print kilo-format snippet
+teleg mcp --path /custom/mcp-server/index.js
+```
 
 ## SQLite Database Architecture
 

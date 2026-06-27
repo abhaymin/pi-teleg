@@ -13,6 +13,7 @@
     },
     "scripts": {
         "build": "tsc",
+        "build:mcp": "node -e \"console.log('[build:mcp] mcp-server/index.js is plain JS — no compile step needed')\"",
         "test": "npm run build && node --test",
         "dev": "tsc --watch",
         "deploy": "./deploy.sh",

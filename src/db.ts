@@ -429,6 +429,20 @@ function initSchema(database: DatabaseSync): void {
     CREATE INDEX IF NOT EXISTS idx_pubsub_channel ON pubsub(channel, consumed_at);
     CREATE INDEX IF NOT EXISTS idx_pubsub_target ON pubsub(target_session, consumed_at);
     CREATE INDEX IF NOT EXISTS idx_pubsub_bot ON pubsub(bot_id, channel);
+    -- OUTBOUND: bot replies, so reply-chains and reactions can resolve the
+    -- message a user reacted to / replied to (incl. the bot's own earlier post).
+    CREATE TABLE IF NOT EXISTS outbound_messages (
+      id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+      bot_id             INTEGER NOT NULL,
+      chat_id            INTEGER NOT NULL,
+      message_id         INTEGER NOT NULL,
+      reply_to_message_id INTEGER,
+      from_session       TEXT,
+      text               TEXT NOT NULL DEFAULT '',
+      created_at         INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000)
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_outbound_lookup ON outbound_messages(bot_id, chat_id, message_id);
+    CREATE INDEX IF NOT EXISTS idx_outbound_bot ON outbound_messages(bot_id);
   `);
 }
 
@@ -494,6 +508,82 @@ export function enqueueMessage(params: {
   // Get the last inserted row ID
   const row = d.prepare("SELECT last_insert_rowid() as id").get() as { id: number };
   return row.id;
+}
+
+/**
+ * Record a bot outbound reply so later reply-chains and reactions can resolve
+ * the message the user reacted to / replied to (including the bot's own post).
+ * Re-recording the same (bot_id, chat_id, message_id) replaces the prior row.
+ */
+export function recordOutboundMessage(params: {
+  bot_id: number;
+  chat_id: number;
+  message_id: number;
+  reply_to_message_id?: number | null;
+  from_session?: string | null;
+  text: string;
+}): void {
+  getDb().prepare(`
+    INSERT INTO outbound_messages (bot_id, chat_id, message_id, reply_to_message_id, from_session, text)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(bot_id, chat_id, message_id) DO UPDATE SET
+      reply_to_message_id = excluded.reply_to_message_id,
+      from_session = excluded.from_session,
+      text = excluded.text,
+      created_at = (unixepoch('now') * 1000)
+  `).run(
+    params.bot_id,
+    params.chat_id,
+    params.message_id,
+    params.reply_to_message_id ?? null,
+    params.from_session ?? null,
+    params.text,
+  );
+}
+
+export interface ChainMessage {
+  /** Display author label for the message. */
+  author: string;
+  text: string;
+  replyToMessageId: number | null;
+}
+
+/**
+ * Resolve a single message by id across BOTH stores — incoming (message_queue)
+ * and the bot's own outbound replies (outbound_messages). Returns null if the
+ * message is unknown to this bridge. Used to build reply chains and to surface
+ * the post a reaction refers to.
+ */
+export function lookupMessageForChain(botId: number, chatId: number, messageId: number): ChainMessage | null {
+  const incoming = getDb().prepare(
+    "SELECT from_username AS author, text, reply_to_message_id FROM message_queue WHERE bot_id = ? AND chat_id = ? AND message_id = ?"
+  ).get(botId, chatId, messageId) as { author: string | null; text: string; reply_to_message_id: number | null } | undefined;
+  if (incoming) {
+    return { author: incoming.author || "User", text: incoming.text, replyToMessageId: incoming.reply_to_message_id ?? null };
+  }
+  const outbound = getDb().prepare(
+    "SELECT from_session AS author, text, reply_to_message_id FROM outbound_messages WHERE bot_id = ? AND chat_id = ? AND message_id = ?"
+  ).get(botId, chatId, messageId) as { author: string | null; text: string; reply_to_message_id: number | null } | undefined;
+  if (outbound) {
+    return { author: outbound.author ? `@${outbound.author}` : "Assistant", text: outbound.text, replyToMessageId: outbound.reply_to_message_id ?? null };
+  }
+  return null;
+}
+
+/**
+ * Bound growth of the outbound store: drop old rows beyond a keep window.
+ * Mirrors purgeOldMessages semantics. Returns the number of rows removed.
+ */
+export function purgeOldOutboundMessages(keepCount: number = 1000, botId?: number): number {
+  const d = getDb();
+  const row = botId !== undefined
+    ? d.prepare(`SELECT id FROM outbound_messages WHERE bot_id = ? ORDER BY id DESC LIMIT 1 OFFSET ?`).get(botId, keepCount) as { id: number } | undefined
+    : d.prepare(`SELECT id FROM outbound_messages ORDER BY id DESC LIMIT 1 OFFSET ?`).get(keepCount) as { id: number } | undefined;
+  if (!row) return 0;
+  const result = botId !== undefined
+    ? d.prepare(`DELETE FROM outbound_messages WHERE bot_id = ? AND id < ?`).run(botId, row.id)
+    : d.prepare(`DELETE FROM outbound_messages WHERE id < ?`).run(row.id);
+  return result.changes;
 }
 
 /**
@@ -1334,6 +1424,7 @@ export function runStartupRecovery(botId?: number): {
 
   // Also purge old completed/failed messages (keep last 1000)
   purgeOldMessages(1000, botId);
+  purgeOldOutboundMessages(1000, botId);
 
   // Merge session_name from local DB if it differs from shared DB.
   // This handles the case where the poll worker was writing to a local DB

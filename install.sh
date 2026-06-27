@@ -501,6 +501,107 @@ cmd_version() {
   log "teleg-bridge ${pkg_ver}${git_desc:+ ($git_desc)}"
 }
 
+# ── mcp: emit / install the standalone MCP config for third-party clients ────
+# The Pi extension is wired separately by deploy.sh. This command only deals
+# with the standalone stdio MCP server (mcp-server/index.js) for other apps:
+# omp, opencode, Claude Code, Kilo Code, or any mcpServers-style client.
+mcp_server_path() { printf '%s/mcp-server/index.js\n' "$(resolve_home)"; }
+
+cmd_mcp() {
+  local app="" do_write=false mcp_path
+  mcp_path="$(mcp_server_path)"
+  while (($#)); do
+    case "$1" in
+      --app)   app="${2:-}"; shift 2 ;;
+      --write) do_write=true; shift ;;
+      --path)  mcp_path="$2"; shift 2 ;;
+      -h|--help)
+        grep -q 'teleg mcp' "$0" 2>/dev/null && sed -n '/^  teleg mcp/,/^$/p' "$0" | sed 's/^  //'
+        return 0 ;;
+      *) die "Unknown flag '$1' (see: teleg mcp -h)" ;;
+    esac
+  done
+
+  [[ -f "$mcp_path" ]] || warn "MCP server not found at $mcp_path (still emitting config)."
+
+  local entry
+  entry="$(MCP_PATH="$mcp_path" python3 - <<'PY'
+import json, os
+p = os.environ["MCP_PATH"]
+print(json.dumps({"command": "node", "args": [p]}))
+PY
+)"
+
+  # No --app: print the standard mcpServers block (Claude Code / omp / generic).
+  if [[ -z "$app" ]]; then
+    log "Add this to your MCP client config under \"mcpServers\":"
+    log ""
+    MCP_PATH="$mcp_path" python3 - <<'PY'
+import json, os
+p = os.environ["MCP_PATH"]
+print(json.dumps({"mcpServers": {"teleg-bridge": {"command": "node", "args": [p]}}}, indent=2))
+PY
+    log ""
+    log "App-specific hints:"
+    log "  claude   teleg mcp --app claude --write   →  ~/.claude.json (mcpServers)"
+    log "  omp/pi   already wired by deploy.sh        →  ~/.pi/agent/mcp.json"
+    log "  opencode teleg mcp --app opencode          →  print opencode format"
+    log "  kilo     teleg mcp --app kilo              →  print kilo format"
+    return 0
+  fi
+
+  local target kind
+  case "$app" in
+    claude|claude-code)
+      target="$HOME/.claude.json"; kind="mcpServers" ;;
+    pi|omp)
+      target="$HOME/.pi/agent/mcp.json"; kind="mcpServers" ;;
+    opencode)
+      # opencode uses a top-level "mcp" object with type/command/enabled entries.
+      log "opencode snippet (merge into opencode.json under \"mcp\"):"
+      log ""
+      MCP_PATH="$mcp_path" python3 - <<'PY'
+import json, os
+print(json.dumps({"mcp": {"teleg-bridge": {"type": "local", "command": ["node", os.environ["MCP_PATH"]], "enabled": True}}}, indent=2))
+PY
+      [[ "$do_write" == true ]] && warn "opencode config locations vary — copy the snippet above into your opencode.json."
+      return 0 ;;
+    kilo|kilo-code)
+      log "Kilo Code snippet (merge into Kilo Code settings under \"mcpServers\"):"
+      log ""
+      MCP_PATH="$mcp_path" python3 - <<'PY'
+import json, os
+print(json.dumps({"mcpServers": {"teleg-bridge": {"command": "node", "args": [os.environ["MCP_PATH"]], "disabled": False, "autoApprove": []}}}, indent=2))
+PY
+      [[ "$do_write" == true ]] && warn "Kilo Code stores MCP via its UI/extension settings — copy the snippet above."
+      return 0 ;;
+    *) die "Unknown app '$app'. Try: claude, pi, omp, opencode, kilo" ;;
+  esac
+
+  # mcpServers-style targets (claude, pi/omp): merge non-clobberingly on --write.
+  if [[ "$do_write" == true ]]; then
+    [[ -n "$target" ]] || die "no target path for app '$app'"
+    mkdir -p "$(dirname "$target")"
+    TARGET="$target" KIND="$kind" ENTRY="$entry" python3 - <<'PY'
+import json, os
+path = os.environ["TARGET"]; kind = os.environ["KIND"]; entry = json.loads(os.environ["ENTRY"])
+try:
+    with open(path) as f: cfg = json.load(f)
+except Exception:
+    cfg = {}
+if not isinstance(cfg, dict): cfg = {}
+cfg.setdefault(kind, {})
+cfg[kind]["teleg-bridge"] = entry
+with open(path, "w") as f: json.dump(cfg, f, indent=2)
+print(f"wrote teleg-bridge → {path}:{kind}")
+PY
+  else
+    log "Preview for $app (pass --write to merge into $target):"
+    log ""
+    ENTRY="$entry" KIND="$kind" python3 -c "import json,os; print(json.dumps({os.environ['KIND']:{'teleg-bridge':json.loads(os.environ['ENTRY'])}}, indent=2))"
+  fi
+}
+
 usage() {
   cat <<'EOF'
 teleg — teleg-bridge lifecycle (git-based install / update / remove)
@@ -511,6 +612,7 @@ Usage:
   teleg uninstall [--home PATH] [--purge] [-y]      (alias: remove)
   teleg status
   teleg version
+  teleg mcp [--app claude|pi|omp|opencode|kilo] [--write] [--path PATH]
   teleg help
 
 Channels:
@@ -532,7 +634,8 @@ main() {
     update)          shift; cmd_update "$@" ;;
     uninstall|remove) shift; cmd_uninstall "$@" ;;
     status)          shift; cmd_status "$@" ;;
-    version)         shift; cmd_version "$@" ;;
+    version)        shift; cmd_version "$@" ;;
+    mcp)            shift; cmd_mcp "$@" ;;
     help|-h|--help)  usage; exit 0 ;;
     "")              cmd_install ;;        # piped / no args → bootstrap install
     -*)              cmd_install "$@" ;;   # flags only → install

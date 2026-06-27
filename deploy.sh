@@ -1,14 +1,23 @@
 #!/bin/bash
-# Deploy teleg monorepo: extension + MCP server (stdio)
-# Both are part of the same source tree at /home/abhaym/Development/PTGD/teleg/
+# Deploy teleg monorepo: Pi extension + standalone MCP server (stdio)
+# Both ship the SAME toolset (full parity): send_message/photo/video/document,
+# teleg-attach, queue + session + relay management, kill-switches.
 #
 # Architecture:
-#   - Extension (dist/)          → polls Telegram, handles message routing, @sessionName routing
-#   - MCP server (mcp-server/)   → stdio JSON-RPC tools (send_message, send_photo, send_video, get_me, teleg_attach)
+#   - Extension (dist/)        → native Pi extension: polls Telegram, routes
+#                                 messages, drains the queue, AND registers every
+#                                 tool via pi.registerTool(). Validates recorded
+#                                 config (bot token/id, db path, allowlist) so it
+#                                 agrees with the MCP.
+#   - MCP server (mcp-server/) → standalone stdio MCP exposing the identical
+#                                 toolset for THIRD-PARTY clients (omp, opencode,
+#                                 Claude Code, Kilo Code, …). NOT loaded in Pi by
+#                                 default (would duplicate native tool names); wire
+#                                 it in explicitly with `teleg mcp --app pi --write`.
 #
-# The extension owns the polling lock. The MCP server provides tools only (no polling).
-# MCP server can be used standalone (without the extension) OR with the extension.
-#
+# Both honour the same recorded state: ~/.pi/agent/teleg-bridge.{json,db} and
+# .pi/teleg.json. In Pi the native extension is the sole tool surface (it also
+# owns polling); the MCP is for clients that don't have the extension.
 # Usage:
 #   ./deploy.sh          → one-time deploy
 #   ./deploy.sh --watch  → watch mode (tsc --watch)
@@ -20,6 +29,18 @@ cd "$SCRIPT_DIR"
 
 WATCH_MODE=false
 [[ "$1" == "--watch" ]] && WATCH_MODE=true
+
+# ── Isolated Python via uv ───────────────────────────────────────────────────
+# A mounted AppImage leaks PYTHONHOME/PYTHONPATH into the shell, which makes any
+# system python3 fail ("No module named encodings"). uv provisions a clean
+# interpreter; we strip the leaked vars at invocation so it is immune.
+TELEG_VENV="${TELEG_VENV:-$HOME/.cache/teleg-bridge/venv}"
+run_py() { env -u PYTHONHOME -u PYTHONPATH "${TELEG_VENV}/bin/python" - "$@"; }
+if ! command -v uv >/dev/null 2>&1; then
+  echo "[!] 'uv' not found. Install it (https://docs.astral.sh/uv/) or export a working PYTHONHOME." >&2
+  exit 1
+fi
+uv venv --quiet "$TELEG_VENV" >/dev/null 2>&1 || true
 
 echo "=== teleg monorepo deploy ==="
 echo "Source: $SCRIPT_DIR"
@@ -36,8 +57,7 @@ mkdir -p "$AGENT_DIR"
 
 echo ""
 echo "[2] Updating $SETTINGS_FILE (extension only)..."
-
-python3 << 'PYEOF'
+run_py << 'PYEOF'
 import json, os, sys
 
 teleg_path = os.path.abspath(".")
@@ -80,51 +100,45 @@ with open(settings_file, "w") as f:
 print(f"  Updated {len(deduped)} packages in settings.json")
 PYEOF
 
-# ── Update agent mcp.json (teleg-bridge stdio MCP, non-clobbering) ───────────
+# ── Pi runs the NATIVE extension only — drop any stale teleg-bridge MCP ───────
+# The extension exposes the full toolset natively (it also owns polling).
+# Loading the MCP alongside it in Pi created duplicate tool names, so Pi kept
+# redirecting mcp({tool:...}) calls to the native tool with a warning. The MCP
+# server stays installed for third-party clients (omp, opencode, Claude Code,
+# Kilo Code); wire it into Pi explicitly only if you really want it:
+#   teleg mcp --app pi --write
 MCP_CONFIG_FILE="$AGENT_DIR/mcp.json"
-echo ""
-echo "[3] Updating $MCP_CONFIG_FILE (teleg-bridge stdio MCP)..."
-
-# Merge ONLY the teleg-bridge entry; leave imports + all other servers intact.
-# Path is derived from $SCRIPT_DIR (portable across cloned/dev checkouts).
-TELEG_MCP_PATH="$SCRIPT_DIR/mcp-server/index.js" \
-MCP_CONFIG_FILE="$MCP_CONFIG_FILE" \
-python3 << 'PYEOF'
+if [[ -f "$MCP_CONFIG_FILE" ]]; then
+  echo ""
+  echo "[3] Ensuring $MCP_CONFIG_FILE has no teleg-bridge (native extension is authoritative)..."
+  MCP_CONFIG_FILE="$MCP_CONFIG_FILE" run_py <<'PYEOF'
 import json, os
-
-mcp_file = os.environ["MCP_CONFIG_FILE"]
-mcp_server = os.path.abspath(os.path.expandvars(os.environ["TELEG_MCP_PATH"]))
-
+path = os.environ["MCP_CONFIG_FILE"]
 try:
-    with open(mcp_file) as f:
-        mcp = json.load(f)
+    with open(path) as f:
+        m = json.load(f)
 except Exception:
-    mcp = {}
-
-if not isinstance(mcp, dict):
-    mcp = {}
-mcp.setdefault("mcpServers", {})
-
-# Set/replace only the teleg-bridge entry (dynamic, checkout-relative path).
-mcp["mcpServers"]["teleg-bridge"] = {
-    "command": "node",
-    "args": [mcp_server],
-}
-
-with open(mcp_file, "w") as f:
-    json.dump(mcp, f, indent=2)
-
-print(f"  teleg-bridge stdio MCP -> {mcp_server}")
+    m = {}
+if isinstance(m, dict):
+    servers = m.get("mcpServers")
+    if isinstance(servers, dict) and "teleg-bridge" in servers:
+        del servers["teleg-bridge"]
+        with open(path, "w") as f:
+            json.dump(m, f, indent=2)
+        print("  removed stale teleg-bridge entry")
+    else:
+        print("  no teleg-bridge entry (ok)")
 PYEOF
+fi
 
 echo ""
 echo "=== Deploy complete ==="
 echo ""
-echo "Restart pi — extension + MCP server load automatically."
-echo ""
 echo "Sessions:"
-echo "  - Extension polls Telegram, handles @sessionName routing"
-echo "  - MCP server (stdio) provides send_message/send_photo/send_video tools"
-echo "  - teleg-bridge MCP works standalone OR with the extension"
+echo "  - Native extension is the sole tool surface in Pi: polls, routes, drains queue, all 22 tools"
+echo "  - Standalone MCP (same toolset) is installed for OTHER apps: teleg mcp --app {claude|opencode|kilo|...}"
+echo "  - Both share ~/.pi/agent/teleg-bridge.{json,db}; the extension validates recorded config at startup"
+echo ""
+echo "Restart pi — the native extension loads automatically (MCP is not loaded in Pi)."
 echo ""
 echo "Start in watch mode: ./deploy.sh --watch"

@@ -28,6 +28,8 @@ temp/
 
 # pi-teleg specific
 teleg-bridge.json
+# Local project Telegram config — holds the live bot token, never commit
+.pi/teleg.json
 .teleg-*
 
 # SQLite database (runtime)

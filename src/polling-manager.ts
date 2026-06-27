@@ -364,7 +364,7 @@ export class PollingManager {
     };
   }
 
-  /** Walk reply_to_message_id chain in message_queue and return formatted context. */
+  /** Walk reply_to_message_id chain across incoming + bot outbound stores. */
   private resolveReplyChain(chatId: number, replyToMessageId: number | null): string {
     if (!replyToMessageId) return "";
     const parts: string[] = [];
@@ -372,12 +372,10 @@ export class PollingManager {
     const MAX_CHAIN = 10;
     let depth = 0;
     while (currentReplyTo && depth < MAX_CHAIN) {
-      const row = Db.getDb().prepare(
-        "SELECT message_id, from_username, text, reply_to_message_id FROM message_queue WHERE bot_id = ? AND chat_id = ? AND message_id = ?"
-      ).get(this.botId, chatId, currentReplyTo) as { message_id: number; from_username: string | null; text: string; reply_to_message_id: number | null } | undefined;
-      if (!row) break;
-      parts.unshift(`[${row.from_username || "User"}]: ${row.text}`);
-      currentReplyTo = row.reply_to_message_id;
+      const m = Db.lookupMessageForChain(this.botId, chatId, currentReplyTo);
+      if (!m) break;
+      parts.unshift(`[${m.author}]: ${m.text}`);
+      currentReplyTo = m.replyToMessageId;
       depth++;
     }
     return parts.length > 0 ? parts.join("\n") : "";

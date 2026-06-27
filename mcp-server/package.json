@@ -1,7 +1,7 @@
 {
   "name": "teleg-bridge-mcp",
-  "version": "1.0.0",
-  "description": "Telegram bridge MCP server - exposes send_message, send_photo, send_video, etc.",
+  "version": "2.0.0",
+  "description": "Telegram bridge MCP server (standalone, for third-party MCP clients). Same toolset as the Pi native extension: send_message/photo/video/document, queue + session + relay management.",
   "main": "index.js",
   "type": "module",
   "scripts": {

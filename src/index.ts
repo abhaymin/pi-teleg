@@ -38,6 +38,7 @@ import * as Db from "./db.js";
 import { reconcileSessions, getSessionLivenessSummary, evictSession, electPrimary } from "./session-registry.js";
 import {
   resolveBotContext,
+  resolveBotContextInteractive,
   resolveFromBotId,
   setDefaultBotId,
   listConfiguredBots,
@@ -306,7 +307,7 @@ async function callTelegram<TResponse>(
   }
 }
 
-async function sendReply(botToken: string, chatId: string, replyToMsgId: number, text: string): Promise<number | undefined> {
+async function sendReply(botToken: string, chatId: string, replyToMsgId: number, text: string, onSent?: (messageId: number, chunkText: string) => void): Promise<number | undefined> {
   const chunks: string[] = [];
   let current = "";
   const paragraphs = text.split(/\n\n+/);
@@ -333,6 +334,7 @@ async function sendReply(botToken: string, chatId: string, replyToMsgId: number,
           ...(replyToMsgId ? { reply_to_message_id: replyToMsgId } : {}),
         }, { timeout: 15000 });
         lastMessageId = sent.message_id;
+        onSent?.(sent.message_id, chunk);
         break;
       } catch (err) {
         if (attempt < MAX_RETRIES) {
@@ -353,14 +355,17 @@ async function sendFile(
   replyToMsgId: number,
   filePath: string,
   fileName: string,
-  isImage: boolean,
+  kind: "photo" | "video" | "document",
   caption?: string,
 ): Promise<boolean> {
   const { execFile } = await import("node:child_process");
-  const method = isImage ? "sendPhoto" : "sendDocument";
-  const fieldName = isImage ? "photo" : "document";
-  const ext = fileName.split(".").pop() || (isImage ? "jpeg" : "bin");
-  const mimeType = isImage ? `image/${ext}` : "application/octet-stream";
+  const method = kind === "photo" ? "sendPhoto" : kind === "video" ? "sendVideo" : "sendDocument";
+  const fieldName = kind === "photo" ? "photo" : kind === "video" ? "video" : "document";
+  const ext = fileName.split(".").pop() || (kind === "photo" ? "jpeg" : "bin");
+  const mimeType =
+    kind === "photo" ? `image/${ext}` :
+    kind === "video" ? `video/${ext}` :
+    "application/octet-stream";
   const MAX_RETRIES = 3;
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
@@ -402,13 +407,6 @@ async function verifyToken(token: string): Promise<TelegramUser | null> {
     if (data.ok && data.result) return data.result;
     return null;
   } catch { return null; }
-}
-async function selectBotForSession(projectDir: string): Promise<BotContext | undefined> {
-  try {
-    return await resolveBotContext(projectDir);
-  } catch {
-    return undefined;
-  }
 }
 
 // ============================================================================
@@ -496,6 +494,58 @@ export default function (pi: ExtensionAPI): void {
   function currentDbPath(): string {
     return state.botContext?.dbPath ?? join(homedir(), ".pi", "agent", "teleg-bridge.db");
   }
+
+  /**
+   * Validate the SAME recorded information the standalone MCP resolves from
+   * the same files (env > project .pi/teleg.json > global ~/.pi/agent/teleg-bridge.json).
+   * Cross-checks the recorded project config against the resolved bot context so
+   * the extension and the MCP always agree on bot token, bot id, db path, and the
+   * allowlist. Returns warnings/errors surfaced at session_start.
+   */
+  function validateRecordedConfig(): { ok: boolean; warnings: string[]; errors: string[] } {
+    const warnings: string[] = [];
+    const errors: string[] = [];
+    const botId = currentBotId();
+    const botToken = currentBotToken();
+
+    if (!botToken) {
+      errors.push("No bot token recorded. Run /teleg-setup or set TELEG_BOT_TOKEN.");
+    }
+
+    // Cross-check the recorded project config (.pi/teleg.json) vs resolved context.
+    try {
+      const projectCfgPath = join(cwd, ".pi", "teleg.json");
+      if (existsSync(projectCfgPath)) {
+        const recorded = JSON.parse(readFileSync(projectCfgPath, "utf8")) as Record<string, unknown>;
+        if (botId && recorded.botId && recorded.botId !== botId) {
+          warnings.push(`Project .pi/teleg.json records botId ${recorded.botId} but session resolved botId ${botId}.`);
+        }
+        if (botToken && recorded.botToken && recorded.botToken !== botToken) {
+          warnings.push("Project .pi/teleg.json records a bot token that differs from the resolved bot context.");
+        }
+        if (recorded.dbPath && state.botContext?.dbPath && recorded.dbPath !== state.botContext.dbPath) {
+          warnings.push(`Project .pi/teleg.json dbPath (${recorded.dbPath}) differs from resolved DB (${state.botContext.dbPath}).`);
+        }
+      }
+    } catch { /* best effort */ }
+
+    // DB path / parent directory accessibility.
+    const dbPath = currentDbPath();
+    try {
+      const dir = dirname(dbPath);
+      if (!existsSync(dir)) warnings.push(`DB directory ${dir} does not exist; it will be created on first use.`);
+    } catch (err) {
+      warnings.push(`DB path check failed: ${err instanceof Error ? err.message : err}`);
+    }
+
+    // Allowlist still open (pairing window).
+    if (currentAllowedUserIds().length === 0 && currentAllowedChatIds().length === 0) {
+      warnings.push("No allowed users/chats recorded yet. Send /start to the bot from Telegram to pair.");
+    }
+
+    return { ok: errors.length === 0, warnings, errors };
+  }
+
 
   function currentPollingManager(): import("./polling-manager.js").PollingManager | null {
     const botId = currentBotId();
@@ -1153,18 +1203,18 @@ export default function (pi: ExtensionAPI): void {
     const inline = message.reply_to_message;
     parts.unshift(`[${inline.from?.username || inline.from?.first_name || "User"}]: ${inline.text || inline.caption || ""}`);
 
-    // Walk deeper chain from DB if there's a further reply
+    // Walk deeper chain from DB (incoming + bot outbound) if there's a further reply.
+    // This resolves the bot's own earlier posts too, so a reply to a bot answer
+    // threads the full prior conversation back into context.
     if (botId && inline.reply_to_message) {
       let currentMsgId: number | undefined = inline.reply_to_message.message_id;
       const MAX_CHAIN = 10;
       let depth = 0;
       while (currentMsgId && depth < MAX_CHAIN) {
-        const row = Db.getDb().prepare(
-          "SELECT message_id, from_username, text, reply_to_message_id FROM message_queue WHERE bot_id = ? AND chat_id = ? AND message_id = ?"
-        ).get(botId, chatId, currentMsgId) as { message_id: number; from_username: string | null; text: string; reply_to_message_id: number | null } | undefined;
-        if (!row) break;
-        parts.unshift(`[${row.from_username || "User"}]: ${row.text}`);
-        currentMsgId = row.reply_to_message_id ?? undefined;
+        const m = Db.lookupMessageForChain(botId, chatId, currentMsgId);
+        if (!m) break;
+        parts.unshift(`[${m.author}]: ${m.text}`);
+        currentMsgId = m.replyToMessageId ?? undefined;
         depth++;
       }
     }
@@ -1773,7 +1823,7 @@ export default function (pi: ExtensionAPI): void {
       const stats = await stat(params.file_path);
       if (!stats.isFile()) throw new Error(`Not a file: ${params.file_path}`);
       const fileName = params.file_path.split("/").pop() || "photo.jpg";
-      const success = await sendFile(botToken, String(targetChatId), 0, params.file_path, fileName, true, params.caption);
+      const success = await sendFile(botToken, String(targetChatId), 0, params.file_path, fileName, "photo", params.caption);
       if (!success) throw new Error("Failed to send photo");
       return { content: [{ type: "text", text: "Photo sent" }], details: {} };
     },
@@ -1799,9 +1849,35 @@ export default function (pi: ExtensionAPI): void {
       const stats = await stat(params.file_path);
       if (!stats.isFile()) throw new Error(`Not a file: ${params.file_path}`);
       const fileName = params.file_path.split("/").pop() || "video.mp4";
-      const success = await sendFile(botToken, String(targetChatId), 0, params.file_path, fileName, false, params.caption);
+      const success = await sendFile(botToken, String(targetChatId), 0, params.file_path, fileName, "video", params.caption);
       if (!success) throw new Error("Failed to send video");
       return { content: [{ type: "text", text: "Video sent" }], details: {} };
+    },
+  });
+
+  pi.registerTool({
+    name: "teleg-send_document",
+    label: "Send Telegram Document",
+    description: "Send an arbitrary file as a document to Telegram chat",
+    parameters: Type.Object({
+      file_path: Type.String({ description: "Local file path to the document" }),
+      caption: Type.Optional(Type.String({ description: "Optional caption for the document" })),
+      chat_id: Type.Optional(Type.String({ description: "Target chat ID (optional)" })),
+    }),
+    async execute(_toolCallId, params) {
+      const targetChatId = params.chat_id
+        ? parseInt(params.chat_id)
+        : currentAllowedUserIds()[0];
+      const botToken = currentBotToken();
+      if (!targetChatId || !botToken) {
+        throw new Error("No chat ID available. Send /start to pair first.");
+      }
+      const stats = await stat(params.file_path);
+      if (!stats.isFile()) throw new Error(`Not a file: ${params.file_path}`);
+      const fileName = params.file_path.split("/").pop() || "file.bin";
+      const success = await sendFile(botToken, String(targetChatId), 0, params.file_path, fileName, "document", params.caption);
+      if (!success) throw new Error("Failed to send document");
+      return { content: [{ type: "text", text: "Document sent" }], details: {} };
     },
   });
 
@@ -2240,24 +2316,28 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => {
     try {
-      state.botContext = await selectBotForSession(cwd);
-      if (!state.botContext && cwd !== process.cwd()) {
-        state.botContext = await selectBotForSession(process.cwd());
+      // Intelligent bot resolution: LOCAL .pi/teleg.json → GLOBAL config → ask the user.
+      let resolution = await resolveBotContextInteractive(cwd);
+      if (resolution.source === "none" && cwd !== process.cwd()) {
+        const alt = await resolveBotContextInteractive(process.cwd());
+        if (alt.context) resolution = alt;
       }
+      if (resolution.reason) console.warn(`[teleg:${sessionName}] bot resolution: ${resolution.reason}`);
+      state.botContext = resolution.context;
 
-      // No preconfigured bot — try interactive setup if UI is available.
-
-      // No preconfigured bot — try interactive setup if UI is available.
-      // Important: only prompt when there is truly no project or global bot pin.
+      // Fallback: neither local nor global has a valid bot — ASK the user for the
+      // Telegram bot key via the Pi harness UI, verify it, and pin it to THIS
+      // folder's local .pi/teleg.json so future runs resolve locally first.
       if (!state.botContext && ctx.hasUI && !state.setupInProgress) {
         state.setupInProgress = true;
         try {
-          const token = await ctx.ui.input("No Telegram bot configured. Enter bot token to set up", "123456:ABCDEF...");
+          const token = await ctx.ui.input("No Telegram bot configured for this folder. Paste a bot token from @BotFather", "123456:ABCDEF...");
           if (token) {
             const botInfo = await verifyToken(token);
             if (botInfo) {
               await saveVerifiedBotConfig(token, botInfo);
               state.botContext = await resolveBotContext(cwd);
+              resolution = { context: state.botContext, source: "local" };
               ctx.ui.notify(`Teleg-bridge connected: @${botInfo.username}`, "info");
               ctx.ui.notify("Send /start to your bot in Telegram to pair.", "info");
             } else {
@@ -2267,6 +2347,10 @@ export default function (pi: ExtensionAPI): void {
         } finally {
           state.setupInProgress = false;
         }
+      }
+
+      if (state.botContext) {
+        console.log(`[teleg:${sessionName}] Bot @${state.botContext.botUsername} [id:${state.botContext.botId}] resolved from ${resolution.source.toUpperCase()} config.`);
       }
 
       if (!state.botContext) {
@@ -2303,6 +2387,14 @@ export default function (pi: ExtensionAPI): void {
 
     state.config = await readConfig();
     if (state.botContext) normalizeConfigFromBotContext(state.botContext);
+
+    // Validate the same recorded info the standalone MCP resolves, so the
+    // extension and the MCP never disagree about bot token/id, db path, or allowlist.
+    if (state.botContext) {
+      const v = validateRecordedConfig();
+      for (const w of v.warnings) console.warn(`[teleg:${sessionName}] config: ${w}`);
+      for (const e of v.errors) console.error(`[teleg:${sessionName}] config: ${e}`);
+    }
 
     const botId = currentBotId();
     const botToken = currentBotToken();
@@ -2433,15 +2525,43 @@ export default function (pi: ExtensionAPI): void {
       await handleAuthorizedTelegramMessage(message, ctx, dbId);
     });
 
-    // Wire up polling reaction handler
+    // Wire up polling reaction handler. Resolve the post the user reacted to
+    // (an incoming message OR the bot's own earlier reply) and, when idle,
+    // surface it back to the agent as a steer turn so the reaction — and the
+    // post it refers to — becomes part of the ongoing conversation.
     pm?.onReaction((update) => {
       if (!update.message_reaction) return;
       const reaction = update.message_reaction;
-      const userId = reaction.user?.id;
-      const emojis = reaction.new_reaction.map(r => r.emoji).join(", ");
-      if (!emojis) return;
-      // Surface reaction event as a log message — it does not create a turn but is visible
-      console.log(`[teleg:${sessionName}] Reaction on msg ${reaction.message_id} in chat ${reaction.chat.id}: ${emojis} by ${reaction.user?.username || userId || "unknown"}`);
+      const emojis = reaction.new_reaction.map(r => r.emoji).filter(Boolean).join(", ");
+      const reactor = reaction.user?.username || reaction.user?.first_name || reaction.user?.id || "someone";
+      if (!emojis) return; // reaction removed/cleared — nothing to surface
+      const reactionBotId = currentBotId();
+      let targetText = "";
+      let targetAuthor = "";
+      if (reactionBotId) {
+        const target = Db.lookupMessageForChain(reactionBotId, reaction.chat.id, reaction.message_id);
+        if (target) {
+          targetAuthor = target.author;
+          targetText = target.text;
+        }
+      }
+      console.log(`[teleg:${sessionName}] Reaction ${emojis} by ${reactor} on msg ${reaction.message_id} in chat ${reaction.chat.id}${targetText ? " (resolved)" : ""}`);
+      // Only steer when idle and the referenced post resolves; otherwise the
+      // reaction stays a log line and never interrupts an active turn.
+      if (!reactionBotId || state.activeTurn || !ctx.isIdle() || !targetText) return;
+      const reactionText = `${reactor} reacted ${emojis} to this earlier message from ${targetAuthor}:\n\n${targetText}`;
+      const turn: PendingTelegramTurn = {
+        sessionId,
+        sessionName,
+        chatId: reaction.chat.id,
+        replyToMessageId: reaction.message_id,
+        queuedAttachments: [],
+        incomingAttachments: [],
+        content: [{ type: "text", text: `${TELEGRAM_PREFIX} ${reactionText}` }],
+        historyText: reactionText,
+      };
+      activateTurn(turn as ActiveTelegramTurn);
+      pi.sendUserMessage(turn.content, { deliverAs: "steer" });
     });
 
     // Wire up polling poll-answer handler. A poll_answer has no chat/message id,
@@ -2718,11 +2838,28 @@ export default function (pi: ExtensionAPI): void {
       const response = assistantText || "(no response)";
       const taggedResponse = `[<b>${sessionName}</b>]\n${response}`;
       try {
-        await fetch(`https://api.telegram.org/bot${state.config.botToken}/sendMessage`, {
+        const res = await fetch(`https://api.telegram.org/bot${state.config.botToken}/sendMessage`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ chat_id: forward.chatId, text: taggedResponse, reply_to_message_id: forward.messageId, parse_mode: "HTML" }),
         });
+        const fwdBotId = currentBotId();
+        if (fwdBotId) {
+          try {
+            const data = await res.clone().json() as { ok?: boolean; result?: { message_id?: number } };
+            const fwdMsgId = data?.result?.message_id;
+            if (fwdMsgId) {
+              Db.recordOutboundMessage({
+                bot_id: fwdBotId,
+                chat_id: forward.chatId,
+                message_id: fwdMsgId,
+                reply_to_message_id: forward.messageId,
+                from_session: sessionName,
+                text: response,
+              });
+            }
+          } catch { /* best-effort record */ }
+        }
       } catch {
         console.error(`[teleg:${sessionName}] Failed to deliver relay response:`, forward);
       }
@@ -2743,14 +2880,27 @@ export default function (pi: ExtensionAPI): void {
       }
     } else if (turn && state.config.botToken) {
       if (assistantText) {
-        await sendReply(state.config.botToken, String(turn.chatId), turn.replyToMessageId, assistantText);
+        await sendReply(state.config.botToken, String(turn.chatId), turn.replyToMessageId, assistantText, (sentMsgId, chunkText) => {
+          const obBotId = currentBotId();
+          if (obBotId) {
+            Db.recordOutboundMessage({
+              bot_id: obBotId,
+              chat_id: turn.chatId,
+              message_id: sentMsgId,
+              reply_to_message_id: turn.replyToMessageId || null,
+              from_session: sessionName,
+              text: chunkText,
+            });
+          }
+        });
       } else if (turn.queuedAttachments.length > 0) {
         await sendReply(state.config.botToken, String(turn.chatId), turn.replyToMessageId, "Attached requested file(s).");
       }
       for (const attachment of turn.queuedAttachments) {
         const ext = attachment.fileName.split(".").pop()?.toLowerCase();
         const isImage = ["jpg", "jpeg", "png", "gif", "webp"].includes(ext || "");
-        await sendFile(state.config.botToken, String(turn.chatId), turn.replyToMessageId, attachment.path, attachment.fileName, isImage);
+        const kind: "photo" | "document" = isImage ? "photo" : "document";
+        await sendFile(state.config.botToken, String(turn.chatId), turn.replyToMessageId, attachment.path, attachment.fileName, kind);
       }
     }
 

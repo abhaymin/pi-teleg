@@ -99,7 +99,7 @@ interface TelegramGetMeResponse {
   error_code?: number;
 }
 
-async function getMeFromToken(token: string): Promise<{ botId: number; botUsername: string } | null> {
+export async function getMeFromToken(token: string): Promise<{ botId: number; botUsername: string } | null> {
   try {
     const res = await fetch(`https://api.telegram.org/bot${token}/getMe`);
     const data = (await res.json()) as TelegramGetMeResponse;
@@ -344,6 +344,84 @@ export async function resolveBotContext(projectDir: string): Promise<BotContext>
   }
 
   throw new Error("No valid bot configuration found. Set TELEG_BOT_TOKEN, TELEG_BOT_ID, or configure .pi/teleg.json");
+}
+
+export type BotResolutionSource = "env" | "local" | "global" | "none";
+
+export interface BotResolutionResult {
+  context?: BotContext;
+  source: BotResolutionSource;
+  /** Why resolution failed (set when source === "none"). */
+  reason?: string;
+}
+
+/**
+ * Intelligent, explicit bot resolution with a structured result so the caller
+ * can drive the Pi harness (e.g. prompt the user) when nothing resolves.
+ *
+ * Order:
+ *   1. TELEG_BOT_TOKEN / TELEG_BOT_ID env (explicit force-override)
+ *   2. LOCAL project `.pi/teleg.json` — botToken verified against the Telegram
+ *      API; an invalid local token FALLS THROUGH to global instead of throwing.
+ *      API-confirmed botId/botUsername are written back if the file drifted.
+ *   3. GLOBAL `~/.pi/agent/teleg-bridge.json` (defaultBotId)
+ *   4. none — caller should ask the user for a bot token.
+ *
+ * Never throws: failures are reported as { source: "none", reason }.
+ */
+export async function resolveBotContextInteractive(projectDir: string): Promise<BotResolutionResult> {
+  // 1a. Force-override via TELEG_BOT_TOKEN.
+  const envToken = process.env.TELEG_BOT_TOKEN;
+  if (envToken) {
+    try {
+      return { context: await resolveFromToken(envToken, projectDir, "env"), source: "env" };
+    } catch (err) {
+      return { source: "none", reason: `TELEG_BOT_TOKEN is set but invalid: ${err instanceof Error ? err.message : err}` };
+    }
+  }
+  // 1b. Force-select via TELEG_BOT_ID.
+  const envBotId = process.env.TELEG_BOT_ID;
+  if (envBotId) {
+    const botId = parseInt(envBotId, 10);
+    if (!isNaN(botId)) {
+      const context = await resolveFromBotId(botId, projectDir);
+      if (context) return { context, source: "env" };
+      return { source: "none", reason: `TELEG_BOT_ID ${botId} is not registered in global config` };
+    }
+    return { source: "none", reason: `TELEG_BOT_ID is not a valid number: ${envBotId}` };
+  }
+
+  const projectCfg = readProjectConfig(projectDir);
+
+  // 2. LOCAL first: a botToken in .pi/teleg.json, verified against the API.
+  const localToken = projectCfg.botToken?.trim();
+  if (localToken) {
+    const me = await getMeFromToken(localToken);
+    if (me) {
+      try {
+        let context = await resolveFromToken(localToken, projectDir, "project");
+        context = applyProjectConfig(context, projectCfg, projectDir);
+        // Honour the API as source of truth: correct drifted id/username locally.
+        if (projectCfg.botId !== me.botId || projectCfg.botUsername !== me.botUsername) {
+          await writeProjectConfig(projectDir, { botId: me.botId, botUsername: me.botUsername, botToken: localToken });
+        }
+        return { context, source: "local" };
+      } catch (err) {
+        return { source: "none", reason: `Local token verified by getMe but context build failed: ${err instanceof Error ? err.message : err}` };
+      }
+    }
+    // Local token present but rejected by the API → fall through to global.
+  }
+
+  // 3. GLOBAL config (default bot).
+  const globalCfg = await readGlobalConfig();
+  if (globalCfg?.defaultBotId) {
+    const context = await resolveFromBotId(globalCfg.defaultBotId, projectDir);
+    if (context) return { context: applyProjectConfig(context, projectCfg, projectDir), source: "global" };
+  }
+
+  // 4. Nothing resolved — caller asks the user.
+  return { source: "none", reason: "No valid bot in local .pi/teleg.json or global ~/.pi/agent/teleg-bridge.json" };
 }
 
 /**
