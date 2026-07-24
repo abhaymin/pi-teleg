@@ -134,7 +134,9 @@ function resolveBot(botIdArg) {
   }
   const token = process.env.TELEG_BOT_TOKEN || entry.botToken || cfg.botToken;
   if (!token) return null;
-  const chatId = entry.allowedUserIds?.[0] ?? cfg.allowedUserIds?.[0] ?? null;
+  const chatId = entry.allowedChatIds?.[0] ?? entry.allowedUserIds?.[0]
+    ?? cfg.allowedChatIds?.[0] ?? cfg.allowedUserIds?.[0]
+    ?? null;
   return {
     botId: id || entry.botId || cfg.botId || 0,
     botToken: token,
@@ -512,6 +514,100 @@ async function reconcileBot(botId) {
   return report;
 }
 
+/**
+ * Repair DEGRADED / stuck health for a bot: probe Telegram, recover stale queue
+ * rows, reconcile ghosts, and restart the poller when this process can own it.
+ */
+async function fixDegradedHealth(botId, { force = false } = {}) {
+  const token = botTokenFor(botId);
+  const steps = [];
+  const details = { bot_id: botId, force };
+  if (!botId || !token) {
+    return { ok: false, steps: ["No bot configured"], details: { ...details, error: "no_bot" } };
+  }
+
+  let apiOk = false;
+  try {
+    const bot = resolveBot(botId);
+    const me = await getMe(bot);
+    apiOk = !!me?.id;
+    steps.push(apiOk ? `Telegram API OK (@${me.username || me.first_name})` : "Telegram API getMe failed");
+    details.api = me || null;
+  } catch (err) {
+    steps.push(`Telegram API error: ${err?.message || err}`);
+  }
+  details.apiOk = apiOk;
+
+  let recovered = 0;
+  try {
+    if (typeof Db.recoverStaleMessages === "function") {
+      recovered = Db.recoverStaleMessages(60000, botId) || 0;
+    } else {
+      const db = openDb();
+      try {
+        const cutoff = Date.now() - 60000;
+        const r = db.prepare(
+          `UPDATE message_queue SET status='pending', started_at=NULL
+           WHERE bot_id=? AND status='processing' AND started_at IS NOT NULL AND started_at < ?`
+        ).run(botId, cutoff);
+        recovered = r.changes || 0;
+      } finally { db.close(); }
+    }
+  } catch (err) {
+    steps.push(`Stale recovery error: ${err?.message || err}`);
+  }
+  steps.push(recovered > 0 ? `Reset ${recovered} stale processing row(s)` : "No stale processing rows");
+  details.recoveredMessages = recovered;
+
+  let reconcile;
+  try {
+    reconcile = await reconcileBot(botId);
+    steps.push(
+      `Reconcile: checked=${reconcile.checkedSessions}, evicted=${reconcile.evictedSessions.length}, primary=${reconcile.newPrimary ?? "unchanged"}`,
+    );
+    details.reconcile = reconcile;
+  } catch (err) {
+    steps.push(`Reconcile error: ${err?.message || err}`);
+  }
+
+  let pollingAction = "none";
+  try {
+    const pm = getPollingManager(botId);
+    const before = pm.getState();
+    details.before = before;
+    const heldByOther = pm.isHeldByOther();
+    const degraded = !before.isHealthy || before.consecutiveErrors >= 3 || !pm.isActive();
+    if (heldByOther && !pm.isActive()) {
+      pollingAction = "skipped_lock_held";
+      steps.push("Polling lock held by another live session — skipped poller restart");
+      if (apiOk && typeof pm.resetHealthCounters === "function") pm.resetHealthCounters();
+    } else if (force || degraded || !apiOk) {
+      pm.setConfig(token, readLastUpdateId(botId));
+      const started = typeof pm.restart === "function"
+        ? await pm.restart(SESSION_NAME, DB_PATH)
+        : (await pm.stop(), await pm.start(SESSION_NAME, DB_PATH));
+      engineState.polling = !!started;
+      pollingAction = started ? "restarted" : "restart_failed";
+      steps.push(started ? "Poller restarted" : "Poller restart failed");
+    } else if (apiOk && typeof pm.resetHealthCounters === "function") {
+      pm.resetHealthCounters();
+      pollingAction = "counters_reset";
+      steps.push("Poller healthy — counters cleared");
+    }
+    details.after = pm.getState();
+    details.polling = pm.isActive();
+  } catch (err) {
+    pollingAction = "error";
+    steps.push(`Poller repair error: ${err?.message || err}`);
+  }
+  details.pollingAction = pollingAction;
+
+  const ok = apiOk && (details.polling === true || pollingAction === "skipped_lock_held" || details.after?.isHealthy !== false);
+  steps.push(ok ? "Health repair complete" : "Health still degraded — check token/network/lock");
+  details.ok = ok;
+  return { ok, steps, details };
+}
+
 // ─── MCP Engine: omp / standalone receive path ───────────────────────────────
 // The native Pi extension owns polling + turn injection (pi.sendUserMessage).
 // MCP clients (omp, opencode, Claude Code, …) have no Pi runtime, so this
@@ -569,15 +665,40 @@ function routeMessage(botId, _update, dbId) {
   try {
     const db = openDb();
     try {
-      const row = db.prepare("SELECT text FROM message_queue WHERE id = ?").get(dbId);
+      const row = db.prepare("SELECT text, chat_id, from_user_id FROM message_queue WHERE id = ?").get(dbId);
+      if (!row) return;
+      // 1) Explicit @sessionName
       const m = row?.text?.match(/^\s*@([A-Za-z0-9_.\-]+)\b/);
       if (m) {
         const target = m[1].toLowerCase();
         if (target !== SESSION_NAME && aliveSessionNames(botId).has(target)) {
           db.prepare("UPDATE message_queue SET session_id = ?, session_name = ? WHERE id = ? AND status = 'pending'")
             .run(`__session__:${target}`, target, dbId);
+          return;
         }
       }
+      // 2) Shared-bot instance links (chat/user ownership on relay_sessions)
+      try {
+        const sessions = Db.getAliveRelaySessions(botId) || [];
+        const candidates = sessions.map((s) => ({
+          sessionName: s.session_name,
+          linkedChatIds: Db.getRelayLinkedChatIds?.(s) || [],
+          linkedUserIds: Db.getRelayLinkedUserIds?.(s) || [],
+          capabilities: (() => { try { return JSON.parse(s.capabilities || "[]"); } catch { return []; } })(),
+          description: s.description || "",
+        }));
+        // Prefer unique chat/user owner without pulling in the full resolver if unused.
+        const chatOwners = candidates.filter((c) => c.linkedChatIds.includes(Number(row.chat_id)));
+        let target = chatOwners.length === 1 ? chatOwners[0].sessionName : null;
+        if (!target && row.from_user_id) {
+          const userOwners = candidates.filter((c) => c.linkedUserIds.includes(Number(row.from_user_id)));
+          if (userOwners.length === 1) target = userOwners[0].sessionName;
+        }
+        if (target && target !== SESSION_NAME && aliveSessionNames(botId).has(target)) {
+          db.prepare("UPDATE message_queue SET session_id = ?, session_name = ? WHERE id = ? AND status = 'pending'")
+            .run(`__session__:${target}`, target, dbId);
+        }
+      } catch { /* best effort */ }
     } finally { db.close(); }
   } catch { /* best effort */ }
 }
@@ -633,17 +754,50 @@ async function startEngine() {
   }
 }
 
+let degradedSinceMs = null;
+let lastAutoFixAtMs = 0;
+let autoFixInFlight = false;
+const AUTO_FIX_COOLDOWN_MS = 60_000;
+const AUTO_FIX_DEGRADED_FOR_MS = Number(process.env.TELEG_AUTO_FIX_DEGRADED_MS || 5 * 60_000);
+
 function heartbeat(botId) {
   try { Db.heartbeatRelaySession(botId, SESSION_NAME); } catch {}
   try { touchJsonRegistry(botId); } catch {}
   try {
     const pm = getPollingManager(botId);
-    if (!pm.isActive() && !pm.isHeldByOther()) {
-      pm.setConfig(botTokenFor(botId), readLastUpdateId(botId));
-      pm.start(SESSION_NAME, DB_PATH).then((ok) => { engineState.polling = ok; }).catch(() => {});
-    } else {
-      engineState.polling = pm.isActive();
+    const health = pm.getState?.() || { isHealthy: true, consecutiveErrors: 0 };
+    if (pm.isHeldByOther() && !pm.isActive()) {
+      engineState.polling = false;
+      degradedSinceMs = null;
+      return;
     }
+    const needsRepair = !pm.isActive() || !health.isHealthy || health.consecutiveErrors >= 3;
+    if (!needsRepair) {
+      degradedSinceMs = null;
+      engineState.polling = pm.isActive();
+      return;
+    }
+    if (degradedSinceMs == null) degradedSinceMs = Date.now();
+    const waited = Date.now() - degradedSinceMs;
+    if (waited < AUTO_FIX_DEGRADED_FOR_MS) {
+      engineState.polling = pm.isActive();
+      return;
+    }
+    if (autoFixInFlight || Date.now() - lastAutoFixAtMs < AUTO_FIX_COOLDOWN_MS) {
+      engineState.polling = pm.isActive();
+      return;
+    }
+    autoFixInFlight = true;
+    lastAutoFixAtMs = Date.now();
+    console.error(`[teleg-mcp:${SESSION_NAME}] auto-fix health after ${Math.round(waited / 1000)}s degraded`);
+    fixDegradedHealth(botId, { force: false }).then((r) => {
+      engineState.polling = !!r.details?.polling || getPollingManager(botId).isActive();
+      if (r.ok) degradedSinceMs = null;
+      else degradedSinceMs = Date.now();
+      if (!r.ok) console.error(`[teleg-mcp:${SESSION_NAME}] auto-fix health still degraded`);
+    }).catch((err) => {
+      console.error(`[teleg-mcp:${SESSION_NAME}] auto-fix health failed:`, err?.message || err);
+    }).finally(() => { autoFixInFlight = false; });
   } catch {}
 }
 
@@ -912,6 +1066,17 @@ const TOOL_DEFINITIONS = [
       type: "object",
       properties: {
         bot_id: { type: "number", description: "Bot ID to reconcile (optional; defaults to the configured default bot, or all bots if none configured)" },
+      },
+    },
+  },
+  {
+    name: "teleg-fix-health",
+    description: "Repair DEGRADED bridge health: Telegram getMe probe, reset stale processing rows, reconcile ghost sessions, and restart the poller when the lock is free. Pass force=true to always restart the poller.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        bot_id: { type: "number", description: "Bot ID (optional; defaults to configured default bot)" },
+        force: { type: "boolean", description: "Force poller restart even if currently healthy" },
       },
     },
   },
@@ -1290,6 +1455,13 @@ async function handleRequest(req) {
         }
         report = await reconcileBot(botId);
         sendResponse(id, report);
+        return;
+      }
+
+      if (name === "teleg-fix-health") {
+        const botId = args?.bot_id ? Number(args.bot_id) : (config.defaultBotId || config.botId || 0);
+        const result = await fixDegradedHealth(botId, { force: !!args?.force });
+        sendResponse(id, result);
         return;
       }
 

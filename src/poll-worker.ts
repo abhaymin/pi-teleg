@@ -372,29 +372,36 @@ async function ensureReplyParentMedia(parent: TelegramMessage, chatId: number): 
     parent.video || parent.animation || parent.document ||
     parent.audio || parent.voice || parent.sticker
   );
-  if (!hasInlineMedia) return;
+  const text = parent.text || parent.caption || "";
 
   let downloaded: QueuedAttachment[] = [];
-  try {
-    downloaded = await downloadMedia(parent);
-  } catch (e) {
-    console.error("[teleg-poll] reply-parent media download failed:", e instanceof Error ? e.message : e);
+  if (hasInlineMedia) {
+    try {
+      downloaded = await downloadMedia(parent);
+    } catch (e) {
+      console.error("[teleg-poll] reply-parent media download failed:", e instanceof Error ? e.message : e);
+    }
+    if (downloaded.length === 0) {
+      console.warn("[teleg-poll] reply-parent has media fields but download yielded 0 files (getFile/20MB?)");
+    }
+  } else if (text) {
+    console.warn("[teleg-poll] reply-parent has caption/text but no nested media fields — cannot recover image from reply_to alone");
+  } else {
     return;
   }
-  if (downloaded.length === 0) return;
 
-  const attachmentsJson = JSON.stringify(downloaded);
-  const text = parent.text || parent.caption || "";
+  const attachmentsJson = downloaded.length > 0 ? JSON.stringify(downloaded) : null;
+  // Always upsert at least caption so chain lookup works even when getFile fails.
   if (incoming) {
-    d.prepare("UPDATE message_queue SET attachments = ? WHERE id = ?").run(attachmentsJson, incoming.id);
+    if (attachmentsJson) {
+      d.prepare("UPDATE message_queue SET attachments = ? WHERE id = ?").run(attachmentsJson, incoming.id);
+    }
     if (!(incoming.text || "").trim() && text) {
       d.prepare("UPDATE message_queue SET text = ? WHERE id = ?").run(text, incoming.id);
     }
     return;
   }
 
-  // Parent was never queued (or purged). Insert a completed context row so
-  // lookupMessageForChain / drain turns can resolve the media + caption.
   try {
     d.prepare(`
       INSERT INTO message_queue (
@@ -413,9 +420,11 @@ async function ensureReplyParentMedia(parent: TelegramMessage, chatId: number): 
     );
   } catch (err) {
     if (err instanceof Error && err.message.includes("UNIQUE constraint failed")) {
-      d.prepare(
-        "UPDATE message_queue SET attachments = COALESCE(attachments, ?) WHERE bot_id = ? AND chat_id = ? AND message_id = ?"
-      ).run(attachmentsJson, botId, parentChatId, parent.message_id);
+      if (attachmentsJson) {
+        d.prepare(
+          "UPDATE message_queue SET attachments = COALESCE(attachments, ?) WHERE bot_id = ? AND chat_id = ? AND message_id = ?"
+        ).run(attachmentsJson, botId, parentChatId, parent.message_id);
+      }
     } else {
       console.error("[teleg-poll] reply-parent backfill failed:", err instanceof Error ? err.message : err);
     }

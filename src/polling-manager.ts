@@ -321,6 +321,26 @@ export class PollingManager {
     if (recovered > 0) this.pollState.lastHealthCheck = now();
     return recovered;
   }
+
+  /** Soft-clear DEGRADED counters after a successful probe (no worker restart). */
+  resetHealthCounters(): void {
+    this.pollState.consecutiveErrors = 0;
+    this.pollState.reconnectDelay = 1000;
+    this.pollState.isHealthy = true;
+    this.pollState.lastHealthCheck = now();
+  }
+
+  /**
+   * Stop then start the worker, resetting health state. Used to recover from
+   * DEGRADED poll health when the lock is free (or already held by us).
+   */
+  async restart(sessionName: string, dbPath: string): Promise<boolean> {
+    await this.stop();
+    this.resetHealthCounters();
+    this.pollState.lastSuccessfulPoll = now();
+    return this.start(sessionName, dbPath);
+  }
+
   private buildTurn(dbMsg: Db.QueuedMessage, sessionId: string, sessionName: string): TurnQueueItem {
     const replyChainText = Db.buildReplyChainText(this.botId, dbMsg.chat_id, dbMsg.reply_to_message_id);
     const replyAttachments = Db.collectReplyContextAttachments(this.botId, dbMsg.chat_id, dbMsg.reply_to_message_id);

@@ -159,6 +159,70 @@ function readProjectConfig(projectDir: string): ProjectConfig {
     return {};
   }
 }
+
+/** Exported for callers that need to inspect `.pi/teleg.json` without resolving. */
+export function loadProjectConfig(projectDir: string): ProjectConfig {
+  return readProjectConfig(projectDir);
+}
+
+/** Telegram bot tokens look like `<numericBotId>:<secret>`. */
+export function isUsableBotToken(token: string | undefined | null): boolean {
+  const t = token?.trim();
+  if (!t) return false;
+  return /^\d+:[A-Za-z0-9_-]+$/.test(t);
+}
+
+/**
+ * True when `.pi/teleg.json` already has enough to run without re-prompting:
+ * a usable bot token, and optionally user and/or chat allowlist entries.
+ */
+export function projectConfigIsComplete(cfg: ProjectConfig): boolean {
+  if (!isUsableBotToken(cfg.botToken)) return false;
+  const botId = cfg.botId && cfg.botId > 0
+    ? cfg.botId
+    : parseInt(String(cfg.botToken).split(":")[0], 10);
+  if (!botId || Number.isNaN(botId)) return false;
+  return true;
+}
+
+/** Prefer non-empty allowlists so an empty local `[]` does not wipe global IDs. */
+function preferIds(primary?: number[], fallback?: number[]): number[] {
+  if (Array.isArray(primary) && primary.length > 0) return primary;
+  if (Array.isArray(fallback) && fallback.length > 0) return fallback;
+  return Array.isArray(primary) ? primary : (fallback || []);
+}
+
+/**
+ * Build a BotContext from local `.pi/teleg.json` without calling Telegram.
+ * Used when getMe is unreachable but the file already has a valid token (+ ids).
+ */
+function offlineContextFromProject(projectCfg: ProjectConfig, projectDir: string): BotContext | null {
+  if (!projectConfigIsComplete(projectCfg)) return null;
+  const token = projectCfg.botToken!.trim();
+  const botIdFromToken = parseInt(token.split(":")[0], 10);
+  const botId = projectCfg.botId && projectCfg.botId > 0 ? projectCfg.botId : botIdFromToken;
+  if (!botId || Number.isNaN(botId)) return null;
+  if (projectCfg.botId && projectCfg.botId > 0 && projectCfg.botId !== botIdFromToken) {
+    // Token prefix and recorded botId disagree — do not soft-trust.
+    return null;
+  }
+
+  const globalCfg = readGlobalConfigSync();
+  const entry = globalCfg?.bots[String(botId)];
+  const base: BotEntry = entry
+    ? { ...entry, botToken: token, botUsername: projectCfg.botUsername || entry.botUsername }
+    : {
+        botToken: token,
+        botUsername: projectCfg.botUsername || "unknown",
+        botId,
+        allowedUserIds: projectCfg.allowedUserIds || [],
+        allowedChatIds: projectCfg.allowedChatIds || [],
+        lastUpdateId: projectCfg.lastUpdateId || 0,
+      };
+
+  return applyProjectConfig(buildBotContext(base, projectDir, false), projectCfg, projectDir);
+}
+
 export async function writeProjectConfig(projectDir: string, cfg: ProjectConfig): Promise<void> {
   const projectCfgDir = join(projectDir, ".pi");
   const projectCfgPath = join(projectCfgDir, "teleg.json");
@@ -183,8 +247,9 @@ function applyProjectConfig(context: BotContext, projectCfg: ProjectConfig, proj
   return {
     ...context,
     projectDir,
-    allowedUserIds: projectCfg.allowedUserIds ?? context.allowedUserIds,
-    allowedChatIds: projectCfg.allowedChatIds ?? context.allowedChatIds,
+    // Empty local `[]` must not wipe non-empty global/session allowlists.
+    allowedUserIds: preferIds(projectCfg.allowedUserIds, context.allowedUserIds),
+    allowedChatIds: preferIds(projectCfg.allowedChatIds, context.allowedChatIds),
     lastUpdateId: projectCfg.lastUpdateId ?? context.lastUpdateId,
     dbPath: projectCfg.dbPath ?? context.dbPath,
   };
@@ -301,11 +366,21 @@ export async function resolveBotContext(projectDir: string): Promise<BotContext>
 
   // 3. Project .pi/teleg.json pin for this folder
   if (projectCfg.botToken) {
-    const context = await resolveFromToken(projectCfg.botToken, projectDir, "project");
-    if (projectCfg.botId && context.botId !== projectCfg.botId) {
-      throw new Error(`Project config botId ${projectCfg.botId} does not match bot token ${context.botId}`);
+    try {
+      const context = await resolveFromToken(projectCfg.botToken, projectDir, "project");
+      if (projectCfg.botId && context.botId !== projectCfg.botId) {
+        throw new Error(`Project config botId ${projectCfg.botId} does not match bot token ${context.botId}`);
+      }
+      return applyProjectConfig(context, projectCfg, projectDir);
+    } catch (err) {
+      // Soft-trust complete local config when Telegram is unreachable.
+      const offline = offlineContextFromProject(projectCfg, projectDir);
+      if (offline) {
+        console.warn(`[config] Using offline .pi/teleg.json (${err instanceof Error ? err.message : err})`);
+        return offline;
+      }
+      throw err;
     }
-    return applyProjectConfig(context, projectCfg, projectDir);
   }
   if (projectCfg.botId && projectCfg.botId > 0) {
     const context = await resolveFromBotId(projectCfg.botId, projectDir);
@@ -393,9 +468,11 @@ export async function resolveBotContextInteractive(projectDir: string): Promise<
 
   const projectCfg = readProjectConfig(projectDir);
 
-  // 2. LOCAL first: a botToken in .pi/teleg.json, verified against the API.
+  // 2. LOCAL first: a botToken in .pi/teleg.json.
+  //    Prefer live getMe verification; if the API is unreachable, soft-trust a
+  //    complete local file so we never re-prompt for an already-valid config.
   const localToken = projectCfg.botToken?.trim();
-  if (localToken) {
+  if (localToken && isUsableBotToken(localToken)) {
     const me = await getMeFromToken(localToken);
     if (me) {
       try {
@@ -407,10 +484,29 @@ export async function resolveBotContextInteractive(projectDir: string): Promise<
         }
         return { context, source: "local" };
       } catch (err) {
-        return { source: "none", reason: `Local token verified by getMe but context build failed: ${err instanceof Error ? err.message : err}` };
+        // Fall through to offline trust / global before giving up.
+        console.warn(`[config] Local token verified but context build failed: ${err instanceof Error ? err.message : err}`);
       }
     }
-    // Local token present but rejected by the API → fall through to global.
+
+    const offline = offlineContextFromProject(projectCfg, projectDir);
+    if (offline) {
+      return {
+        context: offline,
+        source: "local",
+        reason: me
+          ? undefined
+          : "Telegram getMe unreachable; using cached .pi/teleg.json (token + ids)",
+      };
+    }
+  }
+
+  // 2b. Local pin by botId only (token lives in global).
+  if (projectCfg.botId && projectCfg.botId > 0) {
+    const context = await resolveFromBotId(projectCfg.botId, projectDir);
+    if (context) {
+      return { context: applyProjectConfig(context, projectCfg, projectDir), source: "local" };
+    }
   }
 
   // 3. GLOBAL config (default bot).
@@ -420,7 +516,13 @@ export async function resolveBotContextInteractive(projectDir: string): Promise<
     if (context) return { context: applyProjectConfig(context, projectCfg, projectDir), source: "global" };
   }
 
-  // 4. Nothing resolved — caller asks the user.
+  // 4. Nothing resolved — caller asks the user (only when local file is incomplete).
+  if (localToken && isUsableBotToken(localToken)) {
+    return {
+      source: "none",
+      reason: "Local .pi/teleg.json has a bot token but it could not be resolved (check botId / global registration)",
+    };
+  }
   return { source: "none", reason: "No valid bot in local .pi/teleg.json or global ~/.pi/agent/teleg-bridge.json" };
 }
 

@@ -46,6 +46,9 @@ import {
   detectSplitDb,
   updateAllowedUsers,
   writeProjectConfig,
+  loadProjectConfig,
+  projectConfigIsComplete,
+  isUsableBotToken,
   type BotContext,
   type ProjectConfig,
 } from "./config.js";
@@ -69,8 +72,15 @@ import {
   unregisterSessionCapabilities,
   cleanStaleCapabilities,
   matchMessageToCapability,
+  resolveInstanceForMessage,
+  mergeInstanceLinks,
 } from "./capabilities.js";
 import { getPollingManager, getAllPollingManagers, type PollState } from "./polling-manager.js";
+import {
+  downloadTelegramMedia,
+  messageHasMedia,
+  describeMediaTypes,
+} from "./telegram-media.js";
 
 // ============================================================================
 // Constants
@@ -254,6 +264,11 @@ Telegram bridge extension is active.
   keyword1, keyword2, ...
   ## description
   What this session does
+  ## linked_chats
+  123456789, -1001234567890
+  ## linked_users
+  987654321
+- linked_chats / linked_users (plus .pi/teleg.json allowedChatIds / allowedUserIds) bind Telegram channels to THIS instance when the same bot is shared across multiple Pi folders.
 - Other sessions with matching capabilities will get relevant messages relayed to them automatically.
 - Messages addressed to a specific session (e.g., "@sessionName ...") are routed directly.
 - If you receive a relayed message from Telegram, process the request and send results back using teleg-send_message, teleg-send_photo, teleg-send_video, or teleg-attach tools.
@@ -487,6 +502,24 @@ export default function (pi: ExtensionAPI): void {
     return state.botContext?.allowedChatIds || state.config.allowedChatIds || [];
   }
 
+  /**
+   * Default outbound chat for tools when chat_id is omitted.
+   * Prefer: explicit arg → active Telegram turn → allowed chats → allowed users.
+   * (Many setups only have allowedChatIds after group/channel pairing.)
+   */
+  function resolveOutboundChatId(explicit?: string | number | null): number | undefined {
+    if (explicit !== undefined && explicit !== null && String(explicit).trim() !== "") {
+      const n = typeof explicit === "number" ? explicit : parseInt(String(explicit), 10);
+      if (Number.isFinite(n)) return n;
+    }
+    if (state.activeTurn?.chatId) return state.activeTurn.chatId;
+    const chats = currentAllowedChatIds();
+    if (chats.length > 0) return chats[0];
+    const users = currentAllowedUserIds();
+    if (users.length > 0) return users[0];
+    return undefined;
+  }
+
   function getUpdateMessage(update: TelegramUpdate): TelegramMessage | undefined {
     return update.message || update.edited_message || update.channel_post || update.edited_channel_post;
   }
@@ -504,13 +537,73 @@ export default function (pi: ExtensionAPI): void {
     // closes permanently for this bot.
     const allowInitialPrivatePairing =
       currentAllowedUserIds().length === 0 &&
+      currentAllowedChatIds().length === 0 &&
       message.chat.type === "private" &&
       message.from && !message.from.is_bot &&
       (text === "/start" || text === "/help");
 
     if (allowInitialPrivatePairing) return true;
     if (message.from && !message.from.is_bot && isAllowedUser(state.config, message.from.id)) return true;
-    return isAllowedChat(state.config, message.chat.id);
+    if (isAllowedChat(state.config, message.chat.id)) return true;
+
+    // Shared-bot multi-instance: accept if ANY alive teleg instance on this bot
+    // has linked this chat/user (their .pi/teleg.json / INFO_REL), so the primary
+    // poller does not drop channels owned by another folder.
+    const botId = currentBotId();
+    if (botId && Db.isLinkedToAliveSession(botId, message.chat.id, message.from?.id)) {
+      return true;
+    }
+    return false;
+  }
+
+  /** Build live instance-link candidates for shared-bot routing. */
+  function liveInstanceLinkCandidates(botId: number): Array<{
+    sessionName: string;
+    linkedChatIds: number[];
+    linkedUserIds: number[];
+    capabilities: string[];
+    description: string;
+  }> {
+    return Db.getAliveRelaySessions(botId).map((s) => {
+      let capabilities: string[] = [];
+      try {
+        if (s.capabilities) capabilities = JSON.parse(s.capabilities) as string[];
+      } catch { /* ignore */ }
+      return {
+        sessionName: s.session_name,
+        linkedChatIds: Db.getRelayLinkedChatIds(s),
+        linkedUserIds: Db.getRelayLinkedUserIds(s),
+        capabilities,
+        description: s.description || "",
+      };
+    });
+  }
+
+  /**
+   * Honour bot→instance links: when the same bot serves multiple Pi folders /
+   * Telegram channels, assign the message to the linked instance (INFO_REL /
+   * teleg.json). Returns the handoff target, or null to continue locally.
+   */
+  function routeByInstanceLink(
+    message: TelegramMessage,
+    dbId: number | undefined,
+    cleanText: string,
+  ): { sessionName: string; reason: string } | null {
+    const botId = currentBotId();
+    if (!botId) return null;
+    const candidates = liveInstanceLinkCandidates(botId);
+    const resolved = resolveInstanceForMessage(
+      message.chat.id,
+      message.from?.id,
+      cleanText,
+      candidates,
+    );
+    if (!resolved) return null;
+    if (resolved.sessionName === sessionName) return null; // stay on local path
+    const alive = candidates.some((c) => c.sessionName === resolved.sessionName);
+    if (!alive) return null;
+    assignIncomingToSession(message, resolved.sessionName, dbId);
+    return resolved;
   }
 
   function currentDbPath(): string {
@@ -732,6 +825,15 @@ export default function (pi: ExtensionAPI): void {
     const botId = state.botContext?.botId;
     if (botId) {
       Db.heartbeatRelaySession(botId, sessionName);
+      // Keep instance links fresh (allowlist / INFO_REL edits without restart).
+      try {
+        const info = detectProjectCapabilities(cwd);
+        const links = mergeInstanceLinks(
+          { chatIds: currentAllowedChatIds(), userIds: currentAllowedUserIds() },
+          { linkedChatIds: info.linkedChatIds, linkedUserIds: info.linkedUserIds },
+        );
+        Db.updateRelayLinks(botId, sessionName, links.chatIds, links.userIds);
+      } catch { /* best effort */ }
     }
   }
 
@@ -820,6 +922,25 @@ export default function (pi: ExtensionAPI): void {
       }
       completeIncoming(dbId);
       return;
+    }
+
+    // Shared-bot multi-instance: honour chat/user links from each folder's
+    // .pi/teleg.json + INFO_REL before capability / sticky / local handling.
+    {
+      const handoff = routeByInstanceLink(message, dbId, cleanText);
+      if (handoff) {
+        const botId = currentBotId();
+        if (state.config.botToken && botId) {
+          const pending = Db.getPendingCountForSession(botId, handoff.sessionName);
+          await sendReply(
+            state.config.botToken,
+            String(message.chat.id),
+            message.message_id,
+            `📥 Queued for @${handoff.sessionName} (${handoff.reason}${pending > 0 ? `; ${pending} pending` : ""})`,
+          );
+        }
+        return;
+      }
     }
 
     if (!targetSessionName) {
@@ -960,9 +1081,9 @@ export default function (pi: ExtensionAPI): void {
     if (lower === "/help" || lower === "/start") {
       const botToken = currentBotToken();
       if (botToken) {
-        await sendReply(botToken, String(message.chat.id), message.message_id, `Teleg-Bridge Active! (this session: ${sessionName})\n\nSend any message to forward to pi.\nPrefix with @sessionName to route to a specific session.\nInclude Twitter/X URLs for automatic media download.\n\nCommands:\n/status - All sessions, relay state & queue\n/chatid - Show current chat/user IDs for group/channel setup\n/queue [session] - Queue for session (or primary)\n/teleg-dc - Disconnect THIS session\n/teleg-dc-all - Disconnect ALL sessions, DB unchanged\n/teleg-clean-db - Reset processing queue + purge old entries\n/teleg-remove-sessions - Remove dead session registry records\n/compact - Compact memory\n/health - Test connection\n/healthfull - Full health diagnostic\nstop - Abort current turn`);
+        await sendReply(botToken, String(message.chat.id), message.message_id, `Teleg-Bridge Active! (this session: ${sessionName})\n\nSend any message to forward to pi.\nPrefix with @sessionName to route to a specific session.\nInclude Twitter/X URLs for automatic media download.\n\nCommands:\n/status - All sessions, relay state & queue\n/chatid - Show current chat/user IDs for group/channel setup\n/queue [session] - Queue for session (or primary)\n/teleg-dc - Disconnect THIS session\n/teleg-dc-all - Disconnect ALL sessions, DB unchanged\n/teleg-clean-db - Reset processing queue + purge old entries\n/teleg-remove-sessions - Remove dead session registry records\n/compact - Compact memory\n/health - Test connection\n/healthfull - Full health diagnostic\n/teleg-fix-health - Repair DEGRADED health (API probe, stale queue, reconcile, poller restart)\nstop - Abort current turn`);
       }
-      if (currentAllowedUserIds().length === 0) {
+      if (currentAllowedUserIds().length === 0 && currentAllowedChatIds().length === 0) {
         const ids = [message.from!.id];
         const botId = currentBotId();
         state.config.allowedUserIds = ids;
@@ -1004,8 +1125,15 @@ export default function (pi: ExtensionAPI): void {
       const health = pm?.getState();
       const botToken = currentBotToken();
       if (botToken) {
-        await sendReply(botToken, String(message.chat.id), message.message_id,
-          health?.isHealthy !== false ? "✅ Bot connection OK" : "⚠️ Connection issues detected. Auto-reconnecting...");
+        const ok = health?.isHealthy !== false;
+        await sendReply(
+          botToken,
+          String(message.chat.id),
+          message.message_id,
+          ok
+            ? "✅ Bot connection OK"
+            : "⚠️ Connection issues detected (DEGRADED). Auto-reconnect running — send /teleg-fix-health to repair now.",
+        );
       }
       return;
     }
@@ -1015,14 +1143,28 @@ export default function (pi: ExtensionAPI): void {
       const health = pm?.getState();
       const botToken = currentBotToken();
       if (botToken && health) {
-        await sendReply(botToken, String(message.chat.id), message.message_id, [
+        const lines = [
           `last successful poll: ${new Date(health.lastSuccessfulPoll).toISOString()}`,
           `last health check: ${new Date(health.lastHealthCheck).toISOString()}`,
           `is healthy: ${health.isHealthy}`,
           `consecutive errors: ${health.consecutiveErrors}`,
           `reconnect delay: ${health.reconnectDelay}ms`,
-        ].join("\n"));
+          `polling: ${pm?.isActive() ? "running" : pm?.isHeldByOther() ? "shared" : "stopped"}`,
+        ];
+        if (!health.isHealthy) {
+          lines.push(``, `Send /teleg-fix-health to repair.`);
+        }
+        await sendReply(botToken, String(message.chat.id), message.message_id, lines.join("\n"));
       }
+      return;
+    }
+
+    if (lower === "/teleg-fix-health" || lower.startsWith("/teleg-fix-health ")) {
+      const botToken = currentBotToken();
+      if (!botToken) return;
+      const force = /\bforce\b/i.test(cleanText);
+      const result = await fixDegradedHealth({ forceRestart: force });
+      await sendReply(botToken, String(message.chat.id), message.message_id, result.lines.join("\n"));
       return;
     }
 
@@ -1184,6 +1326,9 @@ export default function (pi: ExtensionAPI): void {
       }
       return;
     }
+    // Recover reply-parent media before building the turn (DB cache or nested
+    // reply_to_message file_ids). Bot-sent collages often never hit message_queue.
+    const replyMedia = await recoverReplyParentMedia(message);
     // Build reply chain context (text + parent media paths) from DB / nested reply.
     const { text: replyChainText, attachments: replyAttachments } = buildReplyChain(message);
     // Incoming media is downloaded by the poll worker and persisted on the row;
@@ -1192,16 +1337,17 @@ export default function (pi: ExtensionAPI): void {
     const ownAttachments = readIncomingAttachments(dbId);
     const seenPaths = new Set<string>();
     const incomingAttachments: QueuedAttachment[] = [];
-    for (const a of [...ownAttachments, ...replyAttachments]) {
+    for (const a of [...ownAttachments, ...replyAttachments, ...replyMedia.attachments]) {
       if (seenPaths.has(a.path)) continue;
       seenPaths.add(a.path);
       incomingAttachments.push(a);
     }
     const mediaText = incomingAttachments.length > 0
       ? `📎 Available media (message + reply context):\n${incomingAttachments.map(a => `- ${a.path} (${a.fileName})`).join("\n")}`
-      : "";
+      : (replyMedia.hint ? `📎 Reply context: ${replyMedia.hint}` : "");
     const pollText = describePoll(message);
-    const bodyText = [replyChainText, mediaText, pollText, rawText || "(no text)"]
+    const chainText = replyChainText || replyMedia.chainText || "";
+    const bodyText = [chainText, mediaText, pollText, rawText || "(no text)"]
       .filter(Boolean)
       .join("\n");
     const turn: PendingTelegramTurn = {
@@ -1213,13 +1359,88 @@ export default function (pi: ExtensionAPI): void {
       incomingAttachments,
       content: [{ type: "text", text: `${TELEGRAM_PREFIX} ${bodyText}` }],
       historyText: bodyText,
-      replyChainText,
+      replyChainText: chainText,
       dbId,
     };
 
     activateTurn(turn as ActiveTelegramTurn);
     updateStatus(ctx);
     pi.sendUserMessage(turn.content);
+  }
+
+  /**
+   * If this message replies to another, ensure parent media is on disk + in DB.
+   * Covers bot-sent photos that were never recorded in outbound_messages.
+   */
+  async function recoverReplyParentMedia(message: TelegramMessage): Promise<{
+    attachments: QueuedAttachment[];
+    chainText: string;
+    hint: string;
+  }> {
+    const empty = { attachments: [] as QueuedAttachment[], chainText: "", hint: "" };
+    const parent = message.reply_to_message;
+    if (!parent) return empty;
+    const botId = currentBotId();
+    const botToken = currentBotToken();
+    if (!botId || !botToken) return empty;
+
+    const chatId = message.chat.id;
+    const existing = Db.collectReplyContextAttachments(botId, chatId, parent.message_id)
+      .filter((a) => existsSync(a.path))
+      .map((a) => ({ path: a.path, fileName: a.fileName }));
+    if (existing.length > 0) {
+      return {
+        attachments: existing,
+        chainText: Db.buildReplyChainText(botId, chatId, parent.message_id),
+        hint: "",
+      };
+    }
+
+    const caption = (parent.text || parent.caption || "").trim();
+    const author = parent.from?.username || parent.from?.first_name || "User";
+    const mediaTypes = describeMediaTypes(parent);
+    const hasMedia = messageHasMedia(parent);
+
+    let rich: Array<{ path: string; fileName: string; type: string }> = [];
+    if (hasMedia) {
+      try {
+        rich = await downloadTelegramMedia(botToken, botId, parent);
+      } catch (err) {
+        console.error("[teleg] reply-parent media recovery failed:", err instanceof Error ? err.message : err);
+      }
+    }
+
+    const hintText = caption || (mediaTypes.length ? `(${mediaTypes.join(", ")})` : "");
+    const note = !hasMedia
+      ? "parent has no media fields in Telegram reply_to payload (forward the image if the collage was bot-sent without nested photo)"
+      : (rich.length === 0
+        ? `parent had ${mediaTypes.join("/") || "media"} but getFile failed or file exceeded 20MB`
+        : "");
+
+    try {
+      Db.upsertReplyContextParent({
+        bot_id: botId,
+        chat_id: parent.chat?.id ?? chatId,
+        message_id: parent.message_id,
+        reply_to_message_id: parent.reply_to_message?.message_id ?? null,
+        from_user_id: parent.from?.id ?? 0,
+        from_username: parent.from?.username ?? null,
+        text: hintText,
+        attachments: rich.length > 0 ? JSON.stringify(rich) : null,
+      });
+    } catch (err) {
+      console.error("[teleg] reply-parent upsert failed:", err instanceof Error ? err.message : err);
+    }
+
+    if (note) console.warn(`[teleg] reply-parent recovery: ${note}`);
+
+    const chainText = Db.buildReplyChainText(botId, chatId, parent.message_id)
+      || `[${author}]: ${hintText || "(no text)"}`;
+    return {
+      attachments: rich.map((a) => ({ path: a.path, fileName: a.fileName })),
+      chainText,
+      hint: rich.length === 0 ? note : "",
+    };
   }
 
   /**
@@ -1235,6 +1456,7 @@ export default function (pi: ExtensionAPI): void {
     if (botId) {
       const chainText = Db.buildReplyChainText(botId, chatId, parentId);
       const attachments = Db.collectReplyContextAttachments(botId, chatId, parentId)
+        .filter((a) => existsSync(a.path))
         .map((a) => ({ path: a.path, fileName: a.fileName }));
       if (chainText || attachments.length > 0) {
         return { text: chainText, attachments };
@@ -1245,12 +1467,8 @@ export default function (pi: ExtensionAPI): void {
     const inline = message.reply_to_message;
     const inlineText = (inline.text || inline.caption || "").trim();
     const author = inline.from?.username || inline.from?.first_name || "User";
-    const hasMedia = !!(
-      (inline.photo && inline.photo.length > 0) ||
-      inline.video || inline.animation || inline.document ||
-      inline.audio || inline.voice || inline.sticker
-    );
-    const body = inlineText || (hasMedia ? "(media — not yet cached locally)" : "(no text)");
+    const mediaTypes = describeMediaTypes(inline);
+    const body = inlineText || (mediaTypes.length > 0 ? `(${mediaTypes.join(", ")} — recovering…)` : "(no text)");
     return { text: `[${author}]: ${body}`, attachments: [] };
   }
 
@@ -1288,7 +1506,7 @@ export default function (pi: ExtensionAPI): void {
       ``,
       `🤖 <b>Bot:</b> ${botInfo?.username ? `@${botInfo.username}` : state.config.botUsername || "not configured"}${botId ? ` [id:${botId}]` : ""}`,
       `📡 <b>Polling:</b> ${pollingStatus}${pollerInfo}`,
-      `💚 <b>Health:</b> ${pollState.isHealthy ? "OK" : `DEGRADED (${pollState.consecutiveErrors} errs)`}`,
+      `💚 <b>Health:</b> ${pollState.isHealthy ? "OK" : `DEGRADED (${pollState.consecutiveErrors} errs) — /teleg-fix-health`}`,
     ];
 
     if (allBots.length > 0) {
@@ -1604,6 +1822,184 @@ export default function (pi: ExtensionAPI): void {
     ctx.ui.notify(message, "info");
   }
 
+  /**
+   * Repair DEGRADED / stuck bridge health for the current bot:
+   * probe Telegram, recover stale queue rows, reconcile ghosts, restart poller if needed.
+   */
+  async function fixDegradedHealth(opts?: { forceRestart?: boolean }): Promise<{
+    ok: boolean;
+    lines: string[];
+    details: Record<string, unknown>;
+  }> {
+    const forceRestart = opts?.forceRestart === true;
+    const botId = currentBotId();
+    const token = currentBotToken();
+    const pm = currentPollingManager();
+    const lines: string[] = [`<b>🔧 Fix Health</b>`, ``];
+    const details: Record<string, unknown> = { botId: botId ?? null, forceRestart };
+
+    if (!botId || !token || !pm) {
+      lines.push("❌ No bot configured. Run /teleg-setup first.");
+      return { ok: false, lines, details: { ...details, error: "no_bot" } };
+    }
+
+    const before = pm.getState();
+    lines.push(
+      `<b>Before:</b> ${before.isHealthy ? "OK" : "DEGRADED"} | polling=${pm.isActive() ? "on" : "off"} | errs=${before.consecutiveErrors}`,
+    );
+
+    // 1) Telegram API probe
+    let apiOk = false;
+    try {
+      const me = await verifyToken(token);
+      apiOk = !!me;
+      lines.push(apiOk ? `✅ Telegram API: @${me!.username || me!.first_name}` : "❌ Telegram API: getMe failed");
+    } catch (err) {
+      lines.push(`❌ Telegram API: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    details.apiOk = apiOk;
+
+    // 2) Stale processing recovery
+    const recovered = await pm.recoverCrashState();
+    lines.push(recovered > 0 ? `♻️ Reset ${recovered} stale processing row(s)` : "♻️ No stale processing rows");
+    details.recoveredMessages = recovered;
+
+    // 3) Session reconcile (ghosts + primary)
+    let reconcileReport: Awaited<ReturnType<typeof reconcileSessions>> | null = null;
+    try {
+      reconcileReport = await reconcileSessions(botId);
+      const report = Array.isArray(reconcileReport) ? reconcileReport[0] : reconcileReport;
+      if (report) {
+        lines.push(
+          `🧹 Reconcile: checked=${report.checkedSessions}, evicted=${report.evictedSessions.length || 0}, primary=${report.newPrimary ?? "unchanged"}`,
+        );
+        details.reconcile = report;
+      }
+    } catch (err) {
+      lines.push(`⚠️ Reconcile failed: ${err instanceof Error ? err.message : String(err)}`);
+      details.reconcileError = String(err);
+    }
+
+    // 4) Poller restart / start when we can own the lock
+    let pollingAction = "none";
+    const heldByOther = pm.isHeldByOther();
+    const needsRestart =
+      forceRestart ||
+      !pm.isActive() ||
+      !before.isHealthy ||
+      before.consecutiveErrors > 0 ||
+      !apiOk;
+
+    if (heldByOther && !pm.isActive()) {
+      lines.push("ℹ️ Polling lock held by another live session — skipped poller restart");
+      pollingAction = "skipped_lock_held";
+      if (apiOk) pm.resetHealthCounters();
+    } else if (needsRestart) {
+      pm.setConfig(token, state.config.lastUpdateId ?? state.botContext?.lastUpdateId ?? 0);
+      try {
+        const started = await pm.restart(sessionName, currentDbPath());
+        Db.updateRelayRole(botId, sessionName, started ? "active" : "drain");
+        if (started) Db.setPrimary(botId, sessionName);
+        lines.push(started ? "🔄 Poller restarted" : "⚠️ Poller restart failed (lock unavailable?)");
+        pollingAction = started ? "restarted" : "restart_failed";
+      } catch (err) {
+        lines.push(`❌ Poller restart error: ${err instanceof Error ? err.message : String(err)}`);
+        pollingAction = "restart_error";
+      }
+    } else if (apiOk) {
+      pm.resetHealthCounters();
+      lines.push("✅ Poller already healthy — counters cleared");
+      pollingAction = "counters_reset";
+    }
+    details.pollingAction = pollingAction;
+
+    const after = pm.getState();
+    const ok = apiOk && after.isHealthy && (pm.isActive() || heldByOther);
+    lines.push(``);
+    lines.push(
+      `<b>After:</b> ${after.isHealthy ? "OK" : "DEGRADED"} | polling=${pm.isActive() ? "on" : heldByOther ? "shared" : "off"} | errs=${after.consecutiveErrors}`,
+    );
+    lines.push(ok ? "✅ Health repair complete" : "⚠️ Health still degraded — check token/network/lock");
+    details.after = after;
+    details.ok = ok;
+    return { ok, lines, details };
+  }
+
+  /** True when this Pi folder has not opted out via /teleg-disable. */
+  function isTelegEnabledHere(): boolean {
+    return !readDisabledSessions().includes(cwd);
+  }
+
+  let lastAutoFixAt = 0;
+  let autoFixInFlight = false;
+  /** When DEGRADED / stopped was first observed; cleared once healthy again. */
+  let degradedSince: number | null = null;
+  const AUTO_FIX_COOLDOWN_MS = 60_000;
+  /** Only auto-repair after health stays bad this long (manual /teleg-fix-health is immediate). */
+  const AUTO_FIX_DEGRADED_FOR_MS = parseInt(process.env.TELEG_AUTO_FIX_DEGRADED_MS || String(5 * 60_000), 10);
+
+  function healthNeedsRepair(): boolean {
+    const pm = currentPollingManager();
+    if (!pm || !currentBotToken()) return false;
+    if (!pm.isActive() && !pm.isHeldByOther()) return true;
+    const h = pm.getState();
+    return !h.isHealthy || h.consecutiveErrors >= 3;
+  }
+
+  /** Track continuous degradation window; reset when healthy. */
+  function sampleDegradedWindow(): void {
+    if (!healthNeedsRepair()) {
+      degradedSince = null;
+      return;
+    }
+    if (degradedSince == null) degradedSince = Date.now();
+  }
+
+  function degradedLongEnough(): boolean {
+    if (degradedSince == null) return false;
+    return Date.now() - degradedSince >= AUTO_FIX_DEGRADED_FOR_MS;
+  }
+
+  /**
+   * When teleg is enabled for this folder, auto-run /teleg-fix-health only after
+   * polling has been DEGRADED/stopped for an extended period (default 5m).
+   * Manual /teleg-fix-health is unchanged (immediate).
+   */
+  async function maybeAutoFixHealth(reason: string): Promise<void> {
+    if (!isTelegEnabledHere()) return;
+    if (autoFixInFlight) return;
+    sampleDegradedWindow();
+    if (!healthNeedsRepair()) return;
+    if (!degradedLongEnough()) {
+      const waited = degradedSince != null ? Math.round((Date.now() - degradedSince) / 1000) : 0;
+      if (reason === "periodic") {
+        console.log(
+          `[teleg:${sessionName}] Health degraded ${waited}s — auto-fix after ${Math.round(AUTO_FIX_DEGRADED_FOR_MS / 1000)}s`,
+        );
+      }
+      return;
+    }
+    const now = Date.now();
+    if (now - lastAutoFixAt < AUTO_FIX_COOLDOWN_MS) return;
+    autoFixInFlight = true;
+    lastAutoFixAt = now;
+    try {
+      const waitedSec = degradedSince != null ? Math.round((now - degradedSince) / 1000) : 0;
+      console.log(`[teleg:${sessionName}] Auto-fixing degraded health after ${waitedSec}s (${reason})...`);
+      const result = await fixDegradedHealth({ forceRestart: false });
+      const action = String(result.details.pollingAction ?? "?");
+      console.log(
+        `[teleg:${sessionName}] Auto-fix health: ${result.ok ? "OK" : "still degraded"} (action=${action})`,
+      );
+      if (result.ok) degradedSince = null;
+      else degradedSince = Date.now(); // restart the extended window after a failed attempt
+    } catch (err) {
+      console.error(`[teleg:${sessionName}] Auto-fix health failed:`, err);
+    } finally {
+      autoFixInFlight = false;
+    }
+  }
+
   // ─── Bot selection / activation ──────────────────────────────────────
 
   /**
@@ -1634,8 +2030,22 @@ export default function (pi: ExtensionAPI): void {
   async function promptForBot(
     ctx: ExtensionContext
   ): Promise<{ botId: number; botUsername: string } | "new" | null> {
+    // Prefer the bot already pinned in this folder's .pi/teleg.json — never
+    // re-ask which bot when the project file already names one.
+    const localCfg = loadProjectConfig(cwd);
+    if (localCfg.botId && localCfg.botId > 0 && isUsableBotToken(localCfg.botToken)) {
+      return {
+        botId: localCfg.botId,
+        botUsername: localCfg.botUsername || String(localCfg.botId),
+      };
+    }
+
     const bots = await listConfiguredBots();
     if (bots.length === 0) return null;
+    if (localCfg.botId && localCfg.botId > 0) {
+      const pinned = bots.find((b) => b.botId === localCfg.botId);
+      if (pinned) return pinned;
+    }
     if (bots.length === 1 || !ctx.hasUI) {
       // Single bot → use directly. Headless → can't show a selector, so prefer
       // the configured default bot (falling back to the first registered one).
@@ -1794,6 +2204,19 @@ export default function (pi: ExtensionAPI): void {
     },
   });
 
+  pi.registerCommand("teleg-fix-health", {
+    description: "Repair DEGRADED health: probe API, recover stale queue, reconcile sessions, restart poller",
+    handler: async (args, ctx) => {
+      if (!currentBotToken()) {
+        if (!(await ensureBotSelected(ctx))) return;
+      }
+      const forceRestart = /\bforce\b/i.test(args || "");
+      const result = await fixDegradedHealth({ forceRestart });
+      updateStatus(ctx);
+      ctx.ui.notify(result.lines.map((l) => l.replace(/<\/?b>/g, "")).join(" | "), result.ok ? "info" : "error");
+    },
+  });
+
   pi.registerCommand("teleg-disable", {
     description: "Disable teleg-bridge for this project (stays off across restarts until /teleg-enable)",
     handler: async (_args, ctx) => {
@@ -1817,10 +2240,13 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("teleg-enable", {
-    description: "Re-enable teleg-bridge for this project (activates on next session start)",
+    description: "Re-enable teleg-bridge for this project (activates on next session start; health auto-repairs while enabled)",
     handler: async (_args, ctx) => {
       setSessionDisabled(cwd, false);
-      ctx.ui.notify(`Teleg-bridge re-enabled for ${sessionName}. Restart this session to fully activate.`, "info");
+      ctx.ui.notify(
+        `Teleg-bridge re-enabled for ${sessionName}. Restart this session to activate — while enabled, DEGRADED health is repaired automatically.`,
+        "info",
+      );
     },
   });
 
@@ -1853,12 +2279,10 @@ export default function (pi: ExtensionAPI): void {
       chat_id: Type.Optional(Type.String({ description: "Target chat ID (optional)" })),
     }),
     async execute(_toolCallId, params) {
-      const targetChatId = params.chat_id
-        ? parseInt(params.chat_id)
-        : currentAllowedUserIds()[0];
+      const targetChatId = resolveOutboundChatId(params.chat_id);
       const botToken = currentBotToken();
       if (!targetChatId || !botToken) {
-        throw new Error("No chat ID available. Send /start to pair first.");
+        throw new Error("No chat ID available. Send /start to pair first, or pass chat_id.");
       }
       const result = await sendReply(botToken, String(targetChatId), 0, params.text);
       return { content: [{ type: "text", text: result ? `Sent message ${result}` : "Message sent" }], details: {} };
@@ -1875,12 +2299,10 @@ export default function (pi: ExtensionAPI): void {
       chat_id: Type.Optional(Type.String({ description: "Target chat ID (optional)" })),
     }),
     async execute(_toolCallId, params) {
-      const targetChatId = params.chat_id
-        ? parseInt(params.chat_id)
-        : currentAllowedUserIds()[0];
+      const targetChatId = resolveOutboundChatId(params.chat_id);
       const botToken = currentBotToken();
       if (!targetChatId || !botToken) {
-        throw new Error("No chat ID available. Send /start to pair first.");
+        throw new Error("No chat ID available. Send /start to pair first, or pass chat_id.");
       }
       const stats = await stat(params.file_path);
       if (!stats.isFile()) throw new Error(`Not a file: ${params.file_path}`);
@@ -1914,12 +2336,10 @@ export default function (pi: ExtensionAPI): void {
       chat_id: Type.Optional(Type.String({ description: "Target chat ID (optional)" })),
     }),
     async execute(_toolCallId, params) {
-      const targetChatId = params.chat_id
-        ? parseInt(params.chat_id)
-        : currentAllowedUserIds()[0];
+      const targetChatId = resolveOutboundChatId(params.chat_id);
       const botToken = currentBotToken();
       if (!targetChatId || !botToken) {
-        throw new Error("No chat ID available. Send /start to pair first.");
+        throw new Error("No chat ID available. Send /start to pair first, or pass chat_id.");
       }
       const stats = await stat(params.file_path);
       if (!stats.isFile()) throw new Error(`Not a file: ${params.file_path}`);
@@ -1953,12 +2373,10 @@ export default function (pi: ExtensionAPI): void {
       chat_id: Type.Optional(Type.String({ description: "Target chat ID (optional)" })),
     }),
     async execute(_toolCallId, params) {
-      const targetChatId = params.chat_id
-        ? parseInt(params.chat_id)
-        : currentAllowedUserIds()[0];
+      const targetChatId = resolveOutboundChatId(params.chat_id);
       const botToken = currentBotToken();
       if (!targetChatId || !botToken) {
-        throw new Error("No chat ID available. Send /start to pair first.");
+        throw new Error("No chat ID available. Send /start to pair first, or pass chat_id.");
       }
       const stats = await stat(params.file_path);
       if (!stats.isFile()) throw new Error(`Not a file: ${params.file_path}`);
@@ -2313,6 +2731,21 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
+    name: "teleg-fix-health",
+    label: "Fix Health",
+    description:
+      "Repair DEGRADED bridge health: Telegram getMe probe, reset stale processing rows, reconcile ghost sessions, and restart the poller when the lock is free. Pass force=true to always restart the poller.",
+    parameters: Type.Object({
+      force: Type.Optional(Type.Boolean({ description: "Force poller restart even if currently healthy" })),
+    }),
+    async execute(_toolCallId, params) {
+      const result = await fixDegradedHealth({ forceRestart: params.force === true });
+      const text = result.lines.map((l) => l.replace(/<\/?b>/g, "")).join("\n");
+      return { content: [{ type: "text", text }], details: result.details };
+    },
+  });
+
+  pi.registerTool({
     name: "teleg-list_sessions",
     label: "List Sessions",
     description: "List all relay sessions for a bot with liveness status.",
@@ -2432,27 +2865,39 @@ export default function (pi: ExtensionAPI): void {
       if (resolution.reason) console.warn(`[teleg:${sessionName}] bot resolution: ${resolution.reason}`);
       state.botContext = resolution.context;
 
-      // Fallback: neither local nor global has a valid bot — ASK the user for the
-      // Telegram bot key via the Pi harness UI, verify it, and pin it to THIS
-      // folder's local .pi/teleg.json so future runs resolve locally first.
+      // Fallback: neither local nor global has a usable bot — ASK only when
+      // `.pi/teleg.json` is missing/incomplete. A complete local file must never
+      // re-prompt for token / user / chat ids that are already recorded.
       if (!state.botContext && ctx.hasUI && !state.setupInProgress) {
-        state.setupInProgress = true;
-        try {
-          const token = await ctx.ui.input("No Telegram bot configured for this folder. Paste a bot token from @BotFather", "123456:ABCDEF...");
-          if (token) {
-            const botInfo = await verifyToken(token);
-            if (botInfo) {
-              await saveVerifiedBotConfig(token, botInfo);
-              state.botContext = await resolveBotContext(cwd);
-              resolution = { context: state.botContext, source: "local" };
-              ctx.ui.notify(`Teleg-bridge connected: @${botInfo.username}`, "info");
-              ctx.ui.notify("Send /start to your bot in Telegram to pair.", "info");
-            } else {
-              ctx.ui.notify("Invalid Telegram bot token", "error");
+        const localCfg = loadProjectConfig(cwd);
+        if (projectConfigIsComplete(localCfg)) {
+          console.error(
+            `[teleg:${sessionName}] .pi/teleg.json looks complete but resolution failed` +
+              `${resolution.reason ? `: ${resolution.reason}` : ""}. Not re-prompting.`,
+          );
+          ctx.ui.notify(
+            "Teleg local config present but could not activate. Check token/network — not asking again for existing values.",
+            "error",
+          );
+        } else {
+          state.setupInProgress = true;
+          try {
+            const token = await ctx.ui.input("No Telegram bot configured for this folder. Paste a bot token from @BotFather", "123456:ABCDEF...");
+            if (token) {
+              const botInfo = await verifyToken(token);
+              if (botInfo) {
+                await saveVerifiedBotConfig(token, botInfo);
+                state.botContext = await resolveBotContext(cwd);
+                resolution = { context: state.botContext, source: "local" };
+                ctx.ui.notify(`Teleg-bridge connected: @${botInfo.username}`, "info");
+                ctx.ui.notify("Send /start to your bot in Telegram to pair.", "info");
+              } else {
+                ctx.ui.notify("Invalid Telegram bot token", "error");
+              }
             }
+          } finally {
+            state.setupInProgress = false;
           }
-        } finally {
-          state.setupInProgress = false;
         }
       }
 
@@ -2533,7 +2978,7 @@ export default function (pi: ExtensionAPI): void {
     const registry1 = await readSessionRegistry();
     const sessInfo = registry1.sessions.find(s => s.sessionId === sessionId);
     if (sessInfo && !sessInfo.announcedPresence) {
-      const chatId = currentAllowedUserIds()[0];
+      const chatId = resolveOutboundChatId();
       const announceToken = currentBotToken();
       if (chatId && announceToken && botId) {
         try {
@@ -2551,14 +2996,11 @@ export default function (pi: ExtensionAPI): void {
 
     // Register session capabilities
     await cleanStaleCapabilities();
-    const { capabilities: detectedCaps, description: detectedDesc } = detectProjectCapabilities(cwd);
+    const { capabilities: detectedCaps, description: detectedDesc, linkedChatIds: infoRelChats, linkedUserIds: infoRelUsers } =
+      detectProjectCapabilities(cwd);
     await registerSessionCapabilities(sessionId, sessionName, process.pid, cwd, botId).catch(
       (err: unknown) => console.error(`[teleg:${sessionName}] Failed to register capabilities:`, err)
     );
-    // Also store capabilities in SQLite relay_sessions for cross-session routing
-    if (botId && detectedCaps.length > 0) {
-      Db.updateRelayCapabilities(botId, sessionName, JSON.stringify(detectedCaps), detectedDesc || "");
-    }
 
     // Start relay server
     const relayInfo = await startRelayServer(sessionName, 9798, botId);
@@ -2566,6 +3008,21 @@ export default function (pi: ExtensionAPI): void {
     // Register in SQLite relay_sessions table with actual port and secret
     if (botId) {
       Db.registerRelaySession({ bot_id: botId, session_name: sessionName, session_id: sessionId, pid: process.pid, port: relayInfo.port, secret: relayInfo.secret });
+      // Publish chat/user ownership AFTER the relay row exists so the shared-bot
+      // poller/queue can route each channel to the correct teleg instance.
+      const links = mergeInstanceLinks(
+        { chatIds: currentAllowedChatIds(), userIds: currentAllowedUserIds() },
+        { linkedChatIds: infoRelChats, linkedUserIds: infoRelUsers },
+      );
+      Db.updateRelayLinks(botId, sessionName, links.chatIds, links.userIds);
+      if (links.chatIds.length || links.userIds.length) {
+        console.log(
+          `[teleg:${sessionName}] Instance links: chats=[${links.chatIds.join(",")}] users=[${links.userIds.join(",")}]`,
+        );
+      }
+      if (detectedCaps.length > 0) {
+        Db.updateRelayCapabilities(botId, sessionName, JSON.stringify(detectedCaps), detectedDesc || "");
+      }
     }
 
     setCommandHandler(async (text, meta) => {
@@ -2617,6 +3074,14 @@ export default function (pi: ExtensionAPI): void {
       const pollingStarted = await pm.start(sessionName, currentDbPath());
       Db.updateRelayRole(botId, sessionName, pollingStarted ? "active" : "drain");
       if (pollingStarted) Db.setPrimary(botId, sessionName);
+      // Track degradation; auto-fix only after an extended unhealthy window (see maybeAutoFixHealth).
+      pm.onHealth((h) => {
+        if (!h.isHealthy || h.consecutiveErrors >= 3) {
+          sampleDegradedWindow();
+        } else {
+          degradedSince = null;
+        }
+      });
     }
 
     // Wire up polling message handler
@@ -2727,38 +3192,32 @@ export default function (pi: ExtensionAPI): void {
       }
     });
 
-    // Periodic tasks: heartbeat, reconcile, polling restart
+    // Periodic tasks: heartbeat, reconcile, and auto health repair (enabled folders only)
     setInterval(async () => {
+      if (!isTelegEnabledHere()) return;
       await heartbeatSession();
       if (botId) {
         await reconcileSessions(botId).catch((err) => console.error(`[teleg:${sessionName}] Reconcile failed:`, err));
       }
-      if (!botId) return;
-      const pm2 = getPollingManager(botId);
-      if (!pm2.isActive() && currentBotToken()) {
-        if (!pm2.isHeldByOther()) {
-
-          const restarted = await pm2.start(sessionName, currentDbPath()).catch((err) => {
-            console.error(`[teleg:${sessionName}] Auto-restart failed:`, err);
-            return false;
-          });
-          Db.updateRelayRole(botId, sessionName, restarted ? "active" : "drain");
-          if (restarted) Db.setPrimary(botId, sessionName);
-        }
-      }
+      await maybeAutoFixHealth("periodic");
     }, 30000);
 
     // Phase 6: Active idle drain timer
     // Each session independently polls for:
     //   1. Messages explicitly tagged for this session (session_name match)
-    //   2. Unassigned messages that match this session's capabilities
-    //   3. Any remaining unassigned messages (cross-session help)
+    //   2. Unassigned messages linked to this instance (shared-bot chat/user ownership)
+    //   3. Unassigned messages that match this session's capabilities
+    //   4. Any remaining unassigned messages (cross-session help) — never steal other-linked
     state.drainTimer = setInterval(async () => {
       if (state.activeTurn) return;
       if (!botId) return;
       try {
         const defaultBotId = await getDefaultBotId();
         const isDefaultBot = defaultBotId === botId;
+        const myLinks = mergeInstanceLinks(
+          { chatIds: currentAllowedChatIds(), userIds: currentAllowedUserIds() },
+          { linkedChatIds: infoRelChats, linkedUserIds: infoRelUsers },
+        );
 
         if (detectedCaps.length > 0) {
           const pubsubMsgs = Db.subscribe(botId, sessionName, detectedCaps);
@@ -2786,6 +3245,32 @@ export default function (pi: ExtensionAPI): void {
           return;
         }
 
+        // Prefer unassigned rows whose chat/user is linked to THIS instance.
+        const linkedMsg = Db.claimNextLinkedUnassigned(
+          botId,
+          sessionId,
+          sessionName,
+          myLinks.chatIds,
+          myLinks.userIds,
+        );
+        if (linkedMsg) {
+          const text = linkedMsg.text || "";
+          const turn: PendingTelegramTurn = {
+            sessionId,
+            sessionName,
+            chatId: linkedMsg.chat_id,
+            replyToMessageId: linkedMsg.message_id,
+            queuedAttachments: [],
+            incomingAttachments: [],
+            content: [{ type: "text", text: `[telegram] ${text}` }],
+            historyText: text,
+            dbId: linkedMsg.id,
+          };
+          activateTurn(turn as ActiveTelegramTurn);
+          pi.sendUserMessage(turn.content, { deliverAs: "steer" });
+          return;
+        }
+
         const capReg = await readCapabilitiesRegistry();
         const myCaps = capReg.entries.find(e => e.sessionId === sessionId);
         if (myCaps && myCaps.capabilities.length > 0) {
@@ -2793,6 +3278,10 @@ export default function (pi: ExtensionAPI): void {
             "SELECT * FROM message_queue WHERE bot_id = ? AND status = 'pending' AND (session_name = 'unknown' OR session_name IS NULL) ORDER BY id ASC LIMIT 25"
           ).all(botId) as unknown as Db.QueuedMessage[];
           for (const unassigned of unassignedRows) {
+            // Never steal a channel owned by another alive instance.
+            if (Db.isUnassignedOwnedByOtherAliveSession(botId, unassigned.chat_id, unassigned.from_user_id, sessionName)) {
+              continue;
+            }
             const text = unassigned.text || "";
             const match = matchMessageToCapability(text, [myCaps]);
             if (match) {
@@ -2815,6 +3304,37 @@ export default function (pi: ExtensionAPI): void {
               pi.sendUserMessage(turn.content, { deliverAs: "steer" });
               return;
             }
+          }
+        }
+
+        // Primary catch-all for remaining orphans — skip other instances' linked chats.
+        if (isDefaultBot || Db.getPrimarySession(botId)?.session_name === sessionName) {
+          const orphan = Db.getDb().prepare(
+            "SELECT * FROM message_queue WHERE bot_id = ? AND status = 'pending' AND (session_name = 'unknown' OR session_name IS NULL) ORDER BY id ASC LIMIT 10"
+          ).all(botId) as unknown as Db.QueuedMessage[];
+          for (const row of orphan) {
+            if (Db.isUnassignedOwnedByOtherAliveSession(botId, row.chat_id, row.from_user_id, sessionName)) {
+              continue;
+            }
+            const claimed = Db.getDb().prepare(
+              "UPDATE message_queue SET status = 'processing', session_id = ?, session_name = ?, started_at = ? WHERE id = ? AND status = 'pending'"
+            ).run(sessionId, sessionName, Date.now(), row.id).changes;
+            if (claimed === 0) continue;
+            const text = row.text || "";
+            const turn: PendingTelegramTurn = {
+              sessionId,
+              sessionName,
+              chatId: row.chat_id,
+              replyToMessageId: row.message_id,
+              queuedAttachments: [],
+              incomingAttachments: [],
+              content: [{ type: "text", text: `[telegram] ${text}` }],
+              historyText: text,
+              dbId: row.id,
+            };
+            activateTurn(turn as ActiveTelegramTurn);
+            pi.sendUserMessage(turn.content, { deliverAs: "steer" });
+            return;
           }
         }
 
@@ -2881,7 +3401,7 @@ export default function (pi: ExtensionAPI): void {
     const registry2 = await readSessionRegistry();
     const dying = registry2.sessions.find(s => s.sessionId === sessionId);
     if (dying && dying.announcedPresence) {
-      const chatId = currentAllowedUserIds()[0];
+      const chatId = resolveOutboundChatId();
       const botToken = currentBotToken();
       if (chatId && botToken) {
         try {

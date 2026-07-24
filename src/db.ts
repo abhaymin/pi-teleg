@@ -23,7 +23,7 @@ import { readGlobalConfigSync } from "./config.js";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // Schema version for migrations
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 
 // DB path: env override → shared default
 const DEFAULT_DB_PATH = join(process.env.HOME || "~", ".pi", "agent", "teleg-bridge.db");
@@ -69,6 +69,8 @@ export interface RelaySession {
   project_dir: string | null;
   capabilities: string | null; // JSON array
   description: string | null;
+  linked_chat_ids: string | null; // JSON number[] — chats this instance owns
+  linked_user_ids: string | null; // JSON number[] — DM users this instance owns
   role: "active" | "drain";
   is_primary: boolean; // True if this session holds the polling lock for this bot
   registered_at: number;
@@ -132,6 +134,7 @@ function runMigrations(database: DatabaseSync): void {
     // Already up to date, just ensure tables exist and repair legacy constraints.
     initSchema(database);
     repairLegacyRelaySessionsSchema(database);
+    ensureRelayLinkColumns(database);
     return;
   }
 
@@ -155,8 +158,14 @@ function runMigrations(database: DatabaseSync): void {
     migrateToV6(database);
   }
 
+  // Migration from v6 to v7: per-session chat/user links for shared-bot multi-instance routing
+  if (currentVersion < 7) {
+    migrateToV7(database);
+  }
+
   initSchema(database);
   repairLegacyRelaySessionsSchema(database);
+  ensureRelayLinkColumns(database);
 
   // Set the final version
   database.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
@@ -298,6 +307,25 @@ function migrateToV6(database: DatabaseSync): void {
   }
 }
 
+/** v7: chat/user allowlists per relay session for shared-bot multi-instance routing. */
+function migrateToV7(database: DatabaseSync): void {
+  ensureRelayLinkColumns(database);
+}
+
+function ensureRelayLinkColumns(database: DatabaseSync): void {
+  const tableExists = (database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='relay_sessions'").get() as { name: string } | undefined) != null;
+  if (!tableExists) return;
+  for (const col of ["linked_chat_ids", "linked_user_ids"] as const) {
+    try {
+      database.exec(`ALTER TABLE relay_sessions ADD COLUMN ${col} TEXT`);
+    } catch (err) {
+      if (!(err instanceof Error && (err.message.includes("duplicate column") || err.message.includes("no such table")))) {
+        console.error(`[db] Error adding ${col} to relay_sessions:`, err);
+      }
+    }
+  }
+}
+
 function repairLegacyRelaySessionsSchema(database: DatabaseSync): void {
   const row = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'relay_sessions'").get() as { sql?: string } | undefined;
   const createSql = row?.sql ?? "";
@@ -323,13 +351,15 @@ function repairLegacyRelaySessionsSchema(database: DatabaseSync): void {
       description       TEXT,
       role              TEXT NOT NULL DEFAULT 'drain' CHECK (role IN ('active', 'drain')),
       is_primary        INTEGER NOT NULL DEFAULT 0,
+      linked_chat_ids   TEXT,
+      linked_user_ids   TEXT,
       registered_at     INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000),
       last_heartbeat    INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000)
     );
-    INSERT OR IGNORE INTO relay_sessions (id, bot_id, session_name, session_id, pid, port, secret, project_dir, capabilities, description, role, is_primary, registered_at, last_heartbeat)
+    INSERT OR IGNORE INTO relay_sessions (id, bot_id, session_name, session_id, pid, port, secret, project_dir, capabilities, description, role, is_primary, linked_chat_ids, linked_user_ids, registered_at, last_heartbeat)
       SELECT id, bot_id, session_name, session_id, pid, port, secret, project_dir, capabilities, description,
         CASE role WHEN 'passive' THEN 'drain' ELSE role END,
-        is_primary, registered_at, last_heartbeat
+        is_primary, NULL, NULL, registered_at, last_heartbeat
       FROM (
         SELECT *, ROW_NUMBER() OVER (PARTITION BY bot_id, session_name ORDER BY last_heartbeat DESC, id DESC) AS relay_row_number
         FROM ${oldTable}
@@ -411,6 +441,8 @@ function initSchema(database: DatabaseSync): void {
       description       TEXT,
       role              TEXT NOT NULL DEFAULT 'drain' CHECK (role IN ('active', 'drain')),
       is_primary        INTEGER NOT NULL DEFAULT 0,
+      linked_chat_ids   TEXT,
+      linked_user_ids   TEXT,
       registered_at     INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000),
       last_heartbeat    INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000)
     );
@@ -705,6 +737,65 @@ export function buildReplyChainText(
     depth++;
   }
   return parts.join("\n");
+}
+
+/**
+ * Upsert a completed reply-context row for a parent Telegram message so chain
+ * lookup can find caption + local media paths. Used when the parent was never
+ * queued (e.g. bot-sent photo before outbound recording) or needs a media refresh.
+ */
+export function upsertReplyContextParent(params: {
+  bot_id: number;
+  chat_id: number;
+  message_id: number;
+  reply_to_message_id?: number | null;
+  from_user_id?: number;
+  from_username?: string | null;
+  text: string;
+  attachments?: string | null;
+}): void {
+  const d = getDb();
+  const existing = d.prepare(
+    "SELECT id, attachments, text FROM message_queue WHERE bot_id = ? AND chat_id = ? AND message_id = ?"
+  ).get(params.bot_id, params.chat_id, params.message_id) as { id: number; attachments: string | null; text: string } | undefined;
+
+  if (existing) {
+    if (params.attachments) {
+      d.prepare("UPDATE message_queue SET attachments = ? WHERE id = ?").run(params.attachments, existing.id);
+    }
+    if (params.text && !(existing.text || "").trim()) {
+      d.prepare("UPDATE message_queue SET text = ? WHERE id = ?").run(params.text, existing.id);
+    }
+    return;
+  }
+
+  try {
+    d.prepare(`
+      INSERT INTO message_queue (
+        bot_id, chat_id, message_id, reply_to_message_id, from_user_id, from_username,
+        text, session_id, session_name, status, source, attachments
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'reply-context', '_reply_context', 'completed', 'telegram', ?)
+    `).run(
+      params.bot_id,
+      params.chat_id,
+      params.message_id,
+      params.reply_to_message_id ?? null,
+      params.from_user_id ?? 0,
+      params.from_username ?? null,
+      params.text || "",
+      params.attachments ?? null,
+    );
+  } catch (err) {
+    if (err instanceof Error && err.message.includes("UNIQUE constraint failed")) {
+      if (params.attachments) {
+        d.prepare(
+          "UPDATE message_queue SET attachments = COALESCE(attachments, ?) WHERE bot_id = ? AND chat_id = ? AND message_id = ?"
+        ).run(params.attachments, params.bot_id, params.chat_id, params.message_id);
+      }
+      return;
+    }
+    throw err;
+  }
 }
 
 /**
@@ -1255,6 +1346,124 @@ export function updateRelayCapabilities(botId: number, sessionName: string, capa
   getDb().prepare(`
     UPDATE relay_sessions SET capabilities = ?, description = ? WHERE bot_id = ? AND session_name = ?
   `).run(capabilities, description, botId, sessionName);
+}
+
+function parseIdListJson(raw: string | null | undefined): number[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map((n) => Number(n)).filter((n) => Number.isFinite(n));
+  } catch {
+    return [];
+  }
+}
+
+/** Persist which Telegram chats/users this teleg instance owns (shared-bot multi-instance). */
+export function updateRelayLinks(
+  botId: number,
+  sessionName: string,
+  chatIds: number[],
+  userIds: number[],
+): void {
+  getDb().prepare(`
+    UPDATE relay_sessions SET linked_chat_ids = ?, linked_user_ids = ? WHERE bot_id = ? AND session_name = ?
+  `).run(JSON.stringify(chatIds || []), JSON.stringify(userIds || []), botId, sessionName);
+}
+
+export function getRelayLinkedChatIds(session: Pick<RelaySession, "linked_chat_ids">): number[] {
+  return parseIdListJson(session.linked_chat_ids);
+}
+
+export function getRelayLinkedUserIds(session: Pick<RelaySession, "linked_user_ids">): number[] {
+  return parseIdListJson(session.linked_user_ids);
+}
+
+/** True if any *alive* session on this bot lists the chat or user in its links. */
+export function isLinkedToAliveSession(botId: number, chatId: number, userId?: number): boolean {
+  for (const s of getAliveRelaySessions(botId)) {
+    if (getRelayLinkedChatIds(s).includes(chatId)) return true;
+    if (userId && getRelayLinkedUserIds(s).includes(userId)) return true;
+  }
+  return false;
+}
+
+/**
+ * Alive sessions on this bot that own this chat (or DM user).
+ * Used by the poller/queue to honour bot→instance links when the same bot
+ * serves multiple Pi folders / channels.
+ */
+export function getAliveSessionsLinkedTo(
+  botId: number,
+  chatId: number,
+  userId?: number,
+): RelaySession[] {
+  return getAliveRelaySessions(botId).filter((s) => {
+    if (getRelayLinkedChatIds(s).includes(chatId)) return true;
+    if (userId && getRelayLinkedUserIds(s).includes(userId)) return true;
+    return false;
+  });
+}
+
+/**
+ * Claim next pending unassigned row whose chat/user is linked to this session.
+ * Skips rows owned by other instances so shared-bot channels stay sticky.
+ */
+export function claimNextLinkedUnassigned(
+  botId: number,
+  sessionId: string,
+  sessionName: string,
+  linkedChatIds: number[],
+  linkedUserIds: number[],
+): QueuedMessage | null {
+  const chats = linkedChatIds.filter((n) => Number.isFinite(n));
+  const users = linkedUserIds.filter((n) => Number.isFinite(n));
+  if (chats.length === 0 && users.length === 0) return null;
+
+  const d = getDb();
+  const clauses: string[] = [];
+  const params: unknown[] = [botId];
+  if (chats.length > 0) {
+    clauses.push(`chat_id IN (${chats.map(() => "?").join(",")})`);
+    params.push(...chats);
+  }
+  if (users.length > 0) {
+    clauses.push(`from_user_id IN (${users.map(() => "?").join(",")})`);
+    params.push(...users);
+  }
+  const row = d.prepare(`
+    SELECT * FROM message_queue
+    WHERE bot_id = ?
+      AND status = 'pending'
+      AND (session_name = 'unknown' OR session_name IS NULL OR session_id = 'unassigned')
+      AND (${clauses.join(" OR ")})
+    ORDER BY id ASC LIMIT 1
+  `).get(...params) as QueuedMessage | undefined;
+  if (!row) return null;
+
+  const normalized = normalizeSessionName(sessionName);
+  const claimed = d.prepare(`
+    UPDATE message_queue
+    SET status = 'processing', session_id = ?, session_name = ?, started_at = ?
+    WHERE id = ? AND status = 'pending'
+  `).run(sessionId, normalized, Date.now(), row.id).changes;
+  if (claimed === 0) return null;
+  return { ...row, status: "processing", session_id: sessionId, session_name: normalized };
+}
+
+/**
+ * True if an unassigned row is reserved for another alive session via links.
+ * Primary catch-all / CLAIM_OTHERS must not steal these.
+ */
+export function isUnassignedOwnedByOtherAliveSession(
+  botId: number,
+  chatId: number,
+  fromUserId: number,
+  mySessionName: string,
+): boolean {
+  const owners = getAliveSessionsLinkedTo(botId, chatId, fromUserId);
+  if (owners.length === 0) return false;
+  return owners.every((s) => normalizeSessionName(s.session_name) !== normalizeSessionName(mySessionName));
 }
 
 /**

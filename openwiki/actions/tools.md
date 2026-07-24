@@ -39,6 +39,7 @@ Registered in `src/index.ts` via `pi.registerTool` and mirrored in `mcp-server/i
 | `teleg-list_sessions` | List + liveness |
 | `teleg-evict_session` | Evict one |
 | `teleg-reconcile` | Ghost eviction + primary elect |
+| `teleg-fix-health` | Repair DEGRADED health (API + queue + reconcile + poller) |
 | `teleg-list_bots` | Configured bots |
 | `teleg-set_primary` | Force primary |
 

@@ -52,6 +52,7 @@ getUpdates (worker thread)
 
 - **One poller per `botId`** via `polling-{botId}.lock` (pid + sessionName).
 - Many Pi sessions may share a bot: one **active** (lock + worker), others **queue workers** only.
+- **Instance links** (schema v7): each session publishes `linked_chat_ids` / `linked_user_ids` from `.pi/teleg.json` allowlists ∪ INFO_REL `## linked_chats` / `## linked_users`. The primary poller accepts messages for any linked chat on the bot, then routes to the owning instance. Drain claims linked unassigned rows first and never steals another alive instance’s channels. Ambiguous multi-owners use INFO_REL capability matching.
 - Cross-bot `@session` is rejected.
 - Session name ≈ project folder name; relay keyed by `{botId}-{sessionName}`.
 - Almost every DB op takes `botId` — never claim/route across bots.

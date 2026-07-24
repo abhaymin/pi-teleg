@@ -17,6 +17,7 @@ Handled in `src/index.ts` after allowlist checks (user and/or chat).
 | `/chatid` | Show chat/user IDs (group/channel setup) |
 | `/queue [session]` | Queue for session or primary |
 | `/health`, `/healthfull` | Connectivity / full diagnostic |
+| `/teleg-fix-health [force]` | Repair DEGRADED health (API probe, stale queue, reconcile, poller restart) |
 | `/compact` | Compact memory |
 | `stop` / `/stop` | Abort active turn |
 | `/teleg-dc` | Disconnect this session |

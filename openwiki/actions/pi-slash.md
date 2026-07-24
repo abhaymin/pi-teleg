@@ -13,6 +13,7 @@ timestamp: 2026-07-24T16:00:00Z
 | `/teleg-setup` | Interactive bot setup |
 | `/teleg-status` | Extension status UI |
 | `/teleg-connect` / `/teleg-reconnect` | Start / restart polling |
+| `/teleg-fix-health [force]` | Repair DEGRADED health (API, queue, reconcile, poller) |
 | `/teleg-disconnect` | Stop this session’s bridge |
 | `/teleg-disable` / `/teleg-enable` | Persist disable in `teleg-disabled.json` |
 | `/teleg-switch-bot` | Switch among registered bots |
