@@ -3,7 +3,7 @@ type: concept
 title: Gotchas
 description: Hard traps — polling lock, dual-load, unassigned orphans, split DB, attach/media limits.
 tags: [gotchas, pitfalls, invariants]
-timestamp: 2026-07-24T16:00:00Z
+timestamp: 2026-07-25T00:30:00Z
 ---
 
 # Gotchas
@@ -19,6 +19,16 @@ Identical tool names → Pi redirects MCP calls to the native tool with warnings
 ## All state is `bot_id`-scoped
 
 Queue claims, relay sessions, locks, media dirs, and primary election are per bot. Cross-bot routing is forbidden. Split `TELEG_DB_PATH` for the same bot → silent isolated queues (`detectSplitDb` warns).
+
+## Reply-to media is recovered automatically
+
+When a user **replies** to a prior Telegram message (especially an image), the bridge:
+
+1. Looks up parent attachments in `message_queue` / `outbound_messages`.
+2. If missing, downloads media from Telegram's nested `reply_to_message` and backfills the parent row.
+3. Surfaces local paths in the reply chain + turn `Available media` list.
+
+The agent should **read those paths** — the user does not need to re-send the image. Bot-sent photos/videos/docs are also recorded with local paths (schema v6) so replies to bot media resolve too. Media still subject to Telegram `getFile` ≤20MB and local cache retention under `~/.pi/agent/tmp/teleg-media/`.
 
 ## Unassigned / unknown orphans (open bug)
 

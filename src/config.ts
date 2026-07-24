@@ -101,7 +101,7 @@ interface TelegramGetMeResponse {
 
 export async function getMeFromToken(token: string): Promise<{ botId: number; botUsername: string } | null> {
   try {
-    const res = await fetch(`https://api.telegram.org/bot${token}/getMe`);
+    const res = await fetch(`https://api.telegram.org/bot${token}/getMe`, { signal: AbortSignal.timeout(8000) });
     const data = (await res.json()) as TelegramGetMeResponse;
     if (data.ok && data.result) {
       return {

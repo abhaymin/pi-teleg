@@ -113,7 +113,7 @@ export async function checkSessionLiveness(session: Db.RelaySession): Promise<{
     try {
       const relayInfo: RelayInfo = JSON.parse(readFileSync(relayPath, "utf8"));
       try {
-        const response = await fetch(`http://127.0.0.1:${relayInfo.port}/health`);
+        const response = await fetch(`http://127.0.0.1:${relayInfo.port}/health`, { signal: AbortSignal.timeout(3000) });
         relayHttp = response.ok;
       } catch {
         failedChecks.push("relay_http");

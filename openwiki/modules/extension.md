@@ -17,7 +17,8 @@ Default export: `function (pi: ExtensionAPI)` — registers Pi commands/tools an
 - Acquire or skip poll lock via `PollingManager` (only one active poller per bot).
 - `handleAuthorizedTelegramMessage` — auth, `/` commands, `@session` relay, capability route, group stickiness, activate turn.
 - `drainTimer` (~12s) — claim queued work when idle; capability-scan unassigned; silent/CLAIM_OTHERS fallbacks.
-- Reply context — reconstruct `reply_to_message` + outbound history into the `[telegram]` turn.
+- Reply context — reconstruct `reply_to_message` + outbound history into the `[telegram]` turn, including **local paths for parent media** (`buildReplyChain` + `collectReplyContextAttachments`) so users need not re-send images.
+- Outbound media — `teleg-send_photo/video/document` and attach sends record local paths on `outbound_messages` (schema v6).
 - Poll-answer / reaction forwarding as steer or context.
 - `session_shutdown` — heartbeat stop, unregister, release lock if held.
 
@@ -38,5 +39,6 @@ Default export: `function (pi: ExtensionAPI)` — registers Pi commands/tools an
 ## Related
 
 - [Polling](polling.md)
+- [Reply context media](../runtime/reply-context.md)
 - [Actions](../actions/index.md)
-- [Gotchas — orphans](../gotchas.md)
+- [Gotchas — orphans / reply media](../gotchas.md)

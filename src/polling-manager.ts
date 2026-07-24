@@ -135,21 +135,6 @@ function normalizeSessionKey(sessionName: string): string {
   return sessionName.startsWith("__session__:") ? sessionName.slice("__session__:".length) : sessionName;
 }
 
-/** Parse the JSON attachments column into typed incoming media descriptors. */
-function parseAttachments(json: string | null): Array<{ path: string; fileName: string; type: string }> {
-  if (!json) return [];
-  try {
-    const parsed = JSON.parse(json) as unknown;
-    if (!Array.isArray(parsed)) return [];
-    return parsed
-      .filter((a): a is { path: string; fileName: string; type?: string } =>
-        typeof a === "object" && a !== null && typeof (a as { path?: unknown }).path === "string" && typeof (a as { fileName?: unknown }).fileName === "string")
-      .map((a) => ({ path: a.path, fileName: a.fileName, type: a.type ?? "media" }));
-  } catch {
-    return [];
-  }
-}
-
 export class PollingManager {
   readonly botId: number;
   private worker: Worker | null = null;
@@ -337,10 +322,18 @@ export class PollingManager {
     return recovered;
   }
   private buildTurn(dbMsg: Db.QueuedMessage, sessionId: string, sessionName: string): TurnQueueItem {
-    const replyChainText = this.resolveReplyChain(dbMsg.chat_id, dbMsg.reply_to_message_id);
-    const incomingAttachments = parseAttachments(dbMsg.attachments);
+    const replyChainText = Db.buildReplyChainText(this.botId, dbMsg.chat_id, dbMsg.reply_to_message_id);
+    const replyAttachments = Db.collectReplyContextAttachments(this.botId, dbMsg.chat_id, dbMsg.reply_to_message_id);
+    const ownAttachments = Db.parseAttachmentsJson(dbMsg.attachments);
+    const seen = new Set<string>();
+    const incomingAttachments: Array<{ path: string; fileName: string; type: string }> = [];
+    for (const a of [...ownAttachments, ...replyAttachments]) {
+      if (seen.has(a.path)) continue;
+      seen.add(a.path);
+      incomingAttachments.push(a);
+    }
     const mediaText = incomingAttachments.length > 0
-      ? `\n\n📎 Incoming media:\n${incomingAttachments.map((a) => `- ${a.path} (${a.type})`).join("\n")}`
+      ? `\n\n📎 Available media (message + reply context):\n${incomingAttachments.map((a) => `- ${a.path} (${a.type})`).join("\n")}`
       : "";
     const baseHistory = replyChainText ? `${replyChainText}\n${dbMsg.text}` : dbMsg.text;
     const historyText = `${baseHistory}${mediaText}`;
@@ -362,23 +355,6 @@ export class PollingManager {
       dbId: dbMsg.id,
       update: { update_id: dbMsg.id, message: { message_id: dbMsg.message_id, from: { id: dbMsg.from_user_id, is_bot: false, first_name: dbMsg.from_username || "User" }, chat: { id: dbMsg.chat_id, type: "private" }, text: dbMsg.text } },
     };
-  }
-
-  /** Walk reply_to_message_id chain across incoming + bot outbound stores. */
-  private resolveReplyChain(chatId: number, replyToMessageId: number | null): string {
-    if (!replyToMessageId) return "";
-    const parts: string[] = [];
-    let currentReplyTo: number | null = replyToMessageId;
-    const MAX_CHAIN = 10;
-    let depth = 0;
-    while (currentReplyTo && depth < MAX_CHAIN) {
-      const m = Db.lookupMessageForChain(this.botId, chatId, currentReplyTo);
-      if (!m) break;
-      parts.unshift(`[${m.author}]: ${m.text}`);
-      currentReplyTo = m.replyToMessageId;
-      depth++;
-    }
-    return parts.length > 0 ? parts.join("\n") : "";
   }
 
   private async acquireLock(sessionName: string, dbPath: string): Promise<boolean> {

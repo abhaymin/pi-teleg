@@ -19,7 +19,7 @@
 
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
@@ -108,9 +108,11 @@ interface TelegramMessage {
   reply_to_message?: TelegramMessage;
   photo?: Array<{ file_id: string; file_unique_id: string; width: number; height: number; file_size?: number }>;
   video?: { file_id: string; file_unique_id: string; width: number; height: number; duration: number; file_size?: number };
+  animation?: { file_id: string; file_unique_id: string; width: number; height: number; duration: number; file_size?: number };
   document?: { file_id: string; file_unique_id: string; file_name?: string; mime_type?: string; file_size?: number };
   audio?: { file_id: string; file_unique_id: string; duration: number; performer?: string; title?: string; mime_type?: string; file_size?: number };
   voice?: { file_id: string; file_unique_id: string; duration: number; mime_type?: string; file_size?: number };
+  sticker?: { file_id: string; file_unique_id: string; width: number; height: number; file_size?: number };
 }
 
 interface TelegramReactionType {
@@ -239,6 +241,7 @@ const SYSTEM_PROMPT_SUFFIX = `
 Telegram bridge extension is active.
 - Messages forwarded from Telegram are prefixed with "[telegram]".
 - [telegram] messages may include local temp file paths for Telegram attachments. Read those files as needed.
+- When a Telegram user replies to an earlier message, the turn includes a reply chain and local paths under "Referenced media" / "Available media" for the parent message(s). Open those files to understand what the user is referring to — they do not need to re-send the image or document.
 - If a [telegram] user asked for a file or generated artifact, use the teleg-attach tool with the local file path so the extension can send it with my next final reply.
 - Do not assume mentioning a local file path in plain text will send it to Telegram. Use teleg-attach.
 
@@ -357,7 +360,7 @@ async function sendFile(
   fileName: string,
   kind: "photo" | "video" | "document",
   caption?: string,
-): Promise<boolean> {
+): Promise<{ ok: boolean; messageId?: number }> {
   const { execFile } = await import("node:child_process");
   const method = kind === "photo" ? "sendPhoto" : kind === "video" ? "sendVideo" : "sendDocument";
   const fieldName = kind === "photo" ? "photo" : kind === "video" ? "video" : "document";
@@ -377,11 +380,14 @@ async function sendFile(
         "-F", `${fieldName}=@${filePath};filename=${fileName};type=${mimeType}`,
         `https://api.telegram.org/bot${botToken}/${method}`,
       ];
-      const result = await new Promise<{ ok: boolean; error: string }>((resolve) => {
+      const result = await new Promise<{ ok: boolean; error: string; messageId?: number }>((resolve) => {
         execFile("curl", args, { timeout: 125_000 }, (err, stdout, stderr) => {
           if (err) { resolve({ ok: false, error: stderr || err.message }); }
           else {
-            try { const data = JSON.parse(stdout); resolve({ ok: data.ok, error: data.description }); }
+            try {
+              const data = JSON.parse(stdout) as { ok?: boolean; description?: string; result?: { message_id?: number } };
+              resolve({ ok: !!data.ok, error: data.description || "", messageId: data.result?.message_id });
+            }
             catch { resolve({ ok: false, error: stdout.slice(0, 200) }); }
           }
         });
@@ -389,15 +395,15 @@ async function sendFile(
       if (!result.ok) {
         console.error(`[teleg] sendFile error (attempt ${attempt}/${MAX_RETRIES}):`, result.error);
         if (attempt < MAX_RETRIES) { await new Promise(r => setTimeout(r, attempt * 2000)); continue; }
-        return false;
+        return { ok: false };
       }
-      return true;
+      return { ok: true, messageId: result.messageId };
     } catch (err) {
       console.error(`[teleg] sendFile failed (attempt ${attempt}/${MAX_RETRIES}):`, err instanceof Error ? err.message : err);
       if (attempt < MAX_RETRIES) { await new Promise(r => setTimeout(r, attempt * 3000)); continue; }
     }
   }
-  return false;
+  return { ok: false };
 }
 
 async function verifyToken(token: string): Promise<TelegramUser | null> {
@@ -429,6 +435,22 @@ function createSessionState(sessionId: string): SessionState {
 // ============================================================================
 // MAIN EXTENSION
 // ============================================================================
+
+// ─── Persistent per-project disable ─────────────────────────────────────────
+// A project listed here is skipped entirely on session_start (no getMe, polling,
+// relay, timers, or DB activity) and stays off across restarts until /teleg-enable.
+const DISABLED_SESSIONS_PATH = join(homedir(), ".pi", "agent", "teleg-disabled.json");
+function readDisabledSessions(): string[] {
+  try {
+    const d = JSON.parse(readFileSync(DISABLED_SESSIONS_PATH, "utf8")) as { disabled?: string[] };
+    return Array.isArray(d.disabled) ? d.disabled : [];
+  } catch { return []; }
+}
+function setSessionDisabled(projectDir: string, disabled: boolean): void {
+  const list = readDisabledSessions().filter(p => p !== projectDir);
+  if (disabled) list.push(projectDir);
+  try { writeFileSync(DISABLED_SESSIONS_PATH, JSON.stringify({ disabled: list }, null, 2)); } catch { /* best effort */ }
+}
 
 export default function (pi: ExtensionAPI): void {
   const sessionId = getSessionId();
@@ -1162,13 +1184,21 @@ export default function (pi: ExtensionAPI): void {
       }
       return;
     }
-    // Build reply chain context from the nested reply_to_message and DB
-    const replyChainText = buildReplyChain(message);
+    // Build reply chain context (text + parent media paths) from DB / nested reply.
+    const { text: replyChainText, attachments: replyAttachments } = buildReplyChain(message);
     // Incoming media is downloaded by the poll worker and persisted on the row;
-    // read the real local paths here (never Telegram file_ids).
-    const incomingAttachments = readIncomingAttachments(dbId);
+    // read the real local paths here (never Telegram file_ids). Also merge media
+    // from the message(s) being replied to so the agent can open them.
+    const ownAttachments = readIncomingAttachments(dbId);
+    const seenPaths = new Set<string>();
+    const incomingAttachments: QueuedAttachment[] = [];
+    for (const a of [...ownAttachments, ...replyAttachments]) {
+      if (seenPaths.has(a.path)) continue;
+      seenPaths.add(a.path);
+      incomingAttachments.push(a);
+    }
     const mediaText = incomingAttachments.length > 0
-      ? `📎 Incoming media:\n${incomingAttachments.map(a => `- ${a.path} (${a.fileName})`).join("\n")}`
+      ? `📎 Available media (message + reply context):\n${incomingAttachments.map(a => `- ${a.path} (${a.fileName})`).join("\n")}`
       : "";
     const pollText = describePoll(message);
     const bodyText = [replyChainText, mediaText, pollText, rawText || "(no text)"]
@@ -1192,34 +1222,36 @@ export default function (pi: ExtensionAPI): void {
     pi.sendUserMessage(turn.content);
   }
 
-  /** Build reply chain context from the inline reply_to_message (from Telegram API) and DB history. */
-  function buildReplyChain(message: TelegramMessage): string {
-    if (!message.reply_to_message) return "";
+  /**
+   * Build reply chain context from DB (preferred — includes local media paths)
+   * with a fallback to the inline reply_to_message text/caption from Telegram.
+   */
+  function buildReplyChain(message: TelegramMessage): { text: string; attachments: QueuedAttachment[] } {
+    if (!message.reply_to_message) return { text: "", attachments: [] };
     const botId = currentBotId();
     const chatId = message.chat.id;
-    const parts: string[] = [];
+    const parentId = message.reply_to_message.message_id;
 
-    // Start with the inline reply_to_message from the Telegram API payload
-    const inline = message.reply_to_message;
-    parts.unshift(`[${inline.from?.username || inline.from?.first_name || "User"}]: ${inline.text || inline.caption || ""}`);
-
-    // Walk deeper chain from DB (incoming + bot outbound) if there's a further reply.
-    // This resolves the bot's own earlier posts too, so a reply to a bot answer
-    // threads the full prior conversation back into context.
-    if (botId && inline.reply_to_message) {
-      let currentMsgId: number | undefined = inline.reply_to_message.message_id;
-      const MAX_CHAIN = 10;
-      let depth = 0;
-      while (currentMsgId && depth < MAX_CHAIN) {
-        const m = Db.lookupMessageForChain(botId, chatId, currentMsgId);
-        if (!m) break;
-        parts.unshift(`[${m.author}]: ${m.text}`);
-        currentMsgId = m.replyToMessageId ?? undefined;
-        depth++;
+    if (botId) {
+      const chainText = Db.buildReplyChainText(botId, chatId, parentId);
+      const attachments = Db.collectReplyContextAttachments(botId, chatId, parentId)
+        .map((a) => ({ path: a.path, fileName: a.fileName }));
+      if (chainText || attachments.length > 0) {
+        return { text: chainText, attachments };
       }
     }
 
-    return parts.join("\n");
+    // Fallback when the parent is not yet in our DB: use Telegram's nested payload.
+    const inline = message.reply_to_message;
+    const inlineText = (inline.text || inline.caption || "").trim();
+    const author = inline.from?.username || inline.from?.first_name || "User";
+    const hasMedia = !!(
+      (inline.photo && inline.photo.length > 0) ||
+      inline.video || inline.animation || inline.document ||
+      inline.audio || inline.voice || inline.sticker
+    );
+    const body = inlineText || (hasMedia ? "(media — not yet cached locally)" : "(no text)");
+    return { text: `[${author}]: ${body}`, attachments: [] };
   }
 
   // ─── Command handlers ─────────────────────────────────────────────────
@@ -1762,6 +1794,36 @@ export default function (pi: ExtensionAPI): void {
     },
   });
 
+  pi.registerCommand("teleg-disable", {
+    description: "Disable teleg-bridge for this project (stays off across restarts until /teleg-enable)",
+    handler: async (_args, ctx) => {
+      setSessionDisabled(cwd, true);
+      try {
+        if (state.activeTurn) { completeTurn(state.activeTurn.dbId); deactivateTurn(); }
+        if (state.drainTimer) { clearInterval(state.drainTimer); state.drainTimer = undefined; }
+        if (state.livenessTimer) { clearInterval(state.livenessTimer); state.livenessTimer = undefined; }
+        const pm = currentPollingManager();
+        if (pm) await pm.stop().catch(() => {});
+        stopRelayServer();
+        const botId = currentBotId();
+        if (botId) Db.unregisterRelaySession(botId, sessionName);
+        void unregisterSessionCapabilities(sessionId);
+        void unregisterSession();
+      } catch (err) {
+        console.error(`[teleg:${sessionName}] disable cleanup error:`, err);
+      }
+      ctx.ui.notify(`Teleg-bridge disabled for ${sessionName}. Stays off until /teleg-enable, then restart this session.`, "info");
+    },
+  });
+
+  pi.registerCommand("teleg-enable", {
+    description: "Re-enable teleg-bridge for this project (activates on next session start)",
+    handler: async (_args, ctx) => {
+      setSessionDisabled(cwd, false);
+      ctx.ui.notify(`Teleg-bridge re-enabled for ${sessionName}. Restart this session to fully activate.`, "info");
+    },
+  });
+
   pi.registerCommand("teleg-switch-bot", {
     description: "Switch the active Telegram bot for this session",
     handler: async (_args, ctx) => {
@@ -1823,8 +1885,21 @@ export default function (pi: ExtensionAPI): void {
       const stats = await stat(params.file_path);
       if (!stats.isFile()) throw new Error(`Not a file: ${params.file_path}`);
       const fileName = params.file_path.split("/").pop() || "photo.jpg";
-      const success = await sendFile(botToken, String(targetChatId), 0, params.file_path, fileName, "photo", params.caption);
-      if (!success) throw new Error("Failed to send photo");
+      const sent = await sendFile(botToken, String(targetChatId), 0, params.file_path, fileName, "photo", params.caption);
+      if (!sent.ok) throw new Error("Failed to send photo");
+      const obBotId = currentBotId();
+      if (obBotId && sent.messageId) {
+        try {
+          Db.recordOutboundMessage({
+            bot_id: obBotId,
+            chat_id: targetChatId,
+            message_id: sent.messageId,
+            from_session: sessionName,
+            text: params.caption || "(photo)",
+            attachments: JSON.stringify([{ path: params.file_path, fileName, type: "image" }]),
+          });
+        } catch { /* best-effort */ }
+      }
       return { content: [{ type: "text", text: "Photo sent" }], details: {} };
     },
   });
@@ -1849,8 +1924,21 @@ export default function (pi: ExtensionAPI): void {
       const stats = await stat(params.file_path);
       if (!stats.isFile()) throw new Error(`Not a file: ${params.file_path}`);
       const fileName = params.file_path.split("/").pop() || "video.mp4";
-      const success = await sendFile(botToken, String(targetChatId), 0, params.file_path, fileName, "video", params.caption);
-      if (!success) throw new Error("Failed to send video");
+      const sent = await sendFile(botToken, String(targetChatId), 0, params.file_path, fileName, "video", params.caption);
+      if (!sent.ok) throw new Error("Failed to send video");
+      const obBotId = currentBotId();
+      if (obBotId && sent.messageId) {
+        try {
+          Db.recordOutboundMessage({
+            bot_id: obBotId,
+            chat_id: targetChatId,
+            message_id: sent.messageId,
+            from_session: sessionName,
+            text: params.caption || "(video)",
+            attachments: JSON.stringify([{ path: params.file_path, fileName, type: "video" }]),
+          });
+        } catch { /* best-effort */ }
+      }
       return { content: [{ type: "text", text: "Video sent" }], details: {} };
     },
   });
@@ -1875,8 +1963,21 @@ export default function (pi: ExtensionAPI): void {
       const stats = await stat(params.file_path);
       if (!stats.isFile()) throw new Error(`Not a file: ${params.file_path}`);
       const fileName = params.file_path.split("/").pop() || "file.bin";
-      const success = await sendFile(botToken, String(targetChatId), 0, params.file_path, fileName, "document", params.caption);
-      if (!success) throw new Error("Failed to send document");
+      const sent = await sendFile(botToken, String(targetChatId), 0, params.file_path, fileName, "document", params.caption);
+      if (!sent.ok) throw new Error("Failed to send document");
+      const obBotId = currentBotId();
+      if (obBotId && sent.messageId) {
+        try {
+          Db.recordOutboundMessage({
+            bot_id: obBotId,
+            chat_id: targetChatId,
+            message_id: sent.messageId,
+            from_session: sessionName,
+            text: params.caption || `(document: ${fileName})`,
+            attachments: JSON.stringify([{ path: params.file_path, fileName, type: "document" }]),
+          });
+        } catch { /* best-effort */ }
+      }
       return { content: [{ type: "text", text: "Document sent" }], details: {} };
     },
   });
@@ -2316,6 +2417,12 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => {
     try {
+      // Persistent per-project opt-out: skip the entire engine (no getMe, polling,
+      // relay, timers, DB) so the session stays off teleg until /teleg-enable.
+      if (readDisabledSessions().includes(cwd)) {
+        console.log(`[teleg:${sessionName}] Teleg-bridge disabled for this project — skipping engine. Run /teleg-enable to activate.`);
+        return;
+      }
       // Intelligent bot resolution: LOCAL .pi/teleg.json → GLOBAL config → ask the user.
       let resolution = await resolveBotContextInteractive(cwd);
       if (resolution.source === "none" && cwd !== process.cwd()) {
@@ -2432,6 +2539,7 @@ export default function (pi: ExtensionAPI): void {
         try {
           await fetch(`https://api.telegram.org/bot${announceToken}/sendMessage`, {
             method: "POST",
+            signal: AbortSignal.timeout(5000),
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ chat_id: chatId, text: `✅ <b>${sessionName}</b> connected`, parse_mode: "HTML" }),
           });
@@ -2572,6 +2680,21 @@ export default function (pi: ExtensionAPI): void {
       if (!pa) return;
       const paBotId = currentBotId();
       if (!paBotId) return;
+      // Always persist the raw vote so downstream consumers (poll-watcher, etc.)
+      // can read it by poll_id — even when the poll was sent out-of-band (not via
+      // this bridge) and isn't in message_queue.
+      try {
+        Db.recordPollAnswer({
+          bot_id: paBotId,
+          poll_id: pa.poll_id,
+          voter_user_id: pa.user?.id ?? 0,
+          voter_username: pa.user?.username ?? null,
+          option_ids: pa.option_ids,
+        });
+        console.log(`[teleg:${sessionName}] recorded poll_answer ${pa.poll_id} options ${pa.option_ids.join(",")}`);
+      } catch (err) {
+        console.error(`[teleg:${sessionName}] recordPollAnswer failed:`, err);
+      }
       try {
         const pollRow = Db.getDb().prepare(
           "SELECT chat_id, message_id, text FROM message_queue WHERE bot_id = ? AND poll_id = ? ORDER BY id DESC LIMIT 1"
@@ -2900,7 +3023,25 @@ export default function (pi: ExtensionAPI): void {
         const ext = attachment.fileName.split(".").pop()?.toLowerCase();
         const isImage = ["jpg", "jpeg", "png", "gif", "webp"].includes(ext || "");
         const kind: "photo" | "document" = isImage ? "photo" : "document";
-        await sendFile(state.config.botToken, String(turn.chatId), turn.replyToMessageId, attachment.path, attachment.fileName, kind);
+        const sent = await sendFile(state.config.botToken, String(turn.chatId), turn.replyToMessageId, attachment.path, attachment.fileName, kind);
+        const obBotId = currentBotId();
+        if (obBotId && sent.ok && sent.messageId) {
+          try {
+            Db.recordOutboundMessage({
+              bot_id: obBotId,
+              chat_id: turn.chatId,
+              message_id: sent.messageId,
+              reply_to_message_id: turn.replyToMessageId || null,
+              from_session: sessionName,
+              text: `(${kind}: ${attachment.fileName})`,
+              attachments: JSON.stringify([{
+                path: attachment.path,
+                fileName: attachment.fileName,
+                type: isImage ? "image" : "document",
+              }]),
+            });
+          } catch { /* best-effort */ }
+        }
       }
     }
 

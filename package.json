@@ -11,6 +11,9 @@
         "default": "./dist/index.js"
       }
     },
+    "omp": {
+      "extensions": ["./dist/index.js"]
+    },
     "scripts": {
         "build": "tsc",
         "build:mcp": "node -e \"console.log('[build:mcp] mcp-server/index.js is plain JS — no compile step needed')\"",

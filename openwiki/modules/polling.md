@@ -1,9 +1,9 @@
 ---
 type: concept
 title: Polling
-description: Per-bot PollingManager, lock files, and poll-worker persistence.
-tags: [modules, polling, worker, lock]
-timestamp: 2026-07-24T16:00:00Z
+description: Per-bot PollingManager, lock files, and poll-worker persistence including reply-parent media.
+tags: [modules, polling, worker, lock, reply-context]
+timestamp: 2026-07-25T00:30:00Z
 ---
 
 # Polling
@@ -17,6 +17,7 @@ One `PollingManager` instance per `botId` (registry via `getPollingManager` / `g
 - Event hooks: `onMessage`, `onReaction`, `onPoll`, `onPollAnswer`.
 - Claim helpers used by drain: `claimNextTurn`, `claimNextTurnForSession`, `claimNextTurnForSilentSession`.
 - `recoverCrashState` — bot-scoped stale `processing` reset.
+- `buildTurn` — reply chain via `Db.buildReplyChainText` + merges own + reply-parent attachments into the turn.
 
 ## `src/poll-worker.ts`
 
@@ -26,6 +27,7 @@ Runs in a **worker thread**. Long-polls `getUpdates`, downloads inbound media, p
 |---|---|
 | Insert | Always `session_id='unassigned'`, `session_name='unknown'`, `status='pending'` |
 | Media | `~/.pi/agent/tmp/teleg-media/{botId}/` (Bot API ~20MB limit) |
+| Reply parent | `ensureReplyParentMedia` — reuse DB paths or download from nested `reply_to_message`, backfill parent row |
 | Events | `message`, `reaction`, `poll`, `poll_answer`, `offset`, `health` |
 | Offset | Main persists via `saveLastUpdateId(botId, …)` |
 

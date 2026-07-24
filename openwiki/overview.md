@@ -15,6 +15,7 @@ Make Telegram a practical control plane for Pi coding agents:
 - Forward authorized private / group / channel messages into Pi as `[telegram]` turns.
 - Share one bot across many Pi sessions without duplicate `getUpdates`.
 - Route work by `@session`, declared capabilities (`INFO_REL.md`), or primary fallback.
+- Recover **reply-to** parent text and media (local cache paths) so users need not re-send images.
 - Send text, photos, videos, and documents back to Telegram.
 - Keep queue + session state recoverable across crashes.
 

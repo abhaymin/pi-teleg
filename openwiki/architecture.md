@@ -3,7 +3,7 @@ type: concept
 title: Architecture
 description: Layers, polling→queue→routing→relay data flow, and system boundaries for teleg-bridge.
 tags: [architecture, data-flow, boundaries, multi-bot]
-timestamp: 2026-07-24T16:00:00Z
+timestamp: 2026-07-25T00:45:00Z
 ---
 
 # Architecture
@@ -33,16 +33,19 @@ timestamp: 2026-07-24T16:00:00Z
 ```
 getUpdates (worker thread)
   → download media → ~/.pi/agent/tmp/teleg-media/{botId}/
+  → if reply_to_message: ensureReplyParentMedia (reuse/backfill parent attachments)
   → INSERT message_queue (session=unassigned/unknown, pending)
   → notify PollingManager
        │
        ├─ primary: handleAuthorizedTelegramMessage
        │     /commands | @session | capability | stickiness | activateTurn
+       │     (reply chain text + Available media paths for parent + self)
        │
        └─ drainTimer (all linked sessions):
              pubsub → claim own / unassigned (rules differ by default bot)
              → capability-scan unassigned → silent fallback → optional CLAIM_OTHERS
              → activateTurn → agent → teleg-send_* → completeMessage
+             → outbound media recorded with local paths (schema v6)
 ```
 
 ## Multi-bot / multi-session rules
@@ -56,14 +59,16 @@ getUpdates (worker thread)
 ## Boundaries / invariants
 
 - Extension owns polling; MCP does not start workers.
-- Worker **does not route** — only persist + notify.
+- Worker **does not route** — only persist + notify (+ reply-parent media ensure).
 - Allowlists: `allowedUserIds` (DMs) vs `allowedChatIds` (groups/channels).
-- Schema version: `PRAGMA user_version = 5` after migrations (`src/db.ts`).
+- Schema version: `PRAGMA user_version = 6` after migrations (`src/db.ts`).
 - Bun/Node SQLite via `src/sqlite-driver.ts` only — do not import `node:sqlite` in shared paths.
+- Reply-to media: agent must read local paths from the turn; users should not need to re-send images.
 
 ## Related
 
 - [Modules](modules/index.md)
 - [Runtime data](runtime/index.md)
+- [Reply context media](runtime/reply-context.md)
 - [Gotchas](gotchas.md)
 - [Unassigned orphan bug](../RELAY_UNASSIGNED_BUG.md)

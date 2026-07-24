@@ -12,6 +12,7 @@ All live state is under **`~/.pi/agent/`** (override DB with `TELEG_DB_PATH`). N
 |---|---|
 | [Config files](config-files.md) | JSON configs, registries, env |
 | [Database](database.md) | Tables, schema version, key columns |
+| [Reply context](reply-context.md) | Parent media recovery on Telegram replies |
 
 ## Path cheat sheet
 

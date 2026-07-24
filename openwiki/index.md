@@ -40,15 +40,17 @@ Runtime state lives under **`~/.pi/agent/`** (DB, config, locks, relay, media) �
 | [Modules](modules/index.md) | `src/*`, MCP server roles |
 | [Actions](actions/index.md) | Telegram cmds, Pi slash, tools, `teleg` CLI |
 | [Runtime data](runtime/index.md) | Config JSON, SQLite, locks, media, env |
+| [Reply context](runtime/reply-context.md) | Recover parent media on Telegram replies |
 | [Plans](plans/index.md) | Multi-bot PLAN_ACTION vs shipped reality |
 | [Automation](automation.md) | `install.sh` / `deploy.sh` / channels |
-| [Gotchas](gotchas.md) | Polling lock, dual-load, unassigned orphans |
+| [Gotchas](gotchas.md) | Polling lock, dual-load, reply media, orphans |
 
-## Top-level on disk (scanned 2026-07-24)
+## Top-level on disk (scanned 2026-07-25)
 
 | Path | Role |
 |---|---|
 | `src/` | TypeScript extension + poll worker (~9.6k LOC) |
+| `src/sqlite-driver.ts` | Bun/Node-neutral SQLite open |
 | `dist/` | Compiled JS + `.d.ts` — what Pi loads |
 | `mcp-server/` | Standalone stdio MCP (same tools; **no** polling) |
 | `install.sh` | Git lifecycle CLI → `~/.local/bin/teleg` |

@@ -13,7 +13,8 @@
  *   - Works on any machine: pi sessions read from the same DB wherever they run.
  */
 
-import { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync } from "node:sqlite";
+import { openSqlite } from "./sqlite-driver.js";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { mkdirSync, existsSync } from "node:fs";
@@ -22,7 +23,7 @@ import { readGlobalConfigSync } from "./config.js";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // Schema version for migrations
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 6;
 
 // DB path: env override → shared default
 const DEFAULT_DB_PATH = join(process.env.HOME || "~", ".pi", "agent", "teleg-bridge.db");
@@ -111,7 +112,7 @@ function getDb(): DatabaseSync {
     const dir = dirname(DB_PATH);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 
-    db = new DatabaseSync(DB_PATH);
+    db = new openSqlite(DB_PATH);
     db.exec("PRAGMA journal_mode=WAL");
     db.exec("PRAGMA busy_timeout=5000");
     db.exec("PRAGMA synchronous=NORMAL");
@@ -147,6 +148,11 @@ function runMigrations(database: DatabaseSync): void {
   // Migration from v3 to v4: Add attachments (incoming media JSON) + poll_id
   if (currentVersion < 4) {
     migrateToV4(database);
+  }
+
+  // Migration from v5 to v6: outbound_messages.attachments for reply-to bot media
+  if (currentVersion < 6) {
+    migrateToV6(database);
   }
 
   initSchema(database);
@@ -275,6 +281,19 @@ function migrateToV4(database: DatabaseSync): void {
   } catch (err) {
     if (!(err instanceof Error && (err.message.includes("duplicate column") || err.message.includes("no such table")))) {
       console.error("[db] Error adding poll_id to message_queue:", err);
+    }
+  }
+}
+
+/** v6: store local media paths on outbound rows so replies to bot-sent photos resolve. */
+function migrateToV6(database: DatabaseSync): void {
+  const tableExists = (database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='outbound_messages'").get() as { name: string } | undefined) != null;
+  if (!tableExists) return;
+  try {
+    database.exec(`ALTER TABLE outbound_messages ADD COLUMN attachments TEXT`);
+  } catch (err) {
+    if (!(err instanceof Error && (err.message.includes("duplicate column") || err.message.includes("no such table")))) {
+      console.error("[db] Error adding attachments to outbound_messages:", err);
     }
   }
 }
@@ -439,10 +458,22 @@ function initSchema(database: DatabaseSync): void {
       reply_to_message_id INTEGER,
       from_session       TEXT,
       text               TEXT NOT NULL DEFAULT '',
+      attachments        TEXT,
       created_at         INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000)
     );
     CREATE UNIQUE INDEX IF NOT EXISTS idx_outbound_lookup ON outbound_messages(bot_id, chat_id, message_id);
     CREATE INDEX IF NOT EXISTS idx_outbound_bot ON outbound_messages(bot_id);
+
+    CREATE TABLE IF NOT EXISTS poll_answers (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      bot_id            INTEGER NOT NULL,
+      poll_id           TEXT NOT NULL,
+      voter_user_id     INTEGER NOT NULL,
+      voter_username    TEXT,
+      option_ids        TEXT NOT NULL,
+      created_at        INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000)
+    );
+    CREATE INDEX IF NOT EXISTS idx_poll_answers_poll ON poll_answers(bot_id, poll_id);
   `);
 }
 
@@ -514,6 +545,8 @@ export function enqueueMessage(params: {
  * Record a bot outbound reply so later reply-chains and reactions can resolve
  * the message the user reacted to / replied to (including the bot's own post).
  * Re-recording the same (bot_id, chat_id, message_id) replaces the prior row.
+ * `attachments` is a JSON array of local media paths sent with the reply
+ * ([{path, fileName, type}]) so a later user reply can re-open that media.
  */
 export function recordOutboundMessage(params: {
   bot_id: number;
@@ -522,14 +555,16 @@ export function recordOutboundMessage(params: {
   reply_to_message_id?: number | null;
   from_session?: string | null;
   text: string;
+  attachments?: string | null;
 }): void {
   getDb().prepare(`
-    INSERT INTO outbound_messages (bot_id, chat_id, message_id, reply_to_message_id, from_session, text)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO outbound_messages (bot_id, chat_id, message_id, reply_to_message_id, from_session, text, attachments)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(bot_id, chat_id, message_id) DO UPDATE SET
       reply_to_message_id = excluded.reply_to_message_id,
       from_session = excluded.from_session,
       text = excluded.text,
+      attachments = COALESCE(excluded.attachments, outbound_messages.attachments),
       created_at = (unixepoch('now') * 1000)
   `).run(
     params.bot_id,
@@ -538,7 +573,14 @@ export function recordOutboundMessage(params: {
     params.reply_to_message_id ?? null,
     params.from_session ?? null,
     params.text,
+    params.attachments ?? null,
   );
+}
+
+export interface ChainAttachment {
+  path: string;
+  fileName: string;
+  type: string;
 }
 
 export interface ChainMessage {
@@ -546,28 +588,123 @@ export interface ChainMessage {
   author: string;
   text: string;
   replyToMessageId: number | null;
+  /** Local media paths attached to this message (incoming or outbound). */
+  attachments: ChainAttachment[];
+}
+
+/** Parse the attachments JSON column into typed descriptors (empty on failure). */
+export function parseAttachmentsJson(json: string | null | undefined): ChainAttachment[] {
+  if (!json) return [];
+  try {
+    const parsed = JSON.parse(json) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((a): a is { path: string; fileName?: string; type?: string } =>
+        typeof a === "object" && a !== null && typeof (a as { path?: unknown }).path === "string")
+      .map((a) => ({
+        path: a.path,
+        fileName: typeof a.fileName === "string" ? a.fileName : a.path.split("/").pop() || "file",
+        type: typeof a.type === "string" ? a.type : "media",
+      }));
+  } catch {
+    return [];
+  }
+}
+
+/** One display line for a chain hop, including referenced local media paths. */
+export function formatChainLine(m: ChainMessage): string {
+  const types = m.attachments.map((a) => a.type).filter(Boolean);
+  const body = (m.text || "").trim() || (types.length > 0 ? `(${types.join(", ")})` : "(no text)");
+  const media = m.attachments.length > 0
+    ? `\n  📎 Referenced media:\n${m.attachments.map((a) => `  - ${a.path} (${a.fileName})`).join("\n")}`
+    : "";
+  return `[${m.author}]: ${body}${media}`;
 }
 
 /**
  * Resolve a single message by id across BOTH stores — incoming (message_queue)
  * and the bot's own outbound replies (outbound_messages). Returns null if the
  * message is unknown to this bridge. Used to build reply chains and to surface
- * the post a reaction refers to.
+ * the post a reaction refers to — including local media paths when available.
  */
 export function lookupMessageForChain(botId: number, chatId: number, messageId: number): ChainMessage | null {
   const incoming = getDb().prepare(
-    "SELECT from_username AS author, text, reply_to_message_id FROM message_queue WHERE bot_id = ? AND chat_id = ? AND message_id = ?"
-  ).get(botId, chatId, messageId) as { author: string | null; text: string; reply_to_message_id: number | null } | undefined;
+    "SELECT from_username AS author, text, reply_to_message_id, attachments FROM message_queue WHERE bot_id = ? AND chat_id = ? AND message_id = ?"
+  ).get(botId, chatId, messageId) as { author: string | null; text: string; reply_to_message_id: number | null; attachments: string | null } | undefined;
   if (incoming) {
-    return { author: incoming.author || "User", text: incoming.text, replyToMessageId: incoming.reply_to_message_id ?? null };
+    return {
+      author: incoming.author || "User",
+      text: incoming.text,
+      replyToMessageId: incoming.reply_to_message_id ?? null,
+      attachments: parseAttachmentsJson(incoming.attachments),
+    };
   }
   const outbound = getDb().prepare(
-    "SELECT from_session AS author, text, reply_to_message_id FROM outbound_messages WHERE bot_id = ? AND chat_id = ? AND message_id = ?"
-  ).get(botId, chatId, messageId) as { author: string | null; text: string; reply_to_message_id: number | null } | undefined;
+    "SELECT from_session AS author, text, reply_to_message_id, attachments FROM outbound_messages WHERE bot_id = ? AND chat_id = ? AND message_id = ?"
+  ).get(botId, chatId, messageId) as { author: string | null; text: string; reply_to_message_id: number | null; attachments: string | null } | undefined;
   if (outbound) {
-    return { author: outbound.author ? `@${outbound.author}` : "Assistant", text: outbound.text, replyToMessageId: outbound.reply_to_message_id ?? null };
+    return {
+      author: outbound.author ? `@${outbound.author}` : "Assistant",
+      text: outbound.text,
+      replyToMessageId: outbound.reply_to_message_id ?? null,
+      attachments: parseAttachmentsJson(outbound.attachments),
+    };
   }
   return null;
+}
+
+/**
+ * Walk the reply_to chain and collect unique local media paths so the agent can
+ * open the media the Telegram user is referring to without a re-send.
+ */
+export function collectReplyContextAttachments(
+  botId: number,
+  chatId: number,
+  replyToMessageId: number | null | undefined,
+  maxDepth: number = 10,
+): ChainAttachment[] {
+  if (!replyToMessageId) return [];
+  const out: ChainAttachment[] = [];
+  const seen = new Set<string>();
+  let current: number | null = replyToMessageId;
+  let depth = 0;
+  while (current && depth < maxDepth) {
+    const m = lookupMessageForChain(botId, chatId, current);
+    if (!m) break;
+    for (const a of m.attachments) {
+      if (!seen.has(a.path)) {
+        seen.add(a.path);
+        out.push(a);
+      }
+    }
+    current = m.replyToMessageId;
+    depth++;
+  }
+  return out;
+}
+
+/**
+ * Build a multi-line reply-chain context string (newest parent last) including
+ * referenced media paths. Empty string when there is no reply parent.
+ */
+export function buildReplyChainText(
+  botId: number,
+  chatId: number,
+  replyToMessageId: number | null | undefined,
+  maxDepth: number = 10,
+): string {
+  if (!replyToMessageId) return "";
+  const parts: string[] = [];
+  let current: number | null = replyToMessageId;
+  let depth = 0;
+  while (current && depth < maxDepth) {
+    const m = lookupMessageForChain(botId, chatId, current);
+    if (!m) break;
+    parts.unshift(formatChainLine(m));
+    current = m.replyToMessageId;
+    depth++;
+  }
+  return parts.join("\n");
 }
 
 /**
@@ -765,6 +902,24 @@ export function failMessage(id: number, error: string): void {
     SET status = 'failed', completed_at = ?, error = ?
     WHERE id = ?
   `).run(Date.now(), error, id);
+}
+
+/**
+ * Persist a Telegram poll_answer (a user's vote). A poll_answer carries no
+ * chat/message id — only poll_id + voter + option_ids — so it is stored here
+ * durably for downstream consumers (e.g. a poll-watcher) to read by poll_id.
+ */
+export function recordPollAnswer(params: {
+  bot_id: number;
+  poll_id: string;
+  voter_user_id: number;
+  voter_username?: string | null;
+  option_ids: number[];
+}): void {
+  getDb().prepare(`
+    INSERT INTO poll_answers (bot_id, poll_id, voter_user_id, voter_username, option_ids)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(params.bot_id, params.poll_id, params.voter_user_id, params.voter_username ?? null, JSON.stringify(params.option_ids));
 }
 
 export function normalizeSessionName(sessionName: string): string {
@@ -1456,7 +1611,7 @@ function mergeLocalSessionNames(): number {
   for (const localPath of localDbPaths) {
     if (!existsSync(localPath)) continue;
     try {
-      const localDb = new DatabaseSync(localPath);
+      const localDb = new openSqlite(localPath);
       localDb.exec("PRAGMA wal_checkpoint(TRUNCATE)");
       const localRows = localDb.prepare(
         "SELECT message_id, session_name, status FROM message_queue WHERE session_name != 'unknown'"

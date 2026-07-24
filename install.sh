@@ -22,6 +22,12 @@ SHIM_NAME="teleg"
 SHIM_DIR="$HOME/.local/bin"
 export GIT_TERMINAL_PROMPT=0          # never prompt for git credentials
 
+# A mounted AppImage (e.g. the omp desktop app) leaks PYTHONHOME/PYTHONPATH into
+# the shell, which breaks system python3 ("No module named encodings"). Strip
+# them so every python3 helper below (meta_*, cmd_mcp, prune_*) works regardless
+# of the process that invoked this script.
+unset PYTHONHOME PYTHONPATH
+
 # ── Logging / control ────────────────────────────────────────────────────────
 log()  { printf '%s\n' "$*"; }
 warn() { printf '⚠  %s\n' "$*" >&2; }
@@ -507,6 +513,22 @@ cmd_version() {
 # omp, opencode, Claude Code, Kilo Code, or any mcpServers-style client.
 mcp_server_path() { printf '%s/mcp-server/index.js\n' "$(resolve_home)"; }
 
+# Build a server entry for a given app family. Pi and Claude Code use the bare
+# {command,args} shape; OMP requires an explicit transport ("type":"stdio").
+pi_entry() {     # $1 = mcp_path  → {"command":"node","args":[path]}
+  MCP_PATH="$1" python3 - <<'PY'
+import json, os
+print(json.dumps({"command": "node", "args": [os.environ["MCP_PATH"]]}))
+PY
+}
+
+stdio_entry() {  # $1 = mcp_path  → {"type":"stdio","command":"node","args":[path]}
+  MCP_PATH="$1" python3 - <<'PY'
+import json, os
+print(json.dumps({"type": "stdio", "command": "node", "args": [os.environ["MCP_PATH"]]}))
+PY
+}
+
 cmd_mcp() {
   local app="" do_write=false mcp_path
   mcp_path="$(mcp_server_path)"
@@ -524,13 +546,7 @@ cmd_mcp() {
 
   [[ -f "$mcp_path" ]] || warn "MCP server not found at $mcp_path (still emitting config)."
 
-  local entry
-  entry="$(MCP_PATH="$mcp_path" python3 - <<'PY'
-import json, os
-p = os.environ["MCP_PATH"]
-print(json.dumps({"command": "node", "args": [p]}))
-PY
-)"
+  # Entry shape is target-specific — built per app in the case below.
 
   # No --app: print the standard mcpServers block (Claude Code / omp / generic).
   if [[ -z "$app" ]]; then
@@ -544,18 +560,23 @@ PY
     log ""
     log "App-specific hints:"
     log "  claude   teleg mcp --app claude --write   →  ~/.claude.json (mcpServers)"
-    log "  omp/pi   already wired by deploy.sh        →  ~/.pi/agent/mcp.json"
+    log "  pi       already wired by deploy.sh        →  ~/.pi/agent/mcp.json"
+    log "  omp      teleg mcp --app omp --write       →  ~/.omp/agent/mcp.json (type:stdio)"
     log "  opencode teleg mcp --app opencode          →  print opencode format"
     log "  kilo     teleg mcp --app kilo              →  print kilo format"
     return 0
   fi
 
-  local target kind
+  local target kind entry
   case "$app" in
     claude|claude-code)
-      target="$HOME/.claude.json"; kind="mcpServers" ;;
-    pi|omp)
-      target="$HOME/.pi/agent/mcp.json"; kind="mcpServers" ;;
+      target="$HOME/.claude.json"; kind="mcpServers"; entry="$(pi_entry "$mcp_path")" ;;
+    pi)
+      # Pi runs the NATIVE extension (deploy.sh); the MCP is optional here.
+      target="$HOME/.pi/agent/mcp.json"; kind="mcpServers"; entry="$(pi_entry "$mcp_path")" ;;
+    omp|oh-my-pi)
+      # OMP (oh-my-pi) is a separate runtime: ~/.omp/agent/mcp.json, stdio transport.
+      target="$HOME/.omp/agent/mcp.json"; kind="mcpServers"; entry="$(stdio_entry "$mcp_path")" ;;
     opencode)
       # opencode uses a top-level "mcp" object with type/command/enabled entries.
       log "opencode snippet (merge into opencode.json under \"mcp\"):"
@@ -578,7 +599,7 @@ PY
     *) die "Unknown app '$app'. Try: claude, pi, omp, opencode, kilo" ;;
   esac
 
-  # mcpServers-style targets (claude, pi/omp): merge non-clobberingly on --write.
+  # mcpServers-style targets (claude, pi, omp): merge non-clobberingly on --write.
   if [[ "$do_write" == true ]]; then
     [[ -n "$target" ]] || die "no target path for app '$app'"
     mkdir -p "$(dirname "$target")"

@@ -14,7 +14,8 @@
  */
 
 import { parentPort, workerData } from "node:worker_threads";
-import { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync } from "node:sqlite";
+import { openSqlite } from "./sqlite-driver.js";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
@@ -173,7 +174,7 @@ function getDb(): DatabaseSync {
   if (!db) {
     const dir = dirname(DB_PATH);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    db = new DatabaseSync(DB_PATH);
+    db = new openSqlite(DB_PATH);
     db.exec("PRAGMA journal_mode=WAL");
     db.exec("PRAGMA busy_timeout=5000");
     // Schema is initialized by the main thread's db.ts migrations.
@@ -319,6 +320,108 @@ function persistMessage(message: TelegramMessage, attachments: QueuedAttachment[
   }
 }
 
+function parseStoredAttachments(json: string | null | undefined): QueuedAttachment[] {
+  if (!json) return [];
+  try {
+    const parsed = JSON.parse(json) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((a): a is { path: string; fileName?: string; type?: string } =>
+        typeof a === "object" && a !== null && typeof (a as { path?: unknown }).path === "string")
+      .map((a) => ({
+        path: a.path,
+        fileName: typeof a.fileName === "string" ? a.fileName : a.path.split("/").pop() || "file",
+        type: typeof a.type === "string" ? a.type : "media",
+      }));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Ensure the message being replied to has locally readable media on disk and in
+ * SQLite. Prefer already-downloaded paths; otherwise download from the nested
+ * Telegram reply_to_message payload (file_ids) and backfill the parent row so
+ * later drain/claim paths can resolve the same media without a user re-send.
+ */
+async function ensureReplyParentMedia(parent: TelegramMessage, chatId: number): Promise<void> {
+  const d = getDb();
+  const parentChatId = parent.chat?.id ?? chatId;
+
+  const aliveFromJson = (json: string | null | undefined): QueuedAttachment[] =>
+    parseStoredAttachments(json).filter((a) => existsSync(a.path));
+
+  const incoming = d.prepare(
+    "SELECT id, attachments, text FROM message_queue WHERE bot_id = ? AND chat_id = ? AND message_id = ?"
+  ).get(botId, parentChatId, parent.message_id) as { id: number; attachments: string | null; text: string } | undefined;
+  if (incoming && aliveFromJson(incoming.attachments).length > 0) return;
+
+  let outboundAttachments: string | null = null;
+  try {
+    const outbound = d.prepare(
+      "SELECT attachments FROM outbound_messages WHERE bot_id = ? AND chat_id = ? AND message_id = ?"
+    ).get(botId, parentChatId, parent.message_id) as { attachments: string | null } | undefined;
+    outboundAttachments = outbound?.attachments ?? null;
+  } catch {
+    // outbound.attachments may not exist yet if main-thread migration hasn't run
+  }
+  if (aliveFromJson(outboundAttachments).length > 0) return;
+
+  const hasInlineMedia = !!(
+    (parent.photo && parent.photo.length > 0) ||
+    parent.video || parent.animation || parent.document ||
+    parent.audio || parent.voice || parent.sticker
+  );
+  if (!hasInlineMedia) return;
+
+  let downloaded: QueuedAttachment[] = [];
+  try {
+    downloaded = await downloadMedia(parent);
+  } catch (e) {
+    console.error("[teleg-poll] reply-parent media download failed:", e instanceof Error ? e.message : e);
+    return;
+  }
+  if (downloaded.length === 0) return;
+
+  const attachmentsJson = JSON.stringify(downloaded);
+  const text = parent.text || parent.caption || "";
+  if (incoming) {
+    d.prepare("UPDATE message_queue SET attachments = ? WHERE id = ?").run(attachmentsJson, incoming.id);
+    if (!(incoming.text || "").trim() && text) {
+      d.prepare("UPDATE message_queue SET text = ? WHERE id = ?").run(text, incoming.id);
+    }
+    return;
+  }
+
+  // Parent was never queued (or purged). Insert a completed context row so
+  // lookupMessageForChain / drain turns can resolve the media + caption.
+  try {
+    d.prepare(`
+      INSERT INTO message_queue (
+        bot_id, chat_id, message_id, reply_to_message_id, from_user_id, from_username,
+        text, session_id, session_name, status, source, attachments
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'reply-context', '_reply_context', 'completed', 'telegram', ?)
+    `).run(
+      botId,
+      parentChatId,
+      parent.message_id,
+      parent.reply_to_message?.message_id ?? null,
+      parent.from?.id ?? 0,
+      parent.from?.username ?? null,
+      text,
+      attachmentsJson,
+    );
+  } catch (err) {
+    if (err instanceof Error && err.message.includes("UNIQUE constraint failed")) {
+      d.prepare(
+        "UPDATE message_queue SET attachments = COALESCE(attachments, ?) WHERE bot_id = ? AND chat_id = ? AND message_id = ?"
+      ).run(attachmentsJson, botId, parentChatId, parent.message_id);
+    } else {
+      console.error("[teleg-poll] reply-parent backfill failed:", err instanceof Error ? err.message : err);
+    }
+  }
+}
+
 async function pollLoop(): Promise<void> {
   // Reset webhook
   try {
@@ -401,6 +504,16 @@ async function pollLoop(): Promise<void> {
           attachments = await downloadMedia(message);
         } catch (e) {
           console.error("[teleg-poll] media capture error:", e);
+        }
+
+        // If this is a reply, ensure the parent message's media is on disk + in
+        // SQLite so the agent can open what the user is referring to.
+        if (message.reply_to_message) {
+          try {
+            await ensureReplyParentMedia(message.reply_to_message, message.chat.id);
+          } catch (e) {
+            console.error("[teleg-poll] reply-parent ensure error:", e);
+          }
         }
 
         // Persist to SQLite immediately

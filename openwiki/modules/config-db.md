@@ -26,7 +26,7 @@ Runtime-neutral open: Node `node:sqlite` vs Bun `bun:sqlite`. **All** DB opens g
 
 ## `src/db.ts`
 
-- `SCHEMA_VERSION = 5` (v2 bot_id → v3 reply_to → v4 attachments/poll_id → v5 relay repair).
+- `SCHEMA_VERSION = 6` (v2 bot_id → v3 reply_to → v4 attachments/poll_id → v5 relay repair → v6 outbound attachments).
 - WAL + `busy_timeout=5000` + `synchronous=NORMAL`.
 - Tables: `message_queue`, `download_queue`, `relay_sessions`, `relay_history`, `pubsub`, `outbound_messages`, `poll_answers`.
 
@@ -35,7 +35,8 @@ Runtime-neutral open: Node `node:sqlite` vs Bun `bun:sqlite`. **All** DB opens g
 | Queue | `enqueueMessage`, `claimNextMessage*`, `completeMessage`, `failMessage` |
 | Relay | `registerRelaySession`, `heartbeatRelaySession`, `setPrimary` |
 | Recovery | `runStartupRecovery` |
-| Outbound / polls | `recordOutboundMessage`, `lookupMessageForChain`, `recordPollAnswer` |
+| Outbound / polls | `recordOutboundMessage` (optional attachments JSON), `recordPollAnswer` |
+| Reply chain | `lookupMessageForChain`, `buildReplyChainText`, `collectReplyContextAttachments`, `formatChainLine` |
 | Pubsub | `publish`, `subscribe` |
 
 **Invariant:** unique `(bot_id, chat_id, message_id)` dedupes Telegram redeliveries; almost all ops take `botId`.

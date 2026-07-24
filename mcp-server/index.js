@@ -23,9 +23,12 @@
  */
 
 import { readFileSync, writeFileSync, existsSync, createReadStream, unlinkSync, readdirSync } from "fs";
-import { join, dirname } from "path";
+import { join, dirname, basename } from "path";
 import { fileURLToPath } from "url";
 import { DatabaseSync } from "node:sqlite";
+import * as Db from "../dist/db.js";
+import { getPollingManager } from "../dist/polling-manager.js";
+import { startRelayServer, stopRelayServer, cleanRelayFilesByPid } from "../dist/relay.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -251,7 +254,9 @@ async function getMe(bot) {
 // ─── DB helpers ──────────────────────────────────────────────────────────────
 
 function openDb(readonly = false) {
-  return new DatabaseSync(DB_PATH, { readonly, fileMustExist: false });
+  const db = new DatabaseSync(DB_PATH, { readonly, fileMustExist: false });
+  if (!readonly) { try { db.exec("PRAGMA busy_timeout=5000"); } catch { /* older sqlite */ } }
+  return db;
 }
 
 /** Resolve a bot id for queue scoping. 0 means "all bots" (legacy/global). */
@@ -307,7 +312,7 @@ function getDownloadStats(botId = 0) {
 // ─── Relay / Liveness helpers (parity with src/session-registry.ts) ──────────
 
 function getRelayPath(sessionName, botId) {
-  const prefix = botId ? `bot${botId}-` : "";
+  const prefix = botId ? `${botId}-` : "";
   return join(RELAY_DIR, `${prefix}${sessionName}.json`);
 }
 
@@ -476,9 +481,231 @@ async function reconcileBot(botId) {
   return report;
 }
 
+// ─── MCP Engine: omp / standalone receive path ───────────────────────────────
+// The native Pi extension owns polling + turn injection (pi.sendUserMessage).
+// MCP clients (omp, opencode, Claude Code, …) have no Pi runtime, so this
+// standalone server runs the SAME engine itself: it polls Telegram, registers
+// as a live relay session, and exposes a blocking teleg_listen tool that hands
+// each incoming message to the agent loop. Reuses the Pi-free ../dist engine.
+const SESSION_NAME = (process.env.TELEG_SESSION_NAME || basename(PROJECT_DIR) || "mcp").replace(/\s+/g, "-").toLowerCase();
+const SESSION_ID = `__session__:${SESSION_NAME}`;
+const POLL_INTERVAL_MS = 300;
+const HEARTBEAT_INTERVAL_MS = 30000;
+const LISTEN_DEFAULT_MS = 20000;
+const LISTEN_MAX_MS = 120000;
+
+const engineState = { started: false, polling: false, port: 0, botId: 0 };
+let heartbeatTimer = null;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Last Telegram update offset for a bot: global bots[id] → project → 0. */
+function readLastUpdateId(botId) {
+  const cfg = loadConfig();
+  const entry = cfg.bots?.[String(botId)] || {};
+  return Number(entry.lastUpdateId ?? cfg.lastUpdateId ?? 0) || 0;
+}
+
+/** Token for a bot id (falls back to the configured default bot). */
+function botTokenFor(botId) {
+  return resolveBot(botId)?.botToken || "";
+}
+
+/** True iff THIS process holds the per-bot polling lock (is the active poller). */
+function amIPrimary(botId) {
+  try { return getPollingManager(botId).isActive(); } catch { return false; }
+}
+
+/** Fresh-heartbeat session names for a bot — drives @name routing. */
+function aliveSessionNames(botId) {
+  const db = openDb(true);
+  try {
+    const rows = db.prepare("SELECT session_name FROM relay_sessions WHERE bot_id = ? AND last_heartbeat > ?").all(botId, Date.now() - DEFAULT_LIVENESS_MS);
+    return new Set(rows.map((r) => r.session_name));
+  } catch {
+    return new Set();
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Routing hook fired by the poller for each newly-inserted message. Direct
+ * @name messages are assigned to the named live session (its teleg_listen claims
+ * them); everything else stays unassigned and is claimed by the primary poller.
+ */
+function routeMessage(botId, _update, dbId) {
+  try {
+    const db = openDb();
+    try {
+      const row = db.prepare("SELECT text FROM message_queue WHERE id = ?").get(dbId);
+      const m = row?.text?.match(/^\s*@([A-Za-z0-9_.\-]+)\b/);
+      if (m) {
+        const target = m[1].toLowerCase();
+        if (target !== SESSION_NAME && aliveSessionNames(botId).has(target)) {
+          db.prepare("UPDATE message_queue SET session_id = ?, session_name = ? WHERE id = ? AND status = 'pending'")
+            .run(`__session__:${target}`, target, dbId);
+        }
+      }
+    } finally { db.close(); }
+  } catch { /* best effort */ }
+}
+
+/** Append/refresh this session in the JSON registry (parity with the extension). */
+function touchJsonRegistry(botId) {
+  const reg = readSessionRegistryJson();
+  let s = reg.sessions.find((x) => x.sessionName === SESSION_NAME && x.botId === botId);
+  if (!s) { s = { sessionId: SESSION_ID, sessionName: SESSION_NAME, botId, pid: process.pid, projectDir: PROJECT_DIR }; reg.sessions.push(s); }
+  s.lastHeartbeat = Date.now(); s.pid = process.pid;
+  writeSessionRegistryJson(reg);
+}
+
+function removeFromJsonRegistry(botId) {
+  const reg = readSessionRegistryJson();
+  const before = reg.sessions.length;
+  reg.sessions = reg.sessions.filter((s) => !(s.sessionName === SESSION_NAME && s.botId === botId));
+  if (reg.primaryByBot?.[String(botId)] === SESSION_ID) delete reg.primaryByBot[String(botId)];
+  if (reg.sessions.length !== before) writeSessionRegistryJson(reg);
+}
+
+/** Start the receive engine: relay server + session registration + poller. */
+async function startEngine() {
+  if (engineState.started) return;
+  const botId = Number(config.defaultBotId || config.botId) || 0;
+  if (!botId) return; // send-only mode (no bot configured)
+  const token = botTokenFor(botId);
+  if (!token) return;
+  engineState.botId = botId;
+  try {
+    // 1. Local relay HTTP server → relay file + /health (liveness checks).
+    const relay = await startRelayServer(SESSION_NAME, 9798, botId).catch((e) => { console.error(`[teleg-mcp:${SESSION_NAME}] relay start failed: ${e?.message || e}`); return null; });
+    engineState.port = relay?.port || 0;
+    // 2. Register as a live relay session (DB is source of truth for liveness).
+    Db.registerRelaySession({
+      bot_id: botId, session_name: SESSION_NAME, session_id: SESSION_ID,
+      pid: process.pid, port: engineState.port, secret: relay?.secret || "",
+      project_dir: PROJECT_DIR, description: "omp/mcp standalone", role: "drain",
+    });
+    touchJsonRegistry(botId);
+    // 3. Poller (per-bot lock: a single Telegram getUpdates consumer).
+    const pm = getPollingManager(botId);
+    pm.setConfig(token, readLastUpdateId(botId));
+    pm.onMessage((update, dbId) => routeMessage(botId, update, dbId));
+    pm.onError((e) => console.error(`[teleg-mcp:${SESSION_NAME}] poller error: ${e}`));
+    engineState.polling = await pm.start(SESSION_NAME, DB_PATH);
+    // 4. Heartbeat + failover (take over polling if the lock frees up).
+    heartbeatTimer = setInterval(() => heartbeat(botId), HEARTBEAT_INTERVAL_MS);
+    engineState.started = true;
+    console.error(`[teleg-mcp:${SESSION_NAME}] engine up (polling=${engineState.polling}, port=${engineState.port})`);
+  } catch (err) {
+    console.error(`[teleg-mcp:${SESSION_NAME}] engine start failed: ${err?.message || err}`);
+  }
+}
+
+function heartbeat(botId) {
+  try { Db.heartbeatRelaySession(botId, SESSION_NAME); } catch {}
+  try { touchJsonRegistry(botId); } catch {}
+  try {
+    const pm = getPollingManager(botId);
+    if (!pm.isActive() && !pm.isHeldByOther()) {
+      pm.setConfig(botTokenFor(botId), readLastUpdateId(botId));
+      pm.start(SESSION_NAME, DB_PATH).then((ok) => { engineState.polling = ok; }).catch(() => {});
+    } else {
+      engineState.polling = pm.isActive();
+    }
+  } catch {}
+}
+
+function stopEngine() {
+  try { clearInterval(heartbeatTimer); } catch {}
+  heartbeatTimer = null;
+  const botId = engineState.botId || Number(config.defaultBotId || config.botId) || 0;
+  try { if (botId) getPollingManager(botId)?.stop?.(); } catch {}
+  try { if (botId) unlinkSync(join(AGENT_DIR, "tmp", "teleg-bridge", `polling-${botId}.lock`)); } catch {}
+  try { stopRelayServer(); } catch {}
+  try { cleanRelayFilesByPid(process.pid); } catch {}
+  if (botId) {
+    try { Db.unregisterRelaySession(botId, SESSION_NAME); } catch {}
+    try { removeFromJsonRegistry(botId); } catch {}
+  }
+  engineState.started = false;
+}
+
+/** Build the agent-facing payload for a claimed queue row (reply chain + media). */
+function buildListenPayload(botId, row) {
+  let replyContext = "";
+  let replyAttachments = [];
+  try {
+    if (row.reply_to_message_id) {
+      replyContext = Db.buildReplyChainText(botId, row.chat_id, row.reply_to_message_id) || "";
+      replyAttachments = Db.collectReplyContextAttachments(botId, row.chat_id, row.reply_to_message_id) || [];
+    }
+  } catch {}
+  let attachments = [];
+  try { if (row.attachments) attachments = JSON.parse(row.attachments) || []; } catch {}
+  const seen = new Set();
+  const merged = [];
+  for (const a of [...attachments, ...replyAttachments]) {
+    const path = a && a.path;
+    if (!path || seen.has(path)) continue;
+    seen.add(path);
+    merged.push(a);
+  }
+  return {
+    id: row.id,
+    chat_id: row.chat_id,
+    message_id: row.message_id,
+    from_user_id: row.from_user_id,
+    from_username: row.from_username,
+    text: row.text,
+    reply_context: replyContext,
+    attachments: merged,
+    session: SESSION_NAME,
+    assigned_to_me: true,
+  };
+}
+
+/**
+ * Claim the next pending message for this session. The primary (active poller)
+ * also drains the unassigned queue; non-primary sessions claim only @routed rows.
+ */
+function claimListenItem(botId) {
+  const primary = amIPrimary(botId);
+  let row = Db.claimNextMessageForSession(botId, SESSION_NAME);
+  if (!row && primary) row = Db.claimNextMessage(botId, SESSION_ID, SESSION_NAME);
+  if (!row) return null;
+  const payload = buildListenPayload(botId, row);
+  payload.primary = primary;
+  return payload;
+}
+
 // ─── MCP Protocol (stdio) ────────────────────────────────────────────────────
 
 const TOOL_DEFINITIONS = [
+  {
+    name: "teleg_listen",
+    description: "Blocking long-poll for the next incoming Telegram message routed to this session. CALL THIS IN A LOOP: it blocks until a message arrives (then returns it) or the timeout elapses (then returns {timed_out:true}). When you get a message, handle it using your tools, send the answer with teleg_reply, then call teleg_listen again — keep the loop running so the bot stays responsive. The session that holds the Telegram polling lock (the primary) also receives unassigned messages; prefix a message with @<session> to route it to a named live session. This is how omp / standalone MCP clients receive and process Telegram — no Pi app required.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        timeout_ms: { type: "number", description: "Max ms to block waiting for a message (default 20000; max 120000). On timeout, re-call teleg_listen." },
+        bot_id: { type: "number", description: "Bot ID (optional; defaults to configured default bot)" },
+      },
+    },
+  },
+  {
+    name: "teleg_reply",
+    description: "Reply to an incoming Telegram message and mark it handled. Sends `text` as a Telegram reply to the original message, records the outbound message, and marks the queue item completed. If you already delivered files via teleg-attach, pass empty text to simply mark the item complete. If handling failed, call set_queue_status with status 'failed' (and an error) instead.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "number", description: "Queue message id returned by teleg_listen" },
+        text: { type: "string", description: "Reply text (omit or empty if you only sent attachments)" },
+        bot_id: { type: "number", description: "Bot ID (optional; defaults to configured default bot)" },
+      },
+      required: ["id"],
+    },
+  },
   {
     name: "teleg-send_message",
     description: "Send a text message to a Telegram chat",
@@ -745,7 +972,8 @@ const TOOL_DEFINITIONS = [
 // waiter queue, so pipelined requests and notifications are never lost
 // across calls (the previous per-call listener approach swallowed bytes).
 let _stdinBuffer = "";
-const _stdinWaiters = [];
+const _stdinLines = [];     // parsed messages that arrived before a reader was waiting
+const _stdinWaiters = [];   // readers awaiting a message
 let _stdinListening = false;
 
 function _ensureStdinListener() {
@@ -759,10 +987,15 @@ function _ensureStdinListener() {
       const line = _stdinBuffer.slice(0, idx).trim();
       _stdinBuffer = _stdinBuffer.slice(idx + 1);
       if (!line) continue;
-      const waiter = _stdinWaiters.shift();
-      if (!waiter) continue; // no reader waiting — drop (req/resp clients shouldn't hit this)
-      try { waiter.resolve(JSON.parse(line)); }
-      catch (err) { waiter.reject(err); }
+      try {
+        const msg = JSON.parse(line);
+        const waiter = _stdinWaiters.shift();
+        if (waiter) waiter.resolve(msg);
+        else _stdinLines.push(msg); // no reader YET — buffer instead of dropping
+      } catch (err) {
+        const waiter = _stdinWaiters.shift();
+        if (waiter) waiter.reject(err);
+      }
     }
   });
   process.stdin.on("end", () => {
@@ -773,6 +1006,8 @@ function _ensureStdinListener() {
 function readRequest() {
   return new Promise((resolve, reject) => {
     _ensureStdinListener();
+    // Drain a buffered message first so pipelined requests are never lost.
+    if (_stdinLines.length) { resolve(_stdinLines.shift()); return; }
     _stdinWaiters.push({ resolve, reject });
   });
 }
@@ -1159,6 +1394,42 @@ async function handleRequest(req) {
         return;
       }
 
+      // ─── Receive-path tools (omp / standalone MCP) ──────────────────────
+      if (name === "teleg_listen") {
+        const botId = scopeBot(args);
+        if (!botId) throw new Error("No bot configured for teleg_listen");
+        const timeoutMs = Math.min(Math.max(Number(args?.timeout_ms) || LISTEN_DEFAULT_MS, 1000), LISTEN_MAX_MS);
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+          const item = claimListenItem(botId);
+          if (item) { sendResponse(id, item); return; }
+          await sleep(POLL_INTERVAL_MS);
+        }
+        sendResponse(id, { timed_out: true, session: SESSION_NAME, primary: amIPrimary(botId) });
+        return;
+      }
+      if (name === "teleg_reply") {
+        const bot = resolveBot(args?.bot_id);
+        if (!bot) throw new Error("No bot token configured");
+        const msgId = Number(args?.id);
+        if (!msgId || !Number.isFinite(msgId)) throw new Error("id (queue message id) required");
+        const text = typeof args?.text === "string" ? args.text : "";
+        let row;
+        try { row = Db.getDb().prepare("SELECT chat_id, message_id, status FROM message_queue WHERE id = ?").get(msgId); }
+        catch (e) { throw new Error(`Failed to read message ${msgId}: ${e.message}`); }
+        if (!row) throw new Error(`No queue message with id ${msgId}`);
+        let sentMessageId = null;
+        if (text.trim().length > 0) {
+          const sent = await tg(bot, "sendMessage", { chat_id: row.chat_id, text, parse_mode: "HTML", reply_to_message_id: row.message_id });
+          sentMessageId = sent?.message_id ?? null;
+          if (sentMessageId) {
+            try { Db.recordOutboundMessage({ bot_id: bot.botId, chat_id: row.chat_id, message_id: sentMessageId, reply_to_message_id: row.message_id, from_session: SESSION_NAME, text }); } catch {}
+          }
+        }
+        try { Db.completeMessage(msgId, text || null); } catch {}
+        sendResponse(id, { ok: true, id: msgId, sent_message_id: sentMessageId, completed: true });
+        return;
+      }
       throw new Error(`Unknown tool: ${name}`);
     }
 
@@ -1172,6 +1443,7 @@ async function handleRequest(req) {
 
 async function main() {
   try {
+    void startEngine(); // omp/standalone receive path: poll + register + route
     while (true) {
       try {
         const req = await readRequest();
@@ -1181,9 +1453,20 @@ async function main() {
         console.error("[teleg-mcp] Error:", err.message);
       }
     }
+    // stdin closed — tear down the engine and exit so the poller worker, relay
+    // server, and heartbeat timer don't keep the process alive as a zombie.
+    stopEngine();
+    process.exit(0);
   } catch {
     // Exit on stdin close
   }
 }
 
 main();
+
+// Graceful engine teardown on shutdown: release the polling lock, stop the
+// relay server, and unregister the session so peers/reconcile see us gone.
+function shutdown(code) { try { stopEngine(); } catch {} process.exit(code); }
+process.on("SIGTERM", () => shutdown(0));
+process.on("SIGINT", () => shutdown(130));
+process.on("beforeExit", () => { try { stopEngine(); } catch {} });
