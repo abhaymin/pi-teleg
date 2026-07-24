@@ -1,0 +1,41 @@
+---
+description: Maintain openwiki/ by default — read it for context, update it when the repo changes (even if the user does not ask)
+alwaysApply: true
+---
+
+# OpenWiki maintenance (default)
+
+Agent-oriented docs live in `openwiki/` (OKF). Treat them as a first-class deliverable for this repo.
+
+## Read
+
+- For repo layout, modules, actions, runtime paths, automation, or invariants: start at `openwiki/index.md`, then the linked concept page — do not dump the whole wiki into context.
+- Prefer the wiki over blind grepping; then open the named source file.
+
+## Update (default, not optional)
+
+**Do not wait for the user to say “update wiki” / “document this”.** Self-documentation is part of finishing any material change (same bar as a green build).
+
+When you **add, remove, rename, or materially change** any of the following, update the matching wiki pages in the **same change** (before finishing):
+
+- Top-level folders / surfaces → `openwiki/index.md` + `overview.md`
+- `src/*` modules or MCP surface → `openwiki/modules/`
+- Tools, Telegram commands, Pi slash, or `teleg` CLI → `openwiki/actions/`
+- Config / DB / lock / relay paths → `openwiki/runtime/`
+- Polling / routing / relay flow → `openwiki/architecture.md`
+- Hard invariants / bugs → `openwiki/gotchas.md`
+- Install / deploy → `openwiki/automation.md`
+- Plan status → `openwiki/plans/`
+
+Also append a short entry to `openwiki/log.md` for non-trivial wiki edits.
+
+## Format
+
+- Concept pages: YAML front matter with `type`, `title`, `description`, `tags`
+- Reserved: nested `index.md` (no concept front matter) and `log.md`
+- Document **why / invariants**, not a code dump; never invent paths that are not on disk
+- Keep `openwiki/INSTRUCTIONS.md` as the human brief; do not rewrite it unless asked
+
+## Do not skip
+
+Finishing a structural or user-visible feature/API/tool change without an OpenWiki update is incomplete work in this repo — whether or not the user mentioned docs.
