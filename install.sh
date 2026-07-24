@@ -560,10 +560,10 @@ PY
     log ""
     log "App-specific hints:"
     log "  claude   teleg mcp --app claude --write   →  ~/.claude.json (mcpServers)"
-    log "  pi       already wired by deploy.sh        →  ~/.pi/agent/mcp.json"
     log "  omp      teleg mcp --app omp --write       →  ~/.omp/agent/mcp.json (type:stdio)"
     log "  opencode teleg mcp --app opencode          →  print opencode format"
     log "  kilo     teleg mcp --app kilo              →  print kilo format"
+    log "  pi       DO NOT use MCP — native extension only (./deploy.sh → settings.json)"
     return 0
   fi
 
@@ -572,8 +572,21 @@ PY
     claude|claude-code)
       target="$HOME/.claude.json"; kind="mcpServers"; entry="$(pi_entry "$mcp_path")" ;;
     pi)
-      # Pi runs the NATIVE extension (deploy.sh); the MCP is optional here.
-      target="$HOME/.pi/agent/mcp.json"; kind="mcpServers"; entry="$(pi_entry "$mcp_path")" ;;
+      # Pi must load the NATIVE extension only. Dual-loading MCP duplicates every
+      # tool name. deploy.sh wires the extension and strips teleg-bridge from
+      # ~/.pi/agent/mcp.json — never write MCP into Pi from this CLI.
+      local pi_mcp="$HOME/.pi/agent/mcp.json"
+      if [[ -f "$pi_mcp" ]]; then
+        prune_mcp "$pi_mcp"
+      fi
+      log "Pi uses the native teleg-bridge extension — MCP must NOT be installed in Pi."
+      log "  Extension path: ensure ./deploy.sh added this repo to ~/.pi/agent/settings.json"
+      log "  MCP config:     teleg-bridge entry removed from $pi_mcp (if it was present)"
+      log "  For other apps: teleg mcp --app omp|claude|opencode|kilo [--write]"
+      if [[ "$do_write" == true ]]; then
+        warn "Ignoring --write for --app pi (MCP is intentionally not wired into Pi)."
+      fi
+      return 0 ;;
     omp|oh-my-pi)
       # OMP (oh-my-pi) is a separate runtime: ~/.omp/agent/mcp.json, stdio transport.
       target="$HOME/.omp/agent/mcp.json"; kind="mcpServers"; entry="$(stdio_entry "$mcp_path")" ;;
@@ -596,7 +609,7 @@ print(json.dumps({"mcpServers": {"teleg-bridge": {"command": "node", "args": [os
 PY
       [[ "$do_write" == true ]] && warn "Kilo Code stores MCP via its UI/extension settings — copy the snippet above."
       return 0 ;;
-    *) die "Unknown app '$app'. Try: claude, pi, omp, opencode, kilo" ;;
+    *) die "Unknown app '$app'. Try: claude, omp, opencode, kilo (not pi — use native extension)" ;;
   esac
 
   # mcpServers-style targets (claude, pi, omp): merge non-clobberingly on --write.
@@ -633,7 +646,10 @@ Usage:
   teleg uninstall [--home PATH] [--purge] [-y]      (alias: remove)
   teleg status
   teleg version
-  teleg mcp [--app claude|pi|omp|opencode|kilo] [--write] [--path PATH]
+  teleg mcp [--app claude|omp|opencode|kilo] [--write] [--path PATH]
+             Emit or merge the standalone MCP server config for THIRD-PARTY
+             clients. Pi must NOT load this MCP — use the native extension
+             (./deploy.sh). --app pi only prunes a stale teleg-bridge entry.
   teleg help
 
 Channels:

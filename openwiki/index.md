@@ -45,6 +45,8 @@ Runtime state lives under **`~/.pi/agent/`** (DB, config, locks, relay, media) â
 | [Automation](automation.md) | `install.sh` / `deploy.sh` / channels |
 | [Gotchas](gotchas.md) | Polling lock, dual-load, reply media, orphans |
 
+**Pi:** native extension only (no teleg MCP). **Other apps:** standalone MCP via `teleg mcp --app â€¦`.
+
 ## Top-level on disk (scanned 2026-07-25)
 
 | Path | Role |

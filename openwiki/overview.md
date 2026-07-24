@@ -27,7 +27,7 @@ Make Telegram a practical control plane for Pi coding agents:
 | **Standalone MCP** | `mcp-server/index.js` | No | Same tools + `teleg_listen` / `teleg_reply` | omp, Claude Code, OpenCode, Kilo, … |
 | **CLI** | `install.sh` → `teleg` | n/a | install / update / mcp wire | Host ops |
 
-**Pi must load the extension only.** Dual-loading extension + MCP duplicates tool names. `deploy.sh` strips `teleg-bridge` from `~/.pi/agent/mcp.json`.
+**Pi must load the extension only.** Dual-loading extension + MCP duplicates tool names. `deploy.sh` strips `teleg-bridge` from `~/.pi/agent/mcp.json`. `teleg mcp --app pi` refuses to write MCP into Pi and only prunes a stale entry. Use `teleg mcp --app omp|claude|…` for other apps.
 
 ## Package / build
 
