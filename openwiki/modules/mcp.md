@@ -17,6 +17,10 @@ Plain Node stdio JSON-RPC MCP. Uses `better-sqlite3` and the **same** `~/.pi/age
 | Tools | Full set | Same names + `teleg_listen`, `teleg_reply` |
 | Polling | Yes | **No** |
 | `teleg-attach` | Queue onto active turn | Send immediately |
+| Reply-to media (inbound) | Live + drain turns | `teleg_listen` merges `reply_context` + parent paths |
+| Outbound media record | Yes (schema v6) | Yes — send_photo/video/document + attach via `recordOutboundMedia` |
+
+Parent media **download/backfill** still runs in the poll worker (usually Pi). MCP reads the shared DB afterward.
 
 ## When to use
 

@@ -37,7 +37,7 @@ User replies "what's in this?" (reply_to that message)
 | Live turn | `src/index.ts` → `buildReplyChain` |
 | Drain turn | `src/polling-manager.ts` → `buildTurn` |
 | MCP payload | `mcp-server/index.js` → `buildListenPayload` |
-| Outbound media record | `recordOutboundMessage(..., attachments)` after `teleg-send_photo/video/document` and attach sends |
+| Outbound media record | `recordOutboundMessage(..., attachments)` after `teleg-send_photo/video/document` and attach sends (extension **and** MCP) |
 
 ## Schema (v6)
 

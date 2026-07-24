@@ -1,5 +1,10 @@
 # OpenWiki log
 
+## 2026-07-25 — MCP outbound media parity
+
+- MCP `teleg-send_photo/video/document` and `teleg-attach` now record `outbound_messages.attachments` (same as extension).
+- Updated `modules/mcp.md` and `runtime/reply-context.md`.
+
 ## 2026-07-25 — Reply-context media recovery
 
 - Added `runtime/reply-context.md`; updated architecture, overview, extension, polling, database, config-db, gotchas, index.

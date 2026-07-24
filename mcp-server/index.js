@@ -247,6 +247,37 @@ async function sendDocument(bot, filePath, caption = "", chatId) {
   return data.result;
 }
 
+/** Infer attachment type from path when the caller does not force one. */
+function mediaTypeForPath(filePath) {
+  const ext = (filePath.split(".").pop() || "").toLowerCase();
+  if (["jpg", "jpeg", "png", "gif", "webp"].includes(ext)) return "image";
+  if (["mp4", "mov", "mkv", "webm", "avi"].includes(ext)) return "video";
+  return "document";
+}
+
+/**
+ * Persist bot-sent media so a later user reply-to can resolve local paths
+ * (parity with the Pi extension's outbound_messages.attachments recording).
+ */
+function recordOutboundMedia(bot, sentResult, filePath, type, caption, chatId) {
+  const messageId = sentResult?.message_id;
+  if (!messageId || !bot?.botId) return;
+  const target = Number(chatId ?? bot.chatId);
+  if (!Number.isFinite(target) || !target) return;
+  const fileName = basename(filePath);
+  const kind = type || mediaTypeForPath(filePath);
+  try {
+    Db.recordOutboundMessage({
+      bot_id: bot.botId,
+      chat_id: target,
+      message_id: messageId,
+      from_session: SESSION_NAME,
+      text: (caption && String(caption).trim()) || `(${kind}: ${fileName})`,
+      attachments: JSON.stringify([{ path: filePath, fileName, type: kind }]),
+    });
+  } catch { /* best-effort — never fail the send */ }
+}
+
 async function getMe(bot) {
   return tg(bot, "getMe");
 }
@@ -1059,19 +1090,25 @@ async function handleRequest(req) {
       if (name === "teleg-send_photo") {
         const bot = resolveBot(args?.bot_id);
         if (!bot) throw new Error("No bot token configured");
-        sendResponse(id, await sendPhoto(bot, args.file_path, args.caption ?? "", args.chat_id));
+        const result = await sendPhoto(bot, args.file_path, args.caption ?? "", args.chat_id);
+        recordOutboundMedia(bot, result, args.file_path, "image", args.caption ?? "", args.chat_id);
+        sendResponse(id, result);
         return;
       }
       if (name === "teleg-send_video") {
         const bot = resolveBot(args?.bot_id);
         if (!bot) throw new Error("No bot token configured");
-        sendResponse(id, await sendVideo(bot, args.file_path, args.caption ?? "", args.chat_id));
+        const result = await sendVideo(bot, args.file_path, args.caption ?? "", args.chat_id);
+        recordOutboundMedia(bot, result, args.file_path, "video", args.caption ?? "", args.chat_id);
+        sendResponse(id, result);
         return;
       }
       if (name === "teleg-send_document") {
         const bot = resolveBot(args?.bot_id);
         if (!bot) throw new Error("No bot token configured");
-        sendResponse(id, await sendDocument(bot, args.file_path, args.caption ?? "", args.chat_id));
+        const result = await sendDocument(bot, args.file_path, args.caption ?? "", args.chat_id);
+        recordOutboundMedia(bot, result, args.file_path, "document", args.caption ?? "", args.chat_id);
+        sendResponse(id, result);
         return;
       }
       if (name === "get_me") {
@@ -1097,9 +1134,12 @@ async function handleRequest(req) {
           const isImage = ["jpg", "jpeg", "png", "gif", "webp"].includes(ext);
           const isVideo = ["mp4", "mov", "mkv", "webm", "avi"].includes(ext);
           const caption = i === 0 ? (args.caption ?? "") : "";
-          if (isImage) await sendPhoto(bot, p, caption, target);
-          else if (isVideo) await sendVideo(bot, p, caption, target);
-          else await sendDocument(bot, p, caption, target);
+          let result;
+          let kind;
+          if (isImage) { result = await sendPhoto(bot, p, caption, target); kind = "image"; }
+          else if (isVideo) { result = await sendVideo(bot, p, caption, target); kind = "video"; }
+          else { result = await sendDocument(bot, p, caption, target); kind = "document"; }
+          recordOutboundMedia(bot, result, p, kind, caption, target);
           sent.push(p);
         }
         sendResponse(id, { sent, count: sent.length, chat_id: target });
