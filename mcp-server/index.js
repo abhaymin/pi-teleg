@@ -789,12 +789,10 @@ function heartbeat(botId) {
     }
     autoFixInFlight = true;
     lastAutoFixAtMs = Date.now();
-    console.error(`[teleg-mcp:${SESSION_NAME}] auto-fix health after ${Math.round(waited / 1000)}s degraded`);
     fixDegradedHealth(botId, { force: false }).then((r) => {
       engineState.polling = !!r.details?.polling || getPollingManager(botId).isActive();
       if (r.ok) degradedSinceMs = null;
       else degradedSinceMs = Date.now();
-      if (!r.ok) console.error(`[teleg-mcp:${SESSION_NAME}] auto-fix health still degraded`);
     }).catch((err) => {
       console.error(`[teleg-mcp:${SESSION_NAME}] auto-fix health failed:`, err?.message || err);
     }).finally(() => { autoFixInFlight = false; });

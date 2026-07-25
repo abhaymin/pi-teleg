@@ -1,9 +1,9 @@
 ---
 type: concept
 title: Gotchas
-description: Hard traps — polling lock, dual-load, unassigned orphans, split DB, attach/media limits.
+description: Hard traps — polling lock, dual-load, unassigned orphans, split DB, attach/media limits, health UX.
 tags: [gotchas, pitfalls, invariants]
-timestamp: 2026-07-25T00:30:00Z
+timestamp: 2026-07-25T11:50:00Z
 ---
 
 # Gotchas
@@ -90,11 +90,19 @@ Empty local allowlist arrays do not wipe non-empty global allowlists.
 
 ## Auto health repair (enabled folders)
 
-When teleg is **not** disabled for the Pi project folder (`teleg-disabled.json`), DEGRADED / stopped polling is repaired automatically **only after it stays bad for an extended period** (default **5 minutes**, override with `TELEG_AUTO_FIX_DEGRADED_MS`):
+When teleg is **not** disabled, DEGRADED / stopped polling is repaired **only after it stays bad ~5 minutes** (`TELEG_AUTO_FIX_DEGRADED_MS`).
 
-- health events / the 30s timer only *track* the degraded window
-- auto-fix runs once that window exceeds the threshold (plus a 60s cooldown between attempts)
-- Manual `/teleg-fix-health` / tool `teleg-fix-health` still repairs immediately
+**UX (do not dump into the prompt):** health is shown only on the extension footer via `ctx.ui.setStatus`:
+
+| Glyph | Meaning |
+|---|---|
+| `✓` | healthy |
+| `⚠` | degraded (waiting / errors) |
+| `↻` | poller stopped, reconnecting |
+| `🔧` | auto-fix in flight |
+| `●` | active Telegram turn |
+
+No countdown `console.log` into the content edit area. Manual `/teleg-fix-health` still repairs immediately and may notify once.
 
 Disabled folders skip the engine entirely.
 

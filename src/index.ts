@@ -696,8 +696,41 @@ export default function (pi: ExtensionAPI): void {
   }
 
   // ─── Status UI ────────────────────────────────────────────────────────
+  // Health belongs in the extension footer badge (setStatus), not console dumps
+  // into the Pi content/prompt area — VS Code status-bar + Pi statusline pattern.
+
+  let uiCtxRef: ExtensionContext | undefined;
+  let lastAutoFixAt = 0;
+  let autoFixInFlight = false;
+  /** When DEGRADED / stopped was first observed; cleared once healthy again. */
+  let degradedSince: number | null = null;
+  const AUTO_FIX_COOLDOWN_MS = 60_000;
+  /** Only auto-repair after health stays bad this long (manual /teleg-fix-health is immediate). */
+  const AUTO_FIX_DEGRADED_FOR_MS = parseInt(process.env.TELEG_AUTO_FIX_DEGRADED_MS || String(5 * 60_000), 10);
+
+  function healthNeedsRepair(): boolean {
+    const pm = currentPollingManager();
+    if (!pm || !currentBotToken()) return false;
+    if (!pm.isActive() && !pm.isHeldByOther()) return true;
+    const h = pm.getState();
+    return !h.isHealthy || h.consecutiveErrors >= 3;
+  }
+
+  function sampleDegradedWindow(): void {
+    if (!healthNeedsRepair()) {
+      degradedSince = null;
+      return;
+    }
+    if (degradedSince == null) degradedSince = Date.now();
+  }
+
+  function degradedLongEnough(): boolean {
+    if (degradedSince == null) return false;
+    return Date.now() - degradedSince >= AUTO_FIX_DEGRADED_FOR_MS;
+  }
 
   function updateStatus(ctx: ExtensionContext, error?: string): void {
+    uiCtxRef = ctx;
     const theme = ctx.ui.theme;
     const label = `${theme.fg("accent", "teleg")}${theme.fg("muted", ":" + sessionName)}`;
 
@@ -709,32 +742,52 @@ export default function (pi: ExtensionAPI): void {
       isHealthy: true,
       lastHealthCheck: Date.now(),
     };
-    const healthIndicator = pollState.isHealthy ? "✓" : "✗";
-    const errorIndicator = pollState.consecutiveErrors > 0
-      ? ` [${pollState.consecutiveErrors} errs]`
-      : "";
 
     if (error) {
-      ctx.ui.setStatus("teleg-bridge", `${label} ${theme.fg("error", "error")} ${theme.fg("muted", error)}${errorIndicator}`);
+      ctx.ui.setStatus("teleg-bridge", `${label} ${theme.fg("error", "✕")} ${theme.fg("muted", error)}`);
       return;
     }
     if (!currentBotToken() || !pm) {
-      ctx.ui.setStatus("teleg-bridge", `${label} ${theme.fg("muted", "not configured")}`);
+      ctx.ui.setStatus("teleg-bridge", `${label} ${theme.fg("muted", "○")}`);
       return;
     }
-    if (!pm.isActive() && !pm.isHeldByOther()) {
-      ctx.ui.setStatus("teleg-bridge", `${label} ${theme.fg("warning", "reconnecting...")}`);
-      return;
-    }
-    // All sessions are active — show queue depth whether polling or drain-only
+
     const queueDepth = pm.getQueueDepth();
     const selfQueue = Db.getPendingCountForSession(pm.botId, sessionName);
-    const activeIndicator = state.activeTurn
-      ? theme.fg("accent", "●")
-      : theme.fg("success", healthIndicator);
-    const queued = queueDepth > 0 ? ` +${queueDepth}` : "";
-    const selfQ = selfQueue > 0 ? ` [${selfQueue}]` : "";
-    ctx.ui.setStatus("teleg-bridge", `${label} ${activeIndicator}${queued}${selfQ}${errorIndicator}`);
+    const queued = queueDepth > 0 ? theme.fg("muted", ` +${queueDepth}`) : "";
+    const selfQ = selfQueue > 0 ? theme.fg("muted", ` [${selfQueue}]`) : "";
+
+    // Compact glyph in the footer only — never dump health text into the prompt.
+    let glyph: string;
+    let color: "success" | "warning" | "error" | "accent" | "muted";
+    if (autoFixInFlight) {
+      glyph = "🔧";
+      color = "warning";
+    } else if (state.activeTurn) {
+      glyph = "●";
+      color = "accent";
+    } else if (!pm.isActive() && !pm.isHeldByOther()) {
+      glyph = "↻";
+      color = "warning";
+    } else if (!pollState.isHealthy || pollState.consecutiveErrors >= 3) {
+      glyph = "⚠";
+      color = "warning";
+    } else if (pollState.consecutiveErrors > 0) {
+      glyph = "○";
+      color = "warning";
+    } else if (pm.isHeldByOther()) {
+      glyph = "✓";
+      color = "muted";
+    } else {
+      glyph = "✓";
+      color = "success";
+    }
+
+    ctx.ui.setStatus("teleg-bridge", `${label} ${theme.fg(color, glyph)}${queued}${selfQ}`);
+  }
+
+  function refreshStatusBar(): void {
+    if (uiCtxRef) updateStatus(uiCtxRef);
   }
 
   // ─── Session lifecycle ────────────────────────────────────────────────
@@ -1930,73 +1983,32 @@ export default function (pi: ExtensionAPI): void {
     return !readDisabledSessions().includes(cwd);
   }
 
-  let lastAutoFixAt = 0;
-  let autoFixInFlight = false;
-  /** When DEGRADED / stopped was first observed; cleared once healthy again. */
-  let degradedSince: number | null = null;
-  const AUTO_FIX_COOLDOWN_MS = 60_000;
-  /** Only auto-repair after health stays bad this long (manual /teleg-fix-health is immediate). */
-  const AUTO_FIX_DEGRADED_FOR_MS = parseInt(process.env.TELEG_AUTO_FIX_DEGRADED_MS || String(5 * 60_000), 10);
-
-  function healthNeedsRepair(): boolean {
-    const pm = currentPollingManager();
-    if (!pm || !currentBotToken()) return false;
-    if (!pm.isActive() && !pm.isHeldByOther()) return true;
-    const h = pm.getState();
-    return !h.isHealthy || h.consecutiveErrors >= 3;
-  }
-
-  /** Track continuous degradation window; reset when healthy. */
-  function sampleDegradedWindow(): void {
-    if (!healthNeedsRepair()) {
-      degradedSince = null;
-      return;
-    }
-    if (degradedSince == null) degradedSince = Date.now();
-  }
-
-  function degradedLongEnough(): boolean {
-    if (degradedSince == null) return false;
-    return Date.now() - degradedSince >= AUTO_FIX_DEGRADED_FOR_MS;
-  }
-
   /**
-   * When teleg is enabled for this folder, auto-run /teleg-fix-health only after
-   * polling has been DEGRADED/stopped for an extended period (default 5m).
-   * Manual /teleg-fix-health is unchanged (immediate).
+   * Auto-repair only after an extended DEGRADED window. Updates the footer glyph
+   * only — never console.log into the Pi prompt/content area.
    */
-  async function maybeAutoFixHealth(reason: string): Promise<void> {
+  async function maybeAutoFixHealth(_reason: string): Promise<void> {
     if (!isTelegEnabledHere()) return;
     if (autoFixInFlight) return;
     sampleDegradedWindow();
+    refreshStatusBar();
     if (!healthNeedsRepair()) return;
-    if (!degradedLongEnough()) {
-      const waited = degradedSince != null ? Math.round((Date.now() - degradedSince) / 1000) : 0;
-      if (reason === "periodic") {
-        console.log(
-          `[teleg:${sessionName}] Health degraded ${waited}s — auto-fix after ${Math.round(AUTO_FIX_DEGRADED_FOR_MS / 1000)}s`,
-        );
-      }
-      return;
-    }
+    if (!degradedLongEnough()) return;
     const now = Date.now();
     if (now - lastAutoFixAt < AUTO_FIX_COOLDOWN_MS) return;
     autoFixInFlight = true;
     lastAutoFixAt = now;
+    refreshStatusBar(); // shows 🔧
     try {
-      const waitedSec = degradedSince != null ? Math.round((now - degradedSince) / 1000) : 0;
-      console.log(`[teleg:${sessionName}] Auto-fixing degraded health after ${waitedSec}s (${reason})...`);
       const result = await fixDegradedHealth({ forceRestart: false });
-      const action = String(result.details.pollingAction ?? "?");
-      console.log(
-        `[teleg:${sessionName}] Auto-fix health: ${result.ok ? "OK" : "still degraded"} (action=${action})`,
-      );
       if (result.ok) degradedSince = null;
-      else degradedSince = Date.now(); // restart the extended window after a failed attempt
+      else degradedSince = Date.now();
     } catch (err) {
+      // Keep a single stderr line for operators; do not dump into the prompt.
       console.error(`[teleg:${sessionName}] Auto-fix health failed:`, err);
     } finally {
       autoFixInFlight = false;
+      refreshStatusBar();
     }
   }
 
@@ -3074,13 +3086,11 @@ export default function (pi: ExtensionAPI): void {
       const pollingStarted = await pm.start(sessionName, currentDbPath());
       Db.updateRelayRole(botId, sessionName, pollingStarted ? "active" : "drain");
       if (pollingStarted) Db.setPrimary(botId, sessionName);
-      // Track degradation; auto-fix only after an extended unhealthy window (see maybeAutoFixHealth).
+      // Health glyph in footer only; silent repair once DEGRADED persists (no prompt spam).
       pm.onHealth((h) => {
-        if (!h.isHealthy || h.consecutiveErrors >= 3) {
-          sampleDegradedWindow();
-        } else {
-          degradedSince = null;
-        }
+        if (!h.isHealthy || h.consecutiveErrors >= 3) sampleDegradedWindow();
+        else degradedSince = null;
+        refreshStatusBar();
       });
     }
 
@@ -3192,13 +3202,15 @@ export default function (pi: ExtensionAPI): void {
       }
     });
 
-    // Periodic tasks: heartbeat, reconcile, and auto health repair (enabled folders only)
+    // Periodic tasks: heartbeat, reconcile, and silent auto health repair (footer glyph only)
     setInterval(async () => {
       if (!isTelegEnabledHere()) return;
       await heartbeatSession();
       if (botId) {
         await reconcileSessions(botId).catch((err) => console.error(`[teleg:${sessionName}] Reconcile failed:`, err));
       }
+      sampleDegradedWindow();
+      refreshStatusBar();
       await maybeAutoFixHealth("periodic");
     }, 30000);
 

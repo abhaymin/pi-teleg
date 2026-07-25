@@ -1,5 +1,13 @@
 # OpenWiki log
 
+## 2026-07-25 — Health status in footer only
+
+- Auto health repair no longer dumps countdown / fix lines into the Pi content/prompt area.
+- Ambient health uses extension footer glyphs via `ctx.ui.setStatus` (`✓` / `⚠` / `↻` / `🔧` / `●`).
+- Auto-fix still waits ~5m (`TELEG_AUTO_FIX_DEGRADED_MS`); manual `/teleg-fix-health` is immediate.
+- Outbound tools resolve chat via active turn → `allowedChatIds` → `allowedUserIds`.
+- Updated `gotchas.md` (glyph table) and `modules/extension.md`.
+
 ## 2026-07-25 — Shared-bot instance links
 
 - Schema v7: `relay_sessions.linked_chat_ids` / `linked_user_ids`.
@@ -15,15 +23,14 @@
 
 ## 2026-07-25 — Auto-fix health when enabled
 
-- Enabled Pi folders auto-run `fixDegradedHealth` on session_start, health events, and the 30s timer (60s cooldown).
+- Enabled folders auto-repair after an **extended** DEGRADED window (default 5m), not on every blip.
+- Status is footer-only (see “Health status in footer only”); no prompt spam.
 - Disabled projects (`teleg-disabled.json`) skip auto-repair with the rest of the engine.
-- MCP heartbeat uses the same full repair path.
 
 ## 2026-07-25 — Fix degraded health
 
 - Added `/teleg-fix-health`, Pi slash `/teleg-fix-health`, tool `teleg-fix-health` (extension + MCP).
 - Repairs: Telegram getMe probe, stale processing recovery, session reconcile, poller restart when lock free.
-- Auto-restart loop now also recovers DEGRADED pollers (`consecutiveErrors >= 3`).
 - Updated telegram / pi-slash / tools / gotchas.
 
 ## 2026-07-25 — MCP outbound media parity
