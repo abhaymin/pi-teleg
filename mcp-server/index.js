@@ -22,6 +22,7 @@
  *   > global  ~/.pi/agent/teleg-bridge.json (multi-bot via `bots`)
  */
 
+import "../dist/suppress-sqlite-warning.js";
 import { readFileSync, writeFileSync, existsSync, createReadStream, unlinkSync, readdirSync } from "fs";
 import { join, dirname, basename } from "path";
 import { fileURLToPath } from "url";

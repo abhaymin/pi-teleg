@@ -13,6 +13,7 @@
  * DB path: env TELEG_DB_PATH → workerData.dbPath → ~/.pi/agent/teleg-bridge.db
  */
 
+import "./suppress-sqlite-warning.js";
 import { parentPort, workerData } from "node:worker_threads";
 import type { DatabaseSync } from "node:sqlite";
 import { openSqlite } from "./sqlite-driver.js";

@@ -8,7 +8,7 @@ timestamp: 2026-07-24T16:00:00Z
 
 # MCP server — `mcp-server/index.js`
 
-Plain Node stdio JSON-RPC MCP. Uses `better-sqlite3` and the **same** `~/.pi/agent/teleg-bridge.{json,db}` as the extension.
+Plain Node stdio JSON-RPC MCP. Uses built-in `node:sqlite` (same as Pi) and the **same** `~/.pi/agent/teleg-bridge.{json,db}` as the extension. Imports `dist/suppress-sqlite-warning.js` first so Node’s SQLite `ExperimentalWarning` does not leak to the host console (see [gotchas](../gotchas.md)).
 
 ## Parity
 

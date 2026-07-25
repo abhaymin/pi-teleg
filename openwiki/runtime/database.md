@@ -8,7 +8,9 @@ timestamp: 2026-07-24T16:00:00Z
 
 # SQLite database
 
-Default: `~/.pi/agent/teleg-bridge.db`. Pragmas: WAL, `busy_timeout=5000`, `synchronous=NORMAL`. `user_version = 6`.
+Default: `~/.pi/agent/teleg-bridge.db`. Pragmas: WAL, `busy_timeout=5000`, `synchronous=NORMAL`. `user_version = 7`.
+
+**Who opens it:** Pi extension / poll-worker via `openSqlite` (Node `node:sqlite` or Bun `bun:sqlite`); MCP via Node `node:sqlite`. CLI does not open the DB. All share this file when paths match. Node’s SQLite `ExperimentalWarning` is filtered — see [gotchas](../gotchas.md).
 
 ## Tables
 

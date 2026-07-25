@@ -62,8 +62,8 @@ getUpdates (worker thread)
 - Extension owns polling; MCP does not start workers.
 - Worker **does not route** — only persist + notify (+ reply-parent media ensure).
 - Allowlists: `allowedUserIds` (DMs) vs `allowedChatIds` (groups/channels).
-- Schema version: `PRAGMA user_version = 6` after migrations (`src/db.ts`).
-- Bun/Node SQLite via `src/sqlite-driver.ts` only — do not import `node:sqlite` in shared paths.
+- Schema version: `PRAGMA user_version = 7` after migrations (`src/db.ts`).
+- Bun/Node SQLite via `src/sqlite-driver.ts` only — do not import `node:sqlite` in shared paths. MCP (Node-only) may use `node:sqlite` directly but must import `suppress-sqlite-warning` first (see [gotchas](gotchas.md)).
 - Reply-to media: agent must read local paths from the turn; users should not need to re-send images.
 
 ## Related

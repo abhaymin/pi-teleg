@@ -17,6 +17,7 @@
  * - src/relay.ts: Inter-session command forwarding
  */
 
+import "./suppress-sqlite-warning.js";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";

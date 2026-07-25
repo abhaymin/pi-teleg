@@ -10,7 +10,17 @@ timestamp: 2026-07-24T16:00:00Z
 
 ## `src/sqlite-driver.ts`
 
-Runtime-neutral open: Node `node:sqlite` vs Bun `bun:sqlite`. **All** DB opens go through `openSqlite` — never import `node:sqlite` directly in shared code (omp/Bun vs Pi/Node).
+Runtime-neutral open: Node `node:sqlite` vs Bun `bun:sqlite`. **All** extension/shared DB opens go through `openSqlite` — never import `node:sqlite` directly in shared code (omp/Bun vs Pi/Node).
+
+Loads `src/suppress-sqlite-warning.ts` first so Node’s SQLite `ExperimentalWarning` does not leak into the Pi content console (see [gotchas](../gotchas.md)).
+
+| Entrypoint | How SQLite is opened |
+|---|---|
+| Extension + poll-worker + `db.ts` | `openSqlite` (`sqlite-driver`) |
+| MCP | direct `node:sqlite` + suppress import (Node-only process) |
+| CLI (`teleg`) | does not open DB; starts MCP / deploys extension |
+
+Requires a Node that provides `node:sqlite` (≈22.5+), or Bun for omp. Same DB path for all Node/Bun processes that share `TELEG_DB_PATH` / default `~/.pi/agent/teleg-bridge.db`.
 
 ## `src/config.ts`
 
@@ -26,7 +36,7 @@ Runtime-neutral open: Node `node:sqlite` vs Bun `bun:sqlite`. **All** DB opens g
 
 ## `src/db.ts`
 
-- `SCHEMA_VERSION = 6` (v2 bot_id → v3 reply_to → v4 attachments/poll_id → v5 relay repair → v6 outbound attachments).
+- `SCHEMA_VERSION = 7` (… → v6 outbound attachments → v7 `linked_chat_ids` / `linked_user_ids`).
 - WAL + `busy_timeout=5000` + `synchronous=NORMAL`.
 - Tables: `message_queue`, `download_queue`, `relay_sessions`, `relay_history`, `pubsub`, `outbound_messages`, `poll_answers`.
 

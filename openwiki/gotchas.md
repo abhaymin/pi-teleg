@@ -1,9 +1,9 @@
 ---
 type: concept
 title: Gotchas
-description: Hard traps — polling lock, dual-load, unassigned orphans, split DB, attach/media limits, health UX.
+description: Hard traps — polling lock, dual-load, unassigned orphans, split DB, attach/media limits, health UX, SQLite warning.
 tags: [gotchas, pitfalls, invariants]
-timestamp: 2026-07-25T11:50:00Z
+timestamp: 2026-07-25T12:25:00Z
 ---
 
 # Gotchas
@@ -87,6 +87,29 @@ When a project folder has `.pi/teleg.json` with a usable `botToken` (and optiona
 - Prefers the pinned `botId` over the global default when selecting bots
 
 Empty local allowlist arrays do not wipe non-empty global allowlists.
+
+## Node SQLite ExperimentalWarning
+
+Pi (and MCP) under Node load built-in `node:sqlite` (still experimental). Node emits:
+
+`ExperimentalWarning: SQLite is an experimental feature and might change at any time`
+
+Pi surfaces that into the content console (often next to pi-lens). teleg installs a **targeted** filter in `src/suppress-sqlite-warning.ts`: monkey-patch `process.emitWarning` and replace the default `warning` listener so only that SQLite experimental warning is dropped (listener cover catches races when `node:sqlite` loads in the same tick). Other warnings still appear.
+
+Do not use blanket `NODE_NO_WARNINGS=1` — it hides real issues.
+
+### Works on which surfaces?
+
+| Surface | Opens SQLite? | Backend | Warning suppressed? |
+|---|---|---|---|
+| **Pi extension** | Yes | `node:sqlite` (Pi/Node) or `bun:sqlite` (omp/Bun) via `openSqlite` | Yes (Node only; Bun never emits this warning) |
+| **Poll worker** | Yes | same as extension | Yes |
+| **MCP** (`mcp-server/index.js`) | Yes | `node:sqlite` | Yes (imports suppress first) |
+| **CLI** (`teleg`) | No | — | N/A; wires install / `teleg mcp`; MCP inherits the filter when Node starts it |
+
+Shared DB: `~/.pi/agent/teleg-bridge.db` (or `TELEG_DB_PATH`) — same file for extension + MCP.
+
+**Runtime requirement:** Node must actually ship `node:sqlite` (roughly Node **22.5+**; still experimental). Bun is fine for omp via `bun:sqlite`. `install.sh` only checks Node ≥18 — older 18/20 hosts will fail to open the DB, not merely warn. Keep a current teleg build so `suppress-sqlite-warning` is present.
 
 ## Auto health repair (enabled folders)
 

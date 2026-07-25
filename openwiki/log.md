@@ -1,5 +1,22 @@
 # OpenWiki log
 
+## 2026-07-25 — SQLite surfaces / runtime docs
+
+- Documented which surfaces open SQLite (extension, poll-worker, MCP) vs CLI (does not).
+- Clarified Node ≈22.5+ / `node:sqlite` requirement; Bun uses `bun:sqlite` (no Node ExperimentalWarning).
+- MCP docs: `node:sqlite` + suppress (was stale `better-sqlite3`); `database.md` schema note → v7.
+- Matrix in `gotchas.md`; entrypoint table in `modules/config-db.md`.
+
+## 2026-07-25 — SQLite ExperimentalWarning race cover
+
+`suppress-sqlite-warning` now also replaces the default `process` `warning` listener so a parallel `node:sqlite` import cannot still print the experimental warning after emitWarning was patched too late.
+
+## 2026-07-25 — Suppress Node SQLite ExperimentalWarning
+
+- Added `src/suppress-sqlite-warning.ts`; imported first from extension, poll-worker, sqlite-driver, and MCP.
+- Stops `ExperimentalWarning: SQLite is an experimental feature…` from leaking into the Pi content console.
+- Documented in `gotchas.md`.
+
 ## 2026-07-25 — Health status in footer only
 
 - Auto health repair no longer dumps countdown / fix lines into the Pi content/prompt area.

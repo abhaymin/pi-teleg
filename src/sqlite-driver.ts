@@ -11,8 +11,10 @@
  * the runtime object under Bun is a structurally-compatible `bun:sqlite` Database.
  */
 
+import "./suppress-sqlite-warning.js";
 import { createRequire } from "node:module";
 import type { DatabaseSync } from "node:sqlite";
+export { suppressNodeSqliteExperimentalWarning } from "./suppress-sqlite-warning.js";
 
 const require = createRequire(import.meta.url);
 const isBun = typeof (globalThis as { Bun?: unknown }).Bun !== "undefined";
