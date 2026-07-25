@@ -23,6 +23,8 @@ npm run build          # tsc → dist/
 
 `install.sh` installs as `~/.local/bin/teleg` and clones managed checkout to `$TELEG_HOME` (default `~/.teleg-bridge`).
 
+**If the CLI is not installed yet:** run `./install.sh install` (or `npm run install:cli`) from the repo. That clones/updates `$TELEG_HOME` when needed, runs `tsc`, runs `./deploy.sh` (wires Pi extension, strips teleg MCP from Pi), and drops the shim. Restart Pi afterward.
+
 | Command | Purpose |
 |---|---|
 | `teleg install [--repo] [--host] [--channel edge\|stable]` | Clone, build, deploy, shim |
@@ -32,6 +34,8 @@ npm run build          # tsc → dist/
 | `teleg mcp [--app …] [--write]` | Wire MCP into third-party clients |
 
 Channels: **edge** = default branch; **stable** = highest semver tag. Meta: `$TELEG_HOME/.teleg-meta.json`.
+
+**Runtime:** `install.sh` checks Node ≥18, but **Pi extension + MCP need `node:sqlite`** (≈Node **22.5+**). Bun under omp uses `bun:sqlite` instead. See [gotchas](gotchas.md).
 
 ## MCP wiring (non-Pi)
 

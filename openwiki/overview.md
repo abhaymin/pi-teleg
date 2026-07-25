@@ -25,9 +25,11 @@ Make Telegram a practical control plane for Pi coding agents:
 |---|---|---|---|---|
 | **Pi extension** | `src/index.ts` → `dist/` | Yes (owns lock) | Full toolset + slash cmds | Pi agent sessions |
 | **Standalone MCP** | `mcp-server/index.js` | No | Same tools + `teleg_listen` / `teleg_reply` | omp, Claude Code, OpenCode, Kilo, … |
-| **CLI** | `install.sh` → `teleg` | n/a | install / update / mcp wire | Host ops |
+| **CLI** | `install.sh` → `teleg` | n/a | install / update / mcp wire (no DB open) | Host ops |
 
 **Pi must load the extension only.** Dual-loading extension + MCP duplicates tool names. `deploy.sh` strips `teleg-bridge` from `~/.pi/agent/mcp.json`. `teleg mcp --app pi` refuses to write MCP into Pi and only prunes a stale entry. Use `teleg mcp --app omp|claude|…` for other apps.
+
+If `teleg` is not on the machine yet, `./install.sh install` builds, deploys the extension, and installs the shim (see [automation](automation.md)).
 
 ## Package / build
 
@@ -37,6 +39,8 @@ Make Telegram a practical control plane for Pi coding agents:
 | version | `1.0.3` (see `package.json`) |
 | build | `npm run build` → `tsc` → `dist/` |
 | test | `npm test` (build + `node --test`) |
+| Node (Pi / MCP) | Prefer ≈**22.5+** (`node:sqlite`); filter in `suppress-sqlite-warning.ts` |
+| Bun (omp) | `bun:sqlite` via `sqlite-driver` — no Node SQLite ExperimentalWarning |
 | peer deps | `@earendil-works/pi-ai`, `pi-coding-agent`, `@sinclair/typebox` |
 
 ## This repo’s `INFO_REL.md`

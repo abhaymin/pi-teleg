@@ -1,5 +1,11 @@
 # OpenWiki log
 
+## 2026-07-25 — CLI bootstrap + SQLite cross-links
+
+- Documented: when `teleg` is missing, `./install.sh install` builds + deploys + shim (`actions/cli.md`, `automation.md`, `overview.md`, `index.md`).
+- Indexed `suppress-sqlite-warning.ts`; Node ≈22.5+ / Bun notes on overview package table.
+- Modules index lists the suppress module under Config & DB.
+
 ## 2026-07-25 — SQLite surfaces / runtime docs
 
 - Documented which surfaces open SQLite (extension, poll-worker, MCP) vs CLI (does not).

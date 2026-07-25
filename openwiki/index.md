@@ -43,9 +43,9 @@ Runtime state lives under **`~/.pi/agent/`** (DB, config, locks, relay, media) �
 | [Reply context](runtime/reply-context.md) | Recover parent media on Telegram replies |
 | [Plans](plans/index.md) | Multi-bot PLAN_ACTION vs shipped reality |
 | [Automation](automation.md) | `install.sh` / `deploy.sh` / channels |
-| [Gotchas](gotchas.md) | Polling lock, dual-load, reply media, orphans |
+| [Gotchas](gotchas.md) | Polling lock, dual-load, reply media, orphans, SQLite warning |
 
-**Pi:** native extension only (no teleg MCP). **Other apps:** standalone MCP via `teleg mcp --app …`.
+**Pi:** native extension only (no teleg MCP). **Other apps:** standalone MCP via `teleg mcp --app …`. **Missing CLI?** `./install.sh install` builds + deploys (see [automation](automation.md)).
 
 ## Top-level on disk (scanned 2026-07-25)
 
@@ -53,9 +53,10 @@ Runtime state lives under **`~/.pi/agent/`** (DB, config, locks, relay, media) �
 |---|---|
 | `src/` | TypeScript extension + poll worker (~9.6k LOC) |
 | `src/sqlite-driver.ts` | Bun/Node-neutral SQLite open |
+| `src/suppress-sqlite-warning.ts` | Drop Node SQLite `ExperimentalWarning` (Pi console) |
 | `dist/` | Compiled JS + `.d.ts` — what Pi loads |
 | `mcp-server/` | Standalone stdio MCP (same tools; **no** polling) |
-| `install.sh` | Git lifecycle CLI → `~/.local/bin/teleg` |
+| `install.sh` | Git lifecycle CLI → `~/.local/bin/teleg` (build + deploy) |
 | `deploy.sh` | Build + wire extension into Pi `settings.json`; strip MCP from Pi |
 | `docs/` | Design notes (`PLAN_ACTION`, install, groups/channels) |
 | `test/db.test.js` | SQLite tests (`npm test`) |
@@ -74,4 +75,4 @@ Runtime state lives under **`~/.pi/agent/`** (DB, config, locks, relay, media) �
 1. Start with [architecture](architecture.md) + [gotchas](gotchas.md) before changing polling, routing, or DB claims.
 2. For a task, open the matching [modules](modules/index.md) or [actions](actions/index.md) page, then the named `.ts` / `.js` file.
 3. Treat [`TASKS.md`](../TASKS.md) + source as “done”; [`docs/PLAN_ACTION.md`](../docs/PLAN_ACTION.md) checkboxes are a stale draft header.
-4. Build with `npm run build` (`tsc` → `dist/`). Deploy to local Pi with `./deploy.sh` (restart Pi after).
+4. Build with `npm run build` (`tsc` → `dist/`). Deploy to local Pi with `./deploy.sh` (restart Pi after). First-time host: `./install.sh install` also builds, deploys, and installs `teleg`.
