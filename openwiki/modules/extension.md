@@ -21,6 +21,7 @@ Default export: `function (pi: ExtensionAPI)` — registers Pi commands/tools an
 - Outbound media — `teleg-send_photo/video/document` and attach sends record local paths on `outbound_messages` (schema v6). Chat target: active turn → `allowedChatIds` → `allowedUserIds`.
 - Poll-answer / reaction forwarding as steer or context.
 - Footer health via `ctx.ui.setStatus` (glyphs only — never dump DEGRADED countdowns into the prompt).
+- Telegram Pi system controls: `src/pi-sys-commands.ts` (`/pi`, `/model`, `/think`, `/agent`, …).
 - `session_shutdown` — heartbeat stop, unregister, release lock if held.
 
 ## Status bar glyphs

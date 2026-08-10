@@ -58,6 +58,8 @@ Do **not** leave teleg-bridge in Pi’s `mcp.json` alongside the extension.
 | `test` | build + `node --test` |
 | `deploy` / `deploy:watch` | `./deploy.sh` |
 | `install:cli` / `update:cli` / `uninstall:cli` | `./install.sh …` |
+| `remove:cli` | `./remove-cli.sh` — delete `~/.local/bin/teleg` shim only |
+| `install:mcp` | `./install-mcp.sh` — wire MCP into Cursor / Claude / IDE / CLI (skip Pi) |
 
 ## Related
 

@@ -1,5 +1,18 @@
 # OpenWiki log
 
+## 2026-08-10 — Pi system commands via Telegram
+
+- Added `src/pi-sys-commands.ts`: `/pi`, `/model`, `/models`, `/think`, `/compact`, `/tools`, `/cmds`, `/cmd`, `/agent`, `/session`, `/new`, `/reload`, `stop`.
+- Wired in `handleAuthorizedTelegramMessage` after allowlist; uses ExtensionAPI (`setModel`, thinking, tools) because TUI slash commands do not run through `sendUserMessage`.
+- `/cmd` and `/agent` are agent-mediated (sub-agent tools when present). Documented in `actions/telegram.md`.
+- `stop` also aborts agent runs (not just turns).
+
+## 2026-08-10 — CLI remove shim + MCP install script
+
+- Added `teleg remove-cli` / `teleg undeploy-cli` (also `npm run remove:cli`, `./remove-cli.sh`, `./deploy-cli.sh --remove`) — deletes only `~/.local/bin/teleg` shim; does **not** touch Pi or MCP. Full teardown stays `teleg uninstall`.
+- Added `install-mcp.sh` / `npm run install:mcp` — wires standalone MCP into non-Pi clients (Cursor, Claude, OpenCode, Kilo, custom paths). New page: `modules/mcp-install.md`.
+- Updated `actions/cli.md`, `automation.md`, `modules/index.md`, `index.md`.
+
 ## 2026-07-25 — CLI bootstrap + SQLite cross-links
 
 - Documented: when `teleg` is missing, `./install.sh install` builds + deploys + shim (`actions/cli.md`, `automation.md`, `overview.md`, `index.md`).

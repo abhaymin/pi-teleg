@@ -54,6 +54,7 @@ Runtime state lives under **`~/.pi/agent/`** (DB, config, locks, relay, media) �
 | `src/` | TypeScript extension + poll worker (~9.6k LOC) |
 | `src/sqlite-driver.ts` | Bun/Node-neutral SQLite open |
 | `src/suppress-sqlite-warning.ts` | Drop Node SQLite `ExperimentalWarning` (Pi console) |
+| `src/pi-sys-commands.ts` | Telegram → Pi system controls (model, think, tools, agent, …) |
 | `dist/` | Compiled JS + `.d.ts` — what Pi loads |
 | `mcp-server/` | Standalone stdio MCP (same tools; **no** polling) |
 | `install.sh` | Git lifecycle CLI → `~/.local/bin/teleg` (build + deploy) |

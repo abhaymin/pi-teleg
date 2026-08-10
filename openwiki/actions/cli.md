@@ -27,11 +27,14 @@ That is enough on a host with Node (use a build that provides `node:sqlite`, ≈
 |---|---|
 | `teleg install [--repo] [--host] [--channel edge\|stable]` | Clone, build, deploy, install shim |
 | `teleg update [--channel] [--keep]` | Fetch + redeploy |
-| `teleg uninstall\|remove [--purge] [-y]` | Remove |
+| `teleg uninstall\|remove [--purge] [-y]` | Full teardown (Pi + MCP + shim) |
+| `teleg remove-cli\|undeploy-cli` | Delete only `~/.local/bin/teleg` shim (not Pi, not MCP) |
 | `teleg status` | Install health |
 | `teleg version` | Version / commit |
 | `teleg mcp [--app claude\|pi\|omp\|opencode\|kilo] [--write] [--path …]` | Print or merge MCP config |
 
-Also exposed via npm: `install:cli`, `update:cli`, `uninstall:cli`.
+Also exposed via npm: `install:cli`, `update:cli`, `uninstall:cli`, `remove:cli`, `install:mcp`.
+
+`./deploy-cli.sh --remove` and `./remove-cli.sh` are aliases for `teleg remove-cli`.
 
 See [automation](../automation.md) for deploy vs install distinction.
