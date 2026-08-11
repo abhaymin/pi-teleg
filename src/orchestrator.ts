@@ -174,12 +174,6 @@ function markTaskDone(task: OrchestrationTask): void {
   }
 }
 
-function markTaskFailed(task: OrchestrationTask, error: string): void {
-  task.status = "failed";
-  task.updatedAt = Date.now();
-  task.results["_error"] = error;
-}
-
 function formatOrchestrationResult(task: OrchestrationTask): string {
   const lines = [
     `<b>📋 Orchestration Result</b>`,
