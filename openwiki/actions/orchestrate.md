@@ -14,17 +14,17 @@ Works from **both** Telegram (`/orchestrate <task>`) and Pi directly (`/orchestr
 
 ## Usage
 
-```
+````bash
 /orchestrate <task>
-```
+````
 
 ### Targeting specific sessions
 
 Use `@sessionName` in the task to target specific sub-agents:
 
-```
+````bash
 /orchestrate download this video and summarize it @data-scrapper and @marketapp
-```
+````
 
 ### No target specified
 
@@ -32,7 +32,7 @@ Broadcasts to all alive sessions for the bot.
 
 ## Architecture
 
-```
+````
 Telegram / Pi UI
       │
       ▼
@@ -47,7 +47,7 @@ Host session (orchestrator)
               │
               ▼
       Aggregated result back to caller
-```
+````
 
 Sub-agents are other Pi sessions — they may or may not have teleg loaded. They process relay commands via their HTTP relay server.
 
