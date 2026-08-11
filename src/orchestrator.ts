@@ -69,7 +69,7 @@ function statePath(botId: number): string {
   return join(STATE_DIR, `bot-${botId}.json`);
 }
 
-export function loadOrchestrationState(botId: number): OrchestrationState {
+function loadOrchestrationState(botId: number): OrchestrationState {
   ensureStateDir();
   const path = statePath(botId);
   try {
@@ -81,7 +81,7 @@ export function loadOrchestrationState(botId: number): OrchestrationState {
   }
 }
 
-export function persistOrchestrationState(botId: number, state: OrchestrationState): void {
+function persistOrchestrationState(botId: number, state: OrchestrationState): void {
   ensureStateDir();
   const path = statePath(botId);
   const data = { tasks: Object.fromEntries(state.tasks) };
@@ -92,7 +92,7 @@ export function persistOrchestrationState(botId: number, state: OrchestrationSta
 // Task creation
 // ============================================================================
 
-export function createOrchestrationTask(
+function createOrchestrationTask(
   botId: number,
   chatId: number,
   messageId: number,
@@ -120,7 +120,7 @@ export function createOrchestrationTask(
 // Subtask management
 // ============================================================================
 
-export function addSubtask(task: OrchestrationTask, targetSession: string, payload: string): Subtask {
+function addSubtask(task: OrchestrationTask, targetSession: string, payload: string): Subtask {
   const id = `sub-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
   const subtask: Subtask = {
     id,
@@ -133,7 +133,7 @@ export function addSubtask(task: OrchestrationTask, targetSession: string, paylo
   return subtask;
 }
 
-export async function dispatchSubtask(
+async function dispatchSubtask(
   subtask: Subtask,
   chatId: number,
   messageId: number,
@@ -163,7 +163,7 @@ export async function dispatchSubtask(
 // Result aggregation
 // ============================================================================
 
-export function markTaskDone(task: OrchestrationTask): void {
+function markTaskDone(task: OrchestrationTask): void {
   task.status = "done";
   task.updatedAt = Date.now();
   // Collect all subtask results
@@ -174,13 +174,13 @@ export function markTaskDone(task: OrchestrationTask): void {
   }
 }
 
-export function markTaskFailed(task: OrchestrationTask, error: string): void {
+function markTaskFailed(task: OrchestrationTask, error: string): void {
   task.status = "failed";
   task.updatedAt = Date.now();
   task.results["_error"] = error;
 }
 
-export function formatOrchestrationResult(task: OrchestrationTask): string {
+function formatOrchestrationResult(task: OrchestrationTask): string {
   const lines = [
     `<b>📋 Orchestration Result</b>`,
     `<code>${task.id}</code>`,
@@ -330,7 +330,7 @@ function buildSubtaskPayload(originalText: string, targetSession: string): strin
 /**
  * Broadcast a payload to all alive sessions for this bot.
  */
-export async function broadcastToSessions(
+async function broadcastToSessions(
   payload: string,
   _botId: number,
 ): Promise<Array<{ session: string; ok: boolean; response?: string; error?: string }>> {
