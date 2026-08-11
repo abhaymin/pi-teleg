@@ -82,6 +82,7 @@ import {
   messageHasMedia,
   describeMediaTypes,
 } from "./telegram-media.js";
+import { tryHandlePiSysCommand, isPiSysCommand } from "./pi-sys-commands.js";
 
 // ============================================================================
 // Constants
@@ -282,6 +283,7 @@ Telegram bridge extension is active.
 - All connected sessions are active. Each session independently drains its queue based on capabilities.
 - Kill-switches: /teleg-dc disconnects this session, /teleg-dc-all disconnects all sessions without cleaning DB state.
 - Cleanup switches are separate: /teleg-clean-db resets queue state; /teleg-remove-sessions removes stale session registry records.
+- Pi system controls from Telegram: /pi (model, think, tools, cmds, agent, compact, session, new, reload).
 - teleg-disconnect, teleg-disconnect-all, teleg-clean-db, and teleg-remove-sessions MCP tools provide the same from any pi session.`;
 
 // ============================================================================
@@ -416,7 +418,7 @@ async function sendFile(
       return { ok: true, messageId: result.messageId };
     } catch (err) {
       console.error(`[teleg] sendFile failed (attempt ${attempt}/${MAX_RETRIES}):`, err instanceof Error ? err.message : err);
-      if (attempt < MAX_RETRIES) { await new Promise(r => setTimeout(r, attempt * 3000)); continue; }
+      if (attempt < MAX_RETRIES) { await new Promise(r => setTimeout(r, attempt * 3000)); }
     }
   }
   return { ok: false };
@@ -472,7 +474,7 @@ export default function (pi: ExtensionAPI): void {
   const sessionId = getSessionId();
   const cwd = process.cwd();
   const sessionName = cwd.split("/").filter(Boolean).pop() || "default";
-  let state: SessionState = createSessionState(sessionId);
+  const state: SessionState = createSessionState(sessionId);
 
   function normalizeConfigFromBotContext(botContext: BotContext): void {
     state.config = {
@@ -1031,12 +1033,39 @@ export default function (pi: ExtensionAPI): void {
         if (state.config.botToken) {
           await sendReply(state.config.botToken, String(message.chat.id), message.message_id, "Aborted current turn.");
         }
+      } else if (!ctx.isIdle()) {
+        ctx.abort();
+        if (state.config.botToken) {
+          await sendReply(state.config.botToken, String(message.chat.id), message.message_id, "Aborted agent run.");
+        }
       } else {
         if (state.config.botToken) {
           await sendReply(state.config.botToken, String(message.chat.id), message.message_id, "No active turn.");
         }
       }
       return;
+    }
+
+    // ─── Pi system commands (model / think / compact / tools / agent / …) ───
+    if (isPiSysCommand(lower)) {
+      const result = await tryHandlePiSysCommand({
+        pi,
+        ctx,
+        rawText: cleanText,
+        lower,
+        notify: (msg) => {
+          const botToken = currentBotToken();
+          if (!botToken) return;
+          void sendReply(botToken, String(message.chat.id), message.message_id, msg);
+        },
+      });
+      if (result.handled) {
+        const botToken = currentBotToken();
+        if (botToken) {
+          await sendReply(botToken, String(message.chat.id), message.message_id, result.reply);
+        }
+        return;
+      }
     }
 
     // ─── Kill-switch commands ────────────────────────────────────────
@@ -1135,7 +1164,7 @@ export default function (pi: ExtensionAPI): void {
     if (lower === "/help" || lower === "/start") {
       const botToken = currentBotToken();
       if (botToken) {
-        await sendReply(botToken, String(message.chat.id), message.message_id, `Teleg-Bridge Active! (this session: ${sessionName})\n\nSend any message to forward to pi.\nPrefix with @sessionName to route to a specific session.\nInclude Twitter/X URLs for automatic media download.\n\nCommands:\n/status - All sessions, relay state & queue\n/chatid - Show current chat/user IDs for group/channel setup\n/queue [session] - Queue for session (or primary)\n/teleg-dc - Disconnect THIS session\n/teleg-dc-all - Disconnect ALL sessions, DB unchanged\n/teleg-clean-db - Reset processing queue + purge old entries\n/teleg-remove-sessions - Remove dead session registry records\n/compact - Compact memory\n/health - Test connection\n/healthfull - Full health diagnostic\n/teleg-fix-health - Repair DEGRADED health (API probe, stale queue, reconcile, poller restart)\nstop - Abort current turn`);
+        await sendReply(botToken, String(message.chat.id), message.message_id, `Teleg-Bridge Active! (this session: ${sessionName})\n\nSend any message to forward to pi.\nPrefix with @sessionName to route to a specific session.\nInclude Twitter/X URLs for automatic media download.\n\nCommands:\n/pi - Pi system commands (model, think, tools, agent, …)\n/status - All sessions, relay state & queue\n/chatid - Show current chat/user IDs for group/channel setup\n/queue [session] - Queue for session (or primary)\n/teleg-dc - Disconnect THIS session\n/teleg-dc-all - Disconnect ALL sessions, DB unchanged\n/teleg-clean-db - Reset processing queue + purge old entries\n/teleg-remove-sessions - Remove dead session registry records\n/compact - Compact memory\n/health - Test connection\n/healthfull - Full health diagnostic\n/teleg-fix-health - Repair DEGRADED health\nstop - Abort current turn`);
       }
       if (currentAllowedUserIds().length === 0 && currentAllowedChatIds().length === 0) {
         const ids = [message.from!.id];
@@ -1219,31 +1248,6 @@ export default function (pi: ExtensionAPI): void {
       const force = /\bforce\b/i.test(cleanText);
       const result = await fixDegradedHealth({ forceRestart: force });
       await sendReply(botToken, String(message.chat.id), message.message_id, result.lines.join("\n"));
-      return;
-    }
-
-    if (lower === "/compact") {
-      if (!ctx.isIdle()) {
-        if (state.config.botToken) {
-          await sendReply(state.config.botToken, String(message.chat.id), message.message_id, "Cannot compact while busy. Send stop first.");
-        }
-        return;
-      }
-      ctx.compact({
-        onComplete: () => {
-          if (state.config.botToken) {
-            void sendReply(state.config.botToken, String(message.chat.id), message.message_id, "Compaction completed.");
-          }
-        },
-        onError: (err) => {
-          if (state.config.botToken) {
-            void sendReply(state.config.botToken, String(message.chat.id), message.message_id, `Compaction failed: ${err instanceof Error ? err.message : String(err)}`);
-          }
-        },
-      });
-      if (state.config.botToken) {
-        await sendReply(state.config.botToken, String(message.chat.id), message.message_id, "Compaction started.");
-      }
       return;
     }
 
@@ -2277,6 +2281,34 @@ export default function (pi: ExtensionAPI): void {
       }
       if (await switchActiveBot(choice.botId, ctx)) {
         await startCurrentPolling(ctx, "Switched bot — polling started.");
+      }
+    },
+  });
+
+  pi.registerCommand("orchestrate", {
+    description: "Multi-session orchestration: delegates sub-tasks to other Pi sessions via relay",
+    handler: async (args, ctx) => {
+      const taskText = (args || "").trim();
+      if (!taskText) {
+        ctx.ui.notify("Usage: /orchestrate <task>\n\nDelegates sub-tasks to other Pi sessions. Use @sessionName to target specific sessions.", "info");
+        return;
+      }
+      try {
+        const { runOrchestration } = await import("./orchestrator.js");
+        const sessionName = pi.getSessionName() ?? "default";
+        const result = await runOrchestration({
+          botId: 0,
+          text: taskText,
+          sourceSession: sessionName,
+          chatId: 0,
+          messageId: 0,
+          notify: async (msg) => {
+            ctx.ui.notify(msg, "info");
+          },
+        });
+        ctx.ui.notify(result.formatted, "info");
+      } catch (err) {
+        ctx.ui.notify(`Orchestration failed: ${err}`, "error");
       }
     },
   });

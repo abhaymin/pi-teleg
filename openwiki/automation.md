@@ -61,6 +61,14 @@ Do **not** leave teleg-bridge in Pi’s `mcp.json` alongside the extension.
 | `remove:cli` | `./remove-cli.sh` — delete `~/.local/bin/teleg` shim only |
 | `install:mcp` | `./install-mcp.sh` — wire MCP into Cursor / Claude / IDE / CLI (skip Pi) |
 
+### Orchestration
+
+| Feature | Description |
+|---|---|
+| `/orchestrate <task>` | Multi-session delegation (Telegram + Pi) |
+| `src/orchestrator.ts` | Core orchestration logic |
+| State dir | `~/.pi/agent/tmp/teleg-orchestrator/bot-{id}.json` |
+
 ## Related
 
 - [Actions → CLI](actions/cli.md)

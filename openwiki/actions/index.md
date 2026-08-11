@@ -14,6 +14,7 @@ Everything an agent or operator can invoke.
 | [Pi slash commands](pi-slash.md) | `pi.registerCommand` inside Pi |
 | [Tools](tools.md) | Extension + MCP `registerTool` set |
 | [CLI](cli.md) | `teleg` from `install.sh` |
+| [Orchestrate](orchestrate.md) | `/orchestrate` multi-session delegation |
 
 ## Quick mental map
 

@@ -21,6 +21,7 @@
         "dev": "tsc --watch",
         "deploy": "./deploy.sh",
         "deploy:watch": "./deploy.sh --watch",
+        "install:mcp": "./install-mcp.sh",
         "install:cli": "./install.sh install",
         "update:cli": "./install.sh update",
         "uninstall:cli": "./install.sh uninstall"

@@ -2,7 +2,7 @@
 
 ## 2026-08-10 — Pi system commands via Telegram
 
-- Added `src/pi-sys-commands.ts`: `/pi`, `/model`, `/models`, `/think`, `/compact`, `/tools`, `/cmds`, `/cmd`, `/agent`, `/session`, `/new`, `/reload`, `stop`.
+- Added `src/pi-sys-commands.ts`: `/pi`, `/model`, `/models`, `/think`, `/compact`, `/tools`, `/cmds`, `/cmd`, `/agent`, `/orchestrate`, `/session`, `/new`, `/reload`, `stop`.
 - Wired in `handleAuthorizedTelegramMessage` after allowlist; uses ExtensionAPI (`setModel`, thinking, tools) because TUI slash commands do not run through `sendUserMessage`.
 - `/cmd` and `/agent` are agent-mediated (sub-agent tools when present). Documented in `actions/telegram.md`.
 - `stop` also aborts agent runs (not just turns).
@@ -12,6 +12,16 @@
 - Added `teleg remove-cli` / `teleg undeploy-cli` (also `npm run remove:cli`, `./remove-cli.sh`, `./deploy-cli.sh --remove`) — deletes only `~/.local/bin/teleg` shim; does **not** touch Pi or MCP. Full teardown stays `teleg uninstall`.
 - Added `install-mcp.sh` / `npm run install:mcp` — wires standalone MCP into non-Pi clients (Cursor, Claude, OpenCode, Kilo, custom paths). New page: `modules/mcp-install.md`.
 - Updated `actions/cli.md`, `automation.md`, `modules/index.md`, `index.md`.
+
+## 2026-08-10 — Orchestration mode
+
+- Added `src/orchestrator.ts`: multi-session orchestration logic.
+- Added `/orchestrate <task>` Pi command (works from both Telegram and Pi directly).
+- Uses relay system to dispatch sub-tasks to other Pi sessions (sub-agents).
+- Sub-agents process relay commands directly; results aggregated and returned.
+- State persisted in `~/.pi/agent/tmp/teleg-orchestrator/bot-{id}.json`.
+- New page: `actions/orchestrate.md`.
+- Updated: `actions/index.md`, `automation.md`, `index.md`, `log.md`.
 
 ## 2026-07-25 — CLI bootstrap + SQLite cross-links
 
