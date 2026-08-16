@@ -33,6 +33,13 @@ import { startRelayServer, stopRelayServer, cleanRelayFilesByPid } from "../dist
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+// Node ≥20 "Happy Eyeballs" (autoSelectFamily) races IPv6/IPv4. On hosts whose
+// IPv6 route to api.telegram.org is broken, fetch fails with ETIMEDOUT ~80% of
+// the time while curl (IPv4-first) works. Disable the race: fetch then behaves
+// like curl. Harmless when IPv6 works (first-family attempt still wins).
+import { setDefaultAutoSelectFamily } from "node:net";
+setDefaultAutoSelectFamily(false);
+
 // ─── Paths / Constants ───────────────────────────────────────────────────────
 
 const HOME_DIR = process.env.HOME || "~";
@@ -1243,43 +1250,57 @@ async function handleRequest(req) {
 
     if (method === "tools/call") {
       const { name, arguments: args } = params ?? {};
+      try {
+        const raw = await dispatchTool(name, args);
+        const text = typeof raw === "string" ? raw : JSON.stringify(raw);
+        sendResponse(id, { content: [{ type: "text", text }], isError: false });
+      } catch (err) {
+        sendResponse(id, { content: [{ type: "text", text: String(err?.message || err) }], isError: true });
+      }
+      return;
+    }
+
+    sendError(id, -32601, `Method not found: ${method}`);
+  } catch (err) {
+    sendError(id, -32603, err.message);
+  }
+}
+
+// Dispatch a tool by name; returns a plain value the caller wraps into a
+// spec-compliant CallToolResult ({content:[{type:"text",...}]}). Throws on failure.
+async function dispatchTool(name, args) {
 
       // ─── Send tools ───────────────────────────────────────────────
       if (name === "teleg-send_message") {
         const bot = resolveBot(args?.bot_id);
         if (!bot) throw new Error("No bot token configured");
-        sendResponse(id, await sendMessage(bot, args.text, args.chat_id));
-        return;
+        return await sendMessage(bot, args.text, args.chat_id);
       }
       if (name === "teleg-send_photo") {
         const bot = resolveBot(args?.bot_id);
         if (!bot) throw new Error("No bot token configured");
         const result = await sendPhoto(bot, args.file_path, args.caption ?? "", args.chat_id);
         recordOutboundMedia(bot, result, args.file_path, "image", args.caption ?? "", args.chat_id);
-        sendResponse(id, result);
-        return;
+        return result;
       }
       if (name === "teleg-send_video") {
         const bot = resolveBot(args?.bot_id);
         if (!bot) throw new Error("No bot token configured");
         const result = await sendVideo(bot, args.file_path, args.caption ?? "", args.chat_id);
         recordOutboundMedia(bot, result, args.file_path, "video", args.caption ?? "", args.chat_id);
-        sendResponse(id, result);
-        return;
+        return result;
       }
       if (name === "teleg-send_document") {
         const bot = resolveBot(args?.bot_id);
         if (!bot) throw new Error("No bot token configured");
         const result = await sendDocument(bot, args.file_path, args.caption ?? "", args.chat_id);
         recordOutboundMedia(bot, result, args.file_path, "document", args.caption ?? "", args.chat_id);
-        sendResponse(id, result);
-        return;
+        return result;
       }
       if (name === "get_me") {
         const bot = resolveBot(args?.bot_id);
         if (!bot) throw new Error("No bot token configured");
-        sendResponse(id, await getMe(bot));
-        return;
+        return await getMe(bot);
       }
 
       // ─── teleg-attach: send immediately in standalone mode ─────────
@@ -1306,21 +1327,18 @@ async function handleRequest(req) {
           recordOutboundMedia(bot, result, p, kind, caption, target);
           sent.push(p);
         }
-        sendResponse(id, { sent, count: sent.length, chat_id: target });
-        return;
+        return { sent, count: sent.length, chat_id: target };
       }
 
       // ─── Queue tools (bot-scoped for parity) ──────────────────────
       if (name === "get_queue_count") {
         const botId = scopeBot(args);
         const stats = getQueueStats(botId);
-        sendResponse(id, { count: stats.depth, pending: stats.pending, processing: stats.processing, bot_id: botId });
-        return;
+        return { count: stats.depth, pending: stats.pending, processing: stats.processing, bot_id: botId };
       }
       if (name === "get_queue_stats") {
         const botId = scopeBot(args);
-        sendResponse(id, { messages: getQueueStats(botId), downloads: getDownloadStats(botId), bot_id: botId });
-        return;
+        return { messages: getQueueStats(botId), downloads: getDownloadStats(botId), bot_id: botId };
       }
       if (name === "get_queue_data") {
         const botId = scopeBot(args);
@@ -1337,7 +1355,7 @@ async function handleRequest(req) {
           } else {
             rows = db.prepare("SELECT * FROM message_queue ORDER BY created_at DESC LIMIT ?").all(limit);
           }
-          sendResponse(id, { rows, bot_id: botId });
+          return { rows, bot_id: botId };
         } finally { db.close(); }
         return;
       }
@@ -1348,7 +1366,7 @@ async function handleRequest(req) {
           const row = botId
             ? db.prepare("SELECT * FROM message_queue WHERE id = ? AND bot_id = ?").get(args.id, botId)
             : db.prepare("SELECT * FROM message_queue WHERE id = ?").get(args.id);
-          sendResponse(id, { row: row ?? null });
+          return { row: row ?? null };
         } finally { db.close(); }
         return;
       }
@@ -1371,7 +1389,7 @@ async function handleRequest(req) {
           if (botId) { query += ` WHERE id = ? AND bot_id = ?`; sqlArgs.push(args.id, botId); }
           else { query += ` WHERE id = ?`; sqlArgs.push(args.id); }
           const result = db.prepare(query).run(...sqlArgs);
-          sendResponse(id, { changes: result.changes, status: args.status });
+          return { changes: result.changes, status: args.status };
         } finally { db.close(); }
         return;
       }
@@ -1418,8 +1436,7 @@ async function handleRequest(req) {
             }
           }
         } finally { db.close(); }
-        sendResponse(id, { action, count, bot_id: botId });
-        return;
+        return { action, count, bot_id: botId };
       }
 
       if (name === "teleg-publish") {
@@ -1429,7 +1446,7 @@ async function handleRequest(req) {
           const result = db.prepare(
             "INSERT INTO pubsub (bot_id, channel, publisher, payload, target_session) VALUES (?, ?, ?, ?, ?)"
           ).run(botId, args.channel, "mcp-server", args.payload, args.target_session || null);
-          sendResponse(id, { id: result.lastInsertRowid, channel: args.channel, target_session: args.target_session ?? null, bot_id: botId });
+          return { id: result.lastInsertRowid, channel: args.channel, target_session: args.target_session ?? null, bot_id: botId };
         } finally { db.close(); }
         return;
       }
@@ -1444,29 +1461,25 @@ async function handleRequest(req) {
           let allBots;
           try { allBots = db.prepare("SELECT DISTINCT bot_id FROM relay_sessions").all(); } finally { db.close(); }
           if (!allBots.length) {
-            sendResponse(id, { botId: 0, checkedSessions: 0, evictedSessions: [], newPrimary: null, errors: [] });
-            return;
+            return { botId: 0, checkedSessions: 0, evictedSessions: [], newPrimary: null, errors: [] };
           }
           const reports = [];
           for (const r of allBots) reports.push(await reconcileBot(r.bot_id));
-          sendResponse(id, { reports, bot_id: null });
-          return;
+          return { reports, bot_id: null };
         }
         report = await reconcileBot(botId);
-        sendResponse(id, report);
-        return;
+        return report;
       }
 
       if (name === "teleg-fix-health") {
         const botId = args?.bot_id ? Number(args.bot_id) : (config.defaultBotId || config.botId || 0);
         const result = await fixDegradedHealth(botId, { force: !!args?.force });
-        sendResponse(id, result);
-        return;
+        return result;
       }
 
       if (name === "teleg-list_sessions") {
         const botId = args?.bot_id ? Number(args.bot_id) : (config.defaultBotId || config.botId || 0);
-        if (!botId) { sendResponse(id, { sessions: [], bot_id: 0 }); return; }
+        if (!botId) { return { sessions: [], bot_id: 0 }; }
         const db = openDb(true);
         let sessions;
         try { sessions = db.prepare("SELECT * FROM relay_sessions WHERE bot_id = ?").all(botId); } finally { db.close(); }
@@ -1485,8 +1498,7 @@ async function handleRequest(req) {
             role: s.role,
           });
         }
-        sendResponse(id, { sessions: result, bot_id: botId });
-        return;
+        return { sessions: result, bot_id: botId };
       }
 
       if (name === "teleg-evict_session") {
@@ -1500,20 +1512,18 @@ async function handleRequest(req) {
           }
         } finally { db.close(); }
         evictSessionStandalone(botId, args.session_name);
-        sendResponse(id, { evicted: args.session_name, bot_id: botId });
-        return;
+        return { evicted: args.session_name, bot_id: botId };
       }
 
       if (name === "teleg-list_bots") {
         const cfg = loadConfig();
-        if (!cfg || !cfg.bots) { sendResponse(id, { bots: [] }); return; }
+        if (!cfg || !cfg.bots) { return { bots: [] }; }
         const bots = Object.entries(cfg.bots).map(([bid, entry]) => ({
           bot_id: parseInt(bid, 10),
           bot_username: entry.botUsername || "unknown",
           lastUpdateId: entry.lastUpdateId,
         }));
-        sendResponse(id, { bots, defaultBotId: cfg.defaultBotId });
-        return;
+        return { bots, defaultBotId: cfg.defaultBotId };
       }
 
       if (name === "teleg-set_primary") {
@@ -1525,7 +1535,7 @@ async function handleRequest(req) {
           db.prepare("UPDATE relay_sessions SET is_primary = 0 WHERE bot_id = ?").run(botId);
           const result = db.prepare("UPDATE relay_sessions SET is_primary = 1 WHERE bot_id = ? AND session_name = ?").run(botId, args.session_name);
           db.exec("COMMIT");
-          sendResponse(id, { session_name: args.session_name, bot_id: botId, updated: result.changes });
+          return { session_name: args.session_name, bot_id: botId, updated: result.changes };
         } catch {
           try { db.exec("ROLLBACK"); } catch {}
           throw new Error("Failed to set primary session");
@@ -1543,7 +1553,7 @@ async function handleRequest(req) {
             : db.prepare("SELECT session_name, pid FROM relay_sessions WHERE is_primary = 1 LIMIT 1").get();
           const killed = session?.session_name ?? null;
           if (session) { try { process.kill(session.pid, 9); } catch { /* already dead */ } }
-          sendResponse(id, { disconnected: killed, bot_id: botId, db_cleaned: false, removed: false });
+          return { disconnected: killed, bot_id: botId, db_cleaned: false, removed: false };
         } finally { db.close(); }
         return;
       }
@@ -1557,7 +1567,7 @@ async function handleRequest(req) {
             : db.prepare("SELECT session_name, pid FROM relay_sessions").all();
           const killed = sessions.map(s => s.session_name);
           for (const s of sessions) { try { process.kill(s.pid, 9); } catch { /* already dead */ } }
-          sendResponse(id, { killed, bot_id: botId, total: killed.length, db_cleaned: false, removed: false });
+          return { killed, bot_id: botId, total: killed.length, db_cleaned: false, removed: false };
         } finally { db.close(); }
         return;
       }
@@ -1579,7 +1589,7 @@ async function handleRequest(req) {
               ? db.prepare("DELETE FROM message_queue WHERE status IN ('completed','failed') AND bot_id = ? AND id < ?").run(botId, row.id).changes
               : db.prepare("DELETE FROM message_queue WHERE status IN ('completed','failed') AND id < ?").run(row.id).changes;
           }
-          sendResponse(id, { reset, purged, bot_id: botId });
+          return { reset, purged, bot_id: botId };
         } finally { db.close(); }
         return;
       }
@@ -1600,7 +1610,7 @@ async function handleRequest(req) {
             if (botId) db.prepare("DELETE FROM relay_sessions WHERE bot_id = ? AND session_name = ?").run(botId, s.session_name);
             else db.prepare("DELETE FROM relay_sessions WHERE session_name = ?").run(s.session_name);
           }
-          sendResponse(id, { removed, bot_id: botId, total: removed.length });
+          return { removed, bot_id: botId, total: removed.length };
         } finally { db.close(); }
         return;
       }
@@ -1613,11 +1623,10 @@ async function handleRequest(req) {
         const deadline = Date.now() + timeoutMs;
         while (Date.now() < deadline) {
           const item = claimListenItem(botId);
-          if (item) { sendResponse(id, item); return; }
+          if (item) { return item; }
           await sleep(POLL_INTERVAL_MS);
         }
-        sendResponse(id, { timed_out: true, session: SESSION_NAME, primary: amIPrimary(botId) });
-        return;
+        return { timed_out: true, session: SESSION_NAME, primary: amIPrimary(botId) };
       }
       if (name === "teleg_reply") {
         const bot = resolveBot(args?.bot_id);
@@ -1638,17 +1647,11 @@ async function handleRequest(req) {
           }
         }
         try { Db.completeMessage(msgId, text || null); } catch {}
-        sendResponse(id, { ok: true, id: msgId, sent_message_id: sentMessageId, completed: true });
-        return;
+        return { ok: true, id: msgId, sent_message_id: sentMessageId, completed: true };
       }
-      throw new Error(`Unknown tool: ${name}`);
-    }
-
-    sendError(id, -32601, `Method not found: ${method}`);
-  } catch (err) {
-    sendError(id, -32603, err.message);
-  }
+  throw new Error(`Unknown tool: ${name}`);
 }
+
 
 // ─── Main Loop ───────────────────────────────────────────────────────────────
 
