@@ -199,11 +199,15 @@ function beginAckTracking(bot, dbId, chatId) {
   if (!bot?.baseUrl || !chatId || !Number.isFinite(Number(dbId))) return;
   dbId = Number(dbId);
   try {
-    if (!ackedMessageIds.has(dbId)) {
+      if (!ackedMessageIds.has(dbId)) {
       if (ackedMessageIds.size > 512) ackedMessageIds.clear();
       ackedMessageIds.add(dbId);
       const ackText = ackTextEnabled();
-      if (ackText) tg(bot, "sendMessage", { chat_id: chatId, text: ackText }).catch(() => {});
+      if (ackText) tg(bot, "sendMessage", { chat_id: chatId, text: ackText })
+        .then((sent) => {
+          try { Db.recordOutboundMessage({ bot_id: bot.botId, chat_id: chatId, message_id: sent?.message_id, reply_to_message_id: null, from_session: "ack", text: ackText }); } catch {}
+        })
+        .catch(() => {});
     }
   } catch { /* ack is best-effort */ }
   if (typingTimers.has(dbId) || !ackTypingEnabled()) return;
