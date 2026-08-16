@@ -174,6 +174,50 @@ async function sendMessage(bot, text, chatId) {
   return tg(bot, "sendMessage", { chat_id: target, text, parse_mode: "HTML" });
 }
 
+// ─── Claimed-message UX: typing indicator + acknowledgment ──────────────────
+// When a message is claimed from the queue (teleg_listen or set_queue_status
+// processing), the sender immediately sees: (1) a one-time ack message and
+// (2) a repeating "typing…" chat action until the reply lands (teleg_reply /
+// set_queue_status completed|failed). Both are disable-able via env.
+
+const ACK_TYPING_MAX_MS = 5 * 60 * 1000; // safety stop if a reply never lands
+const ackedMessageIds = new Set();        // db ids already acked (bounded)
+const typingTimers = new Map();           // db id -> interval handle
+
+function ackTypingEnabled() {
+  const v = (process.env.TELEG_TYPING || "").toLowerCase();
+  return v !== "off" && v !== "false" && v !== "0";
+}
+
+function ackTextEnabled() {
+  const v = (process.env.TELEG_ACK_TEXT ?? "✅ Acknowledged — working on it…").trim();
+  if (!v || ["off", "false", "0"].includes(v.toLowerCase())) return null;
+  return v;
+}
+
+function beginAckTracking(bot, dbId, chatId) {
+  if (!bot?.baseUrl || !chatId || !Number.isFinite(Number(dbId))) return;
+  dbId = Number(dbId);
+  try {
+    if (!ackedMessageIds.has(dbId)) {
+      if (ackedMessageIds.size > 512) ackedMessageIds.clear();
+      ackedMessageIds.add(dbId);
+      const ackText = ackTextEnabled();
+      if (ackText) tg(bot, "sendMessage", { chat_id: chatId, text: ackText }).catch(() => {});
+    }
+  } catch { /* ack is best-effort */ }
+  if (typingTimers.has(dbId) || !ackTypingEnabled()) return;
+  const sendTyping = () => tg(bot, "sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => {});
+  void sendTyping();
+  typingTimers.set(dbId, setInterval(sendTyping, 4000));
+  setTimeout(() => endAckTracking(dbId), ACK_TYPING_MAX_MS).unref?.();
+}
+
+function endAckTracking(dbId) {
+  const t = typingTimers.get(Number(dbId));
+  if (t) { clearInterval(t); typingTimers.delete(Number(dbId)); }
+}
+
 // ─── Streaming Upload Helpers ────────────────────────────────────────────────
 
 /**
@@ -1374,6 +1418,13 @@ async function dispatchTool(name, args) {
         const botId = scopeBot(args);
         const db = openDb();
         try {
+          if (args.status === "processing") {
+            let chatRow;
+            try { chatRow = db.prepare("SELECT chat_id FROM message_queue WHERE id = ?").get(args.id); } catch {}
+            if (chatRow) beginAckTracking(resolveBot(botId), args.id, chatRow.chat_id);
+          } else {
+            endAckTracking(args.id);
+          }
           const now = Date.now();
           let query = `UPDATE message_queue SET status = ?`;
           const sqlArgs = [args.status];
@@ -1623,7 +1674,11 @@ async function dispatchTool(name, args) {
         const deadline = Date.now() + timeoutMs;
         while (Date.now() < deadline) {
           const item = claimListenItem(botId);
-          if (item) { return item; }
+          if (item) {
+            const ackBot = resolveBot(botId);
+            beginAckTracking(ackBot, item.id, item.chat_id);
+            return item;
+          }
           await sleep(POLL_INTERVAL_MS);
         }
         return { timed_out: true, session: SESSION_NAME, primary: amIPrimary(botId) };
@@ -1646,6 +1701,7 @@ async function dispatchTool(name, args) {
             try { Db.recordOutboundMessage({ bot_id: bot.botId, chat_id: row.chat_id, message_id: sentMessageId, reply_to_message_id: row.message_id, from_session: SESSION_NAME, text }); } catch {}
           }
         }
+        endAckTracking(msgId);
         try { Db.completeMessage(msgId, text || null); } catch {}
         return { ok: true, id: msgId, sent_message_id: sentMessageId, completed: true };
       }
