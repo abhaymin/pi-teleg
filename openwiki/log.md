@@ -1,5 +1,17 @@
 # OpenWiki log
 
+## 2026-10-21 — MCP media upload repair
+
+- Fixed the shared MCP uploader to use Telegram file field names (`photo`, `video`, `document`) separately from API method names, and flatten streams into bytes for fetch. Covers send tools and MCP attach.
+- Extracted `mcp-server/upload.js` for an isolated local HTTP regression check in `test/upload.test.js`; no Telegram messages are sent by the test.
+- Documented that `[Image #1]` is a display label, while `file_path` must be a readable local path on the tool host. Pi native uploads use a separate curl path.
+
+## 2026-10-11 — Poll-lock atomicity + theft detection
+
+- Duplicate replies root cause: several live MCP processes polled the same bot token at once (lock kept changing hands), so Telegram delivered the same `update_id` to multiple `getUpdates` consumers and each replied.
+- `src/polling-manager.ts`: `acquireLock()` now claims the lock file atomically (`wx` flag; stale/dead file is removed first) so concurrent starters can't both win; `refreshLock()` stops the worker when the lock is stolen (pid mismatch) instead of silently keeping the old worker polling.
+- Rebuilt `dist/`, restarted MCP children for bot `8553852581`.
+
 ## 2026-08-10 — Pi system commands via Telegram
 
 - Added `src/pi-sys-commands.ts`: `/pi`, `/model`, `/models`, `/think`, `/compact`, `/tools`, `/cmds`, `/cmd`, `/agent`, `/orchestrate`, `/session`, `/new`, `/reload`, `stop`.

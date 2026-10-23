@@ -22,6 +22,17 @@ Plain Node stdio JSON-RPC MCP. Uses built-in `node:sqlite` (same as Pi) and the 
 
 Parent media **download/backfill** still runs in the poll worker (usually Pi). MCP reads the shared DB afterward.
 
+## Media uploads
+
+`mcp-server/upload.js` streams multipart bytes for send_photo/video/document and
+MCP attach. The URL uses `sendPhoto` / `sendVideo` / `sendDocument`; the file part
+must use `photo` / `video` / `document`. Flatten the header, file, and footer
+streams into byte chunks before passing them to fetch. Passing stream objects
+as chunks fails before Telegram can accept the upload.
+
+`test/upload.test.js` checks all three methods against a local HTTP server,
+including multipart names, binary content, captions, and Content-Length.
+
 ## When to use
 
 - omp, Claude Code, OpenCode, Kilo Code, etc. via `teleg mcp --app … --write`.

@@ -21,6 +21,12 @@ Registered in `src/index.ts` via `pi.registerTool` and mirrored in `mcp-server/i
 | `teleg-attach` | Extension: queue onto **active turn** reply; MCP: send now |
 | `get_me` | Bot identity |
 
+Media tools take `file_path` as a real path readable by the process running the
+extension/MCP server. Attachment labels such as `[Image #1]` are display labels,
+not paths; use the attachment metadata path without wrapping quotes. For example,
+`{"file_path":"/absolute/path/photo.jpg"}` for `teleg-send_photo`. A path on a
+different host is not automatically uploaded to the MCP host.
+
 ## Queue
 
 | Tool | Purpose |

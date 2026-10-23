@@ -380,8 +380,14 @@ export class PollingManager {
   private async acquireLock(sessionName: string, dbPath: string): Promise<boolean> {
     try {
       await mkdir(TEMP_DIR, { recursive: true });
-      if (this.isLockHeldByLiveOther(this.readLockSync())) return false;
-      await writeFileAsync(this.lockFile, JSON.stringify({ pid: process.pid, timestamp: now(), botId: this.botId, sessionName, dbPath }) + "\n", "utf8");
+      const existing = this.readLockSync();
+      if (this.isLockHeldByLiveOther(existing)) return false;
+      // Stale or dead-owner lock file: clear it, then claim. The "wx" flag makes
+      // concurrent claims mutually exclusive — only one writer can create the
+      // file; the loser gets EEXIST and stays send-only instead of starting a
+      // second getUpdates consumer on the same bot token (duplicate replies).
+      if (existing) await rmAsync(this.lockFile, { force: true }).catch(() => {});
+      await writeFileAsync(this.lockFile, JSON.stringify({ pid: process.pid, timestamp: now(), botId: this.botId, sessionName, dbPath }) + "\n", { encoding: "utf8", flag: "wx" });
       return true;
     } catch {
       return false;
@@ -391,7 +397,14 @@ export class PollingManager {
   private async refreshLock(): Promise<void> {
     try {
       const existing = this.readLockSync();
-      if (!existing || existing.pid !== process.pid) return;
+      if (!existing || existing.pid !== process.pid) {
+        // Lock was stolen or released while our worker was running — stop
+        // polling immediately so the new owner is the only getUpdates
+        // consumer. Two live pollers on one token make Telegram deliver the
+        // same update twice → duplicate replies.
+        if (this.worker) void this.stop();
+        return;
+      }
       await writeFileAsync(this.lockFile, JSON.stringify({ ...existing, timestamp: now() }) + "\n", "utf8");
     } catch {
     }

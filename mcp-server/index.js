@@ -23,7 +23,8 @@
  */
 
 import "../dist/suppress-sqlite-warning.js";
-import { readFileSync, writeFileSync, existsSync, createReadStream, unlinkSync, readdirSync } from "fs";
+import { streamUpload } from "./upload.js";
+import { readFileSync, writeFileSync, existsSync, unlinkSync, readdirSync } from "fs";
 import { join, dirname, basename } from "path";
 import { fileURLToPath } from "url";
 import { DatabaseSync } from "node:sqlite";
@@ -47,6 +48,12 @@ const AGENT_DIR = join(HOME_DIR, ".pi", "agent");
 const GLOBAL_CONFIG_PATH = join(AGENT_DIR, "teleg-bridge.json");
 const PROJECT_DIR = process.env.TELEG_PROJECT_DIR || process.cwd();
 const PROJECT_CONFIG_PATH = join(PROJECT_DIR, ".pi", "teleg.json");
+// A project can reserve inbound Telegram for its native Pi session: with this
+// marker present the MCP server keeps every send/queue tool but never polls or
+// registers a relay session, so third-party clients (cursor, codex, claude) in
+// the same project can't take the bot's getUpdates lock away from Pi. A file,
+// not an env var: clients respawn MCP servers with the env they started with.
+const SEND_ONLY = existsSync(join(PROJECT_DIR, ".pi", "teleg-mcp-send-only"));
 const SESSION_REGISTRY_PATH = join(AGENT_DIR, "teleg-sessions.json");
 const RELAY_DIR = join(AGENT_DIR, "tmp", "teleg-relay");
 const CAPABILITIES_PATH = join(AGENT_DIR, "teleg-capabilities.json");
@@ -224,44 +231,6 @@ function endAckTracking(dbId) {
 
 // ─── Streaming Upload Helpers ────────────────────────────────────────────────
 
-/**
- * Build a multipart/form-data body using streaming for large files.
- * Avoids loading entire file into memory.
- */
-async function streamUpload(bot, filePath, fieldName, extraFields = {}) {
-  const fileName = filePath.split("/").pop();
-  const fileSize = (await import("fs")).statSync(filePath).size;
-
-  const boundary = `----FormBoundary${Date.now()}${Math.random().toString(36).slice(2)}`;
-
-  let header = `--${boundary}\r\n`;
-  for (const [key, value] of Object.entries(extraFields)) {
-    header += `Content-Disposition: form-data; name="${key}"\r\n\r\n${value}\r\n--${boundary}\r\n`;
-  }
-  header += `Content-Disposition: form-data; name="${fieldName}"; filename="${fileName}"\r\n`;
-  header += `Content-Type: application/octet-stream\r\n\r\n`;
-
-  const { Readable } = await import("stream");
-  const footer = `\r\n--${boundary}--\r\n`;
-
-  const headerStream = Readable.from([Buffer.from(header)]);
-  const fileStream = createReadStream(filePath);
-  const footerStream = Readable.from([Buffer.from(footer)]);
-
-  const combined = Readable.from([headerStream, fileStream, footerStream]);
-
-  const res = await fetch(`${bot.baseUrl}/${fieldName}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": `multipart/form-data; boundary=${boundary}`,
-      "Content-Length": String(Buffer.byteLength(header) + fileSize + Buffer.byteLength(footer)),
-    },
-    body: combined,
-    signal: AbortSignal.timeout(300_000), // 5 min timeout
-  });
-
-  return res;
-}
 
 async function sendPhoto(bot, filePath, caption = "", chatId) {
   const target = chatId ?? bot.chatId;
@@ -633,7 +602,10 @@ async function fixDegradedHealth(botId, { force = false } = {}) {
     details.before = before;
     const heldByOther = pm.isHeldByOther();
     const degraded = !before.isHealthy || before.consecutiveErrors >= 3 || !pm.isActive();
-    if (heldByOther && !pm.isActive()) {
+    if (SEND_ONLY) {
+      pollingAction = "skipped_send_only";
+      steps.push("Send-only MCP (.pi/teleg-mcp-send-only) — polling belongs to the Pi session");
+    } else if (heldByOther && !pm.isActive()) {
       pollingAction = "skipped_lock_held";
       steps.push("Polling lock held by another live session — skipped poller restart");
       if (apiOk && typeof pm.resetHealthCounters === "function") pm.resetHealthCounters();
@@ -1717,7 +1689,7 @@ async function dispatchTool(name, args) {
 
 async function main() {
   try {
-    void startEngine(); // omp/standalone receive path: poll + register + route
+    if (!SEND_ONLY) void startEngine(); // omp/standalone receive path: poll + register + route
     while (true) {
       try {
         const req = await readRequest();

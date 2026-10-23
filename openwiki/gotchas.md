@@ -12,6 +12,8 @@ timestamp: 2026-07-25T12:25:00Z
 
 Telegram allows a single consumer. Starting a second poller for the same `botId` (second Pi instance without lock, or MCP that polls) causes missed/stolen updates. Respect `~/.pi/agent/tmp/teleg-bridge/polling-{botId}.lock`.
 
+The lock is claimed atomically (`wx` — exclusive create; a stale/dead-owner file is removed first) and the holder stops its poll worker when the lock is stolen, so a reconnecting session can never leave a zombie poller double-fetching the same `update_id`.
+
 ## Never dual-load extension + MCP in Pi
 
 Identical tool names → Pi redirects MCP calls to the native tool with warnings. `deploy.sh` removes `teleg-bridge` from `~/.pi/agent/mcp.json`. Use MCP only for non-Pi clients (`teleg mcp --app … --write`).
